@@ -1,0 +1,73 @@
+[ {
+  "tag" : "saludo",
+  "patterns" : [ "hola", "buenos dias", "buenas tardes", "buenas noches", "que tal daemon", "estas en linea", "hola daemon como estas", "despierta daemon" ],
+  "responses" : [ "En línea y operando con mi red neuronal local, Cristian. ¿Qué ejecutamos hoy?" ],
+  "action" : "NONE"
+}, {
+  "tag" : "identidad",
+  "patterns" : [ "quien eres", "como te llamas", "que eres exactamente", "presentate", "cual es tu funcion", "quien te creo" ],
+  "responses" : [ "Soy Daemon, tu asistente autónomo en Kotlin. Opero mediante una red neuronal multicapa entrenada localmente y fui creado por ti, Cristian." ],
+  "action" : "NONE"
+}, {
+  "tag" : "play_pausa",
+  "patterns" : [ "dale play", "pon play", "pausa la musica", "ponle pausa", "deten la cancion", "reanuda la musica", "continua reproduciendo", "dale play a la cancion", "pausa spotify" ],
+  "responses" : [ "Comando Play/Pausa ejecutado en tu sistema, Cristian." ],
+  "action" : "MEDIA_PLAY_PAUSE"
+}, {
+  "tag" : "siguiente_cancion",
+  "patterns" : [ "siguiente cancion", "cambia de cancion", "salta esta rola", "pasa a la siguiente", "otra cancion", "siguiente pista" ],
+  "responses" : [ "Pasando a la siguiente pista, Cristian." ],
+  "action" : "MEDIA_NEXT"
+}, {
+  "tag" : "anterior_cancion",
+  "patterns" : [ "cancion anterior", "regresa la cancion", "pista anterior", "pon la anterior", "atras en spotify" ],
+  "responses" : [ "Regresando a la pista anterior, Cristian." ],
+  "action" : "MEDIA_PREV"
+}, {
+  "tag" : "subir_volumen",
+  "patterns" : [ "sube el volumen", "subele a la musica", "mas volumen", "no se escucha subele", "aumenta el volumen" ],
+  "responses" : [ "Subiendo el volumen del sistema, Cristian." ],
+  "action" : "VOL_UP"
+}, {
+  "tag" : "bajar_volumen",
+  "patterns" : [ "baja el volumen", "bajale a la musica", "menos volumen", "esta muy fuerte bajale", "disminuye el volumen" ],
+  "responses" : [ "Bajando el volumen del sistema, Cristian." ],
+  "action" : "VOL_DOWN"
+}, {
+  "tag" : "que_suena",
+  "patterns" : [ "que cancion esta sonando", "como se llama esta cancion", "que estoy escuchando", "que suena en spotify", "dime el nombre de la rola" ],
+  "responses" : [ ],
+  "action" : "CHECK_SPOTIFY_SONG"
+}, {
+  "tag" : "ventanas_abiertas",
+  "patterns" : [ "que tengo abierto", "que ventanas estan abiertas", "que programas estan corriendo", "revisa mis ventanas activas", "que aplicaciones tengo abiertas ahorita" ],
+  "responses" : [ ],
+  "action" : "CHECK_OPEN_WINDOWS"
+}, {
+  "tag" : "concepto_red_neuronal",
+  "patterns" : [ "que es una red neuronal", "como funciona una red neuronal", "explicame las redes neuronales", "definicion de red neuronal", "que son las neuronas artificiales" ],
+  "responses" : [ "Una red neuronal artificial es un modelo matemático inspirado en el cerebro biológico, compuesto por capas de nodos interconectados que ajustan sus pesos sinápticos mediante retropropagación." ],
+  "action" : "NONE"
+}, {
+  "tag" : "concepto_sistema_operativo",
+  "patterns" : [ "que es un sistema operativo", "como funciona el sistema operativo", "para que sirve un so", "definicion de sistema operativo", "que hace el kernel" ],
+  "responses" : [ "Un sistema operativo es el software principal que gestiona los recursos de hardware y provee servicios a los procesos y aplicaciones del usuario." ],
+  "action" : "NONE"
+}, {
+  "tag": "concepto_proceso",
+  "patterns": [
+    "que es un proceso en computacion",
+    "definicion de proceso e hilo",
+    "como funciona un proceso en el sistema",
+    "que son los procesos y threads"
+  ],
+  "responses": [
+    "Un proceso es una instancia de un programa en ejecución..."
+  ],
+  "action": "NONE"
+}, {
+  "tag" : "concepto_agujero_negro",
+  "patterns" : [ "que es un agujero negro", "explicame los agujeros negros", "como funciona un agujero negro", "definicion de agujero negro" ],
+  "responses" : [ "Un agujero negro es una región finita del espacio-tiempo cuya concentración de masa genera un campo gravitatorio tan intenso que ni siquiera la luz puede escapar." ],
+  "action" : "NONE"
+} ]

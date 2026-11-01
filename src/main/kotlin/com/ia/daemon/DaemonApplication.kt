@@ -7,5 +7,6 @@ import org.springframework.boot.runApplication
 class DaemonApplication
 
 fun main(args: Array<String>) {
+	System.setProperty("java.awt.headless", "false")
 	runApplication<DaemonApplication>(*args)
 }
