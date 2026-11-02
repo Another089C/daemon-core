@@ -5,7 +5,7 @@
   "appsToOpen" : [ "vscode", "notion", "opera gx" ],
   "appsToClose" : [ ],
   "spotifyPlaylist" : "mis me gusta",
-  "greeting" : "Activando Modo Trabajo en tu WINDOWS, Cristian. Abriendo Visual Studio Code, Notion, Opera GX y reproduciendo tus canciones de Mis Me Gusta."
+  "greeting" : "Modo Trabajo activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
 }, {
   "id" : "TAREA",
   "name" : "PROTOCOLO TAREA",
@@ -13,7 +13,7 @@
   "appsToOpen" : [ "vscode", "notion", "opera gx" ],
   "appsToClose" : [ "discord", "steam" ],
   "spotifyPlaylist" : "mis me gusta",
-  "greeting" : "Activando Modo Tarea, Cristian. Preparando Visual Studio Code, Notion, Opera GX y reproduciendo automáticamente tu lista Mis Me Gusta en Spotify."
+  "greeting" : "Modo Tarea activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y tu lista Mis Me Gusta en Spotify."
 }, {
   "id" : "ESTUDIO",
   "name" : "PROTOCOLO ESTUDIO",
@@ -21,7 +21,7 @@
   "appsToOpen" : [ "notion", "opera gx", "vscode" ],
   "appsToClose" : [ "discord", "steam" ],
   "spotifyPlaylist" : "mis me gusta",
-  "greeting" : "Activando Modo Estudio, Cristian. Abriendo Notion, Opera GX, Visual Studio Code y reproduciendo automáticamente tus canciones de Mis Me Gusta."
+  "greeting" : "Modo Estudio activo, Cristian. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
 }, {
   "id" : "GAMING",
   "name" : "PROTOCOLO GAMING",
@@ -29,5 +29,5 @@
   "appsToOpen" : [ "discord" ],
   "appsToClose" : [ "vscode", "notion" ],
   "spotifyPlaylist" : "mis me gusta",
-  "greeting" : "Modo Gaming activo, Cristian. Cerrando aplicaciones de trabajo, abriendo Discord y reproduciendo tu música."
+  "greeting" : "Modo Gaming activo, Cristian. Liberando recursos de trabajo, enfocando Discord y reproduciendo tu música."
 } ]
