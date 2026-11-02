@@ -7,11 +7,13 @@ import org.springframework.web.bind.annotation.*
 import java.awt.*
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.event.MouseMotionAdapter
+import java.awt.geom.Arc2D
 import java.awt.geom.Ellipse2D
-import java.io.BufferedReader
+import java.awt.geom.RoundRectangle2D
 import java.io.File
-import java.io.InputStreamReader
 import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -19,19 +21,25 @@ import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
 import java.text.Normalizer
 import java.time.Duration
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import javax.swing.*
 import javax.swing.border.EmptyBorder
+import javax.swing.plaf.basic.BasicScrollBarUI
 import kotlin.concurrent.thread
 import kotlin.math.*
 import kotlin.random.Random
 
 data class ChatRequest(
     val prompt: String = "",
-    val audio: String? = null,
+    val sessionId: String = "default-session",
+    val accessPin: String = "",
     val fromBrowser: Boolean = true
 )
 
-// Estructura de cada Nodo de la Red Neuronal en daemon_brain.json
 data class IntentNode(
     val tag: String = "",
     val patterns: List<String> = emptyList(),
@@ -39,20 +47,35 @@ data class IntentNode(
     val action: String = "NONE"
 )
 
+data class ConversationTurn(
+    val role: String,
+    val content: String
+)
+
+data class RemoteCommand(
+    val id: Long = System.currentTimeMillis(),
+    val type: String,
+    val payload: String = ""
+)
+
 // ============================================================================
-// 1. RED NEURONAL MULTICAPA (MLP CON BACKPROPAGATION EN KOTLIN PURO)
+// 1. RED NEURONAL MULTICAPA LOCAL (MLP EN KOTLIN PURO)
 // ============================================================================
 class SynapticNeuralNetwork {
     private var vocabulary = listOf<String>()
     private var intents = listOf<IntentNode>()
 
-    private var hiddenSize = 48
+    private var hiddenSize = 72
     private var w1 = arrayOf<DoubleArray>()
     private var b1 = DoubleArray(0)
     private var w2 = arrayOf<DoubleArray>()
     private var b2 = DoubleArray(0)
 
-    private val stopWords = setOf("el", "la", "los", "las", "un", "una", "de", "del", "en", "y", "a", "por", "para", "con", "mi", "tu", "daemon", "oye", "porfa", "favor")
+    private val stopWords = setOf(
+        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "en",
+        "y", "o", "a", "por", "para", "con", "mi", "tu", "su", "daemon", "oye",
+        "porfa", "favor", "dime", "sabes", "puedes", "podrias", "sobre", "acerca"
+    )
 
     fun normalizeAndStem(text: String): List<String> {
         val clean = Normalizer.normalize(text.lowercase(), Normalizer.Form.NFD)
@@ -65,25 +88,33 @@ class SynapticNeuralNetwork {
     }
 
     fun train(dataset: List<IntentNode>) {
-        val t0 = System.currentTimeMillis()
         intents = dataset
         val vocabSet = linkedSetOf<String>()
-        val trainingSamples = mutableListOf<Pair<List<String>, Int>>()
+        val trainingSamples = mutableListOf<Pair<IntArray, Int>>()
 
+        val tempSamples = mutableListOf<Pair<List<String>, Int>>()
         intents.forEachIndexed { intentIdx, node ->
             node.patterns.forEach { pattern ->
                 val stems = normalizeAndStem(pattern)
                 if (stems.isNotEmpty()) {
                     vocabSet.addAll(stems)
-                    trainingSamples.add(stems to intentIdx)
+                    tempSamples.add(stems to intentIdx)
                 }
             }
         }
 
         vocabulary = vocabSet.toList()
+        val vocabIndexMap = vocabulary.withIndex().associate { it.value to it.index }
         val inputSize = vocabulary.size
         val outputSize = intents.size
         if (inputSize == 0 || outputSize == 0) return
+
+        for ((stems, targetIdx) in tempSamples) {
+            val activeIndices = stems.mapNotNull { vocabIndexMap[it] }.distinct().toIntArray()
+            if (activeIndices.isNotEmpty()) {
+                trainingSamples.add(activeIndices to targetIdx)
+            }
+        }
 
         val rnd = Random(42)
         w1 = Array(inputSize) { DoubleArray(hiddenSize) { (rnd.nextDouble() - 0.5) * sqrt(2.0 / inputSize) } }
@@ -91,75 +122,69 @@ class SynapticNeuralNetwork {
         w2 = Array(hiddenSize) { DoubleArray(outputSize) { (rnd.nextDouble() - 0.5) * sqrt(2.0 / hiddenSize) } }
         b2 = DoubleArray(outputSize) { 0.0 }
 
-        val xTrain = trainingSamples.map { (stems, _) ->
-            DoubleArray(inputSize) { i -> if (vocabulary[i] in stems) 1.0 else 0.0 }
-        }
-        val yTrain = trainingSamples.map { (_, targetIdx) -> targetIdx }
+        val lr = 0.07
+        val epochs = 200
+        val hidden = DoubleArray(hiddenSize)
+        val logits = DoubleArray(outputSize)
+        val probs = DoubleArray(outputSize)
+        val dOut = DoubleArray(outputSize)
+        val dHidden = DoubleArray(hiddenSize)
 
-        val lr = 0.08
-        val epochs = 450
         for (epoch in 0 until epochs) {
-            for (sampleIdx in xTrain.indices) {
-                val x = xTrain[sampleIdx]
-                val target = yTrain[sampleIdx]
+            for (sampleIdx in trainingSamples.indices) {
+                val (activeInputs, target) = trainingSamples[sampleIdx]
 
-                // Forward Pass
-                val hidden = DoubleArray(hiddenSize)
                 for (j in 0 until hiddenSize) {
                     var sum = b1[j]
-                    for (i in 0 until inputSize) {
-                        if (x[i] > 0.0) sum += x[i] * w1[i][j]
-                    }
+                    for (i in activeInputs) sum += w1[i][j]
                     hidden[j] = if (sum > 0.0) sum else 0.0
                 }
 
-                val logits = DoubleArray(outputSize)
                 var maxLogit = Double.NEGATIVE_INFINITY
                 for (k in 0 until outputSize) {
                     var sum = b2[k]
-                    for (j in 0 until hiddenSize) sum += hidden[j] * w2[j][k]
+                    for (j in 0 until hiddenSize) if (hidden[j] > 0.0) sum += hidden[j] * w2[j][k]
                     logits[k] = sum
                     if (sum > maxLogit) maxLogit = sum
                 }
 
-                val probs = DoubleArray(outputSize)
                 var expSum = 0.0
                 for (k in 0 until outputSize) {
                     probs[k] = exp(logits[k] - maxLogit)
                     expSum += probs[k]
                 }
-                for (k in 0 until outputSize) probs[k] /= expSum
+                for (k in 0 until outputSize) {
+                    probs[k] /= expSum
+                    dOut[k] = probs[k] - (if (k == target) 1.0 else 0.0)
+                }
 
-                // Backward Pass
-                val dOut = DoubleArray(outputSize) { k -> probs[k] - (if (k == target) 1.0 else 0.0) }
-                val dHidden = DoubleArray(hiddenSize)
                 for (j in 0 until hiddenSize) {
                     if (hidden[j] > 0.0) {
                         var grad = 0.0
                         for (k in 0 until outputSize) grad += dOut[k] * w2[j][k]
                         dHidden[j] = grad
+                    } else {
+                        dHidden[j] = 0.0
                     }
                 }
 
-                for (k in 0 until outputSize) {
-                    b2[k] -= lr * dOut[k]
-                    for (j in 0 until hiddenSize) {
-                        w2[j][k] -= lr * hidden[j] * dOut[k]
-                    }
-                }
-
+                for (k in 0 until outputSize) b2[k] -= lr * dOut[k]
                 for (j in 0 until hiddenSize) {
-                    if (dHidden[j] != 0.0) {
-                        b1[j] -= lr * dHidden[j]
-                        for (i in 0 until inputSize) {
-                            if (x[i] > 0.0) w1[i][j] -= lr * x[i] * dHidden[j]
-                        }
+                    val hj = hidden[j]
+                    if (hj > 0.0) {
+                        val rowW2 = w2[j]
+                        for (k in 0 until outputSize) rowW2[k] -= lr * hj * dOut[k]
+                    }
+                }
+                for (j in 0 until hiddenSize) {
+                    val dh = dHidden[j]
+                    if (dh != 0.0) {
+                        b1[j] -= lr * dh
+                        for (i in activeInputs) w1[i][j] -= lr * dh
                     }
                 }
             }
         }
-        val ms = System.currentTimeMillis() - t0
-        println("[DAEMON NEURAL NET] Red entrenada en ${ms}ms | Vocabulario: $inputSize raíces | Intenciones: $outputSize | Patrones: ${trainingSamples.size}")
     }
 
     fun predict(rawInput: String): Pair<IntentNode?, Double> {
@@ -167,13 +192,13 @@ class SynapticNeuralNetwork {
         val stems = normalizeAndStem(rawInput)
         if (stems.isEmpty()) return null to 0.0
 
-        val x = DoubleArray(vocabulary.size) { i -> if (vocabulary[i] in stems) 1.0 else 0.0 }
-        if (x.all { it == 0.0 }) return null to 0.0
+        val activeInputs = vocabulary.indices.filter { vocabulary[it] in stems }
+        if (activeInputs.isEmpty()) return null to 0.0
 
         val hidden = DoubleArray(hiddenSize)
         for (j in 0 until hiddenSize) {
             var sum = b1[j]
-            for (i in vocabulary.indices) if (x[i] > 0.0) sum += x[i] * w1[i][j]
+            for (i in activeInputs) sum += w1[i][j]
             hidden[j] = if (sum > 0.0) sum else 0.0
         }
 
@@ -181,7 +206,7 @@ class SynapticNeuralNetwork {
         var maxLogit = Double.NEGATIVE_INFINITY
         for (k in intents.indices) {
             var sum = b2[k]
-            for (j in 0 until hiddenSize) sum += hidden[j] * w2[j][k]
+            for (j in 0 until hiddenSize) if (hidden[j] > 0.0) sum += hidden[j] * w2[j][k]
             logits[k] = sum
             if (sum > maxLogit) maxLogit = sum
         }
@@ -204,10 +229,12 @@ class SynapticNeuralNetwork {
         }
         return intents[bestIdx] to bestProb
     }
+
+    fun getPatternCount(): Int = intents.sumOf { it.patterns.size }
 }
 
 // ============================================================================
-// 2. ESCÁNER DEL SISTEMA, PLAYLISTS DE SPOTIFY Y VISIÓN DE VENTANAS ABIERTAS
+// 2. ESCÁNER DEL SISTEMA + CONTROL GARANTIZADO DE SPOTIFY (BASE64 + TRIPLE VÍA)
 // ============================================================================
 @Service
 class SystemScanner {
@@ -220,24 +247,79 @@ class SystemScanner {
     private val installedApps = mutableMapOf<String, String>()
     private val playlistsFile = File("daemon_playlists.json")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
-
     private val savedPlaylists = mutableMapOf<String, String>()
 
+    // Cola de órdenes para sincronizar la Nube con tu PC local
+    val pendingRemoteCommands = ConcurrentLinkedQueue<RemoteCommand>()
+
     private val httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(3))
+        .connectTimeout(Duration.ofSeconds(4))
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build()
 
     init {
         scanInstalledApplications()
         loadPlaylists()
+        startCloudSyncAgent()
     }
 
     fun getOSLabel(): String = when {
-        isWindows -> "Windows (${System.getProperty("os.name")})"
-        isMac -> "macOS"
-        isLinux -> "Linux / Ubuntu"
+        isWindows -> "WIN64 // ${System.getProperty("os.name").uppercase()}"
+        isMac -> "MACOS // DARWIN"
+        isLinux -> "CLOUD // LINUX KERNEL"
         else -> System.getProperty("os.name")
+    }
+
+    // Ejecutor blindado en Base64 (UTF-16LE): Evita que Windows borre comillas o rompa el script
+    fun runPowerShell(script: String, wait: Boolean = false): String {
+        if (!isWindows) return ""
+        return try {
+            val utf16Bytes = script.toByteArray(StandardCharsets.UTF_16LE)
+            val base64 = Base64.getEncoder().encodeToString(utf16Bytes)
+            val proc = ProcessBuilder(
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64
+            ).start()
+            if (wait) {
+                val output = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
+                proc.waitFor()
+                output
+            } else {
+                ""
+            }
+        } catch (e: Exception) {
+            println("[DAEMON PS ERROR] ${e.message}")
+            ""
+        }
+    }
+
+    // Si tu PC está conectada a una instancia de Daemon en la nube, descarga y ejecuta las órdenes de Spotify/Apps
+    private fun startCloudSyncAgent() {
+        val remoteCloudUrl = System.getenv("DAEMON_CLOUD_URL") ?: return
+        if (!isWindows || remoteCloudUrl.isBlank()) return
+        thread(isDaemon = true, name = "Daemon-Cloud-Bridge") {
+            while (true) {
+                try {
+                    val req = HttpRequest.newBuilder()
+                        .uri(URI.create("${remoteCloudUrl.trimEnd('/')}/api/daemon/poll-commands"))
+                        .timeout(Duration.ofSeconds(5))
+                        .GET().build()
+                    val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                    if (res.statusCode() == 200 && res.body().startsWith("[")) {
+                        val cmds = objectMapper.readValue(res.body(), Array<RemoteCommand>::class.java)
+                        cmds.forEach { cmd ->
+                            when (cmd.type) {
+                                "MEDIA_KEY" -> sendMediaKey(cmd.payload)
+                                "PLAY_SONG" -> playSongInSpotify(cmd.payload)
+                                "PLAY_PLAYLIST" -> playPlaylist(cmd.payload, normalizeText(cmd.payload))
+                                "OPEN_APP" -> openAppByName(normalizeText(cmd.payload))
+                                "CLOSE_APP" -> closeAppByName(normalizeText(cmd.payload))
+                            }
+                        }
+                    }
+                } catch (e: Exception) {}
+                Thread.sleep(1500)
+            }
+        }
     }
 
     private fun loadPlaylists() {
@@ -255,9 +337,7 @@ class SystemScanner {
                 rootNode.fields().forEachRemaining { entry ->
                     savedPlaylists[entry.key] = entry.value.asText()
                 }
-            } catch (e: Exception) {
-                println("[DAEMON PLAYLISTS] Error leyendo playlists: ${e.message}")
-            }
+            } catch (e: Exception) {}
         }
     }
 
@@ -277,36 +357,90 @@ class SystemScanner {
         }
         savedPlaylists[cleanName] = uri
         savePlaylists()
-        return "Playlist **$cleanName** vinculada exitosamente a `$uri`, Cristian."
+        return "Playlist '$cleanName' vinculada exitosamente a $uri, Cristian."
     }
 
-    fun getOpenWindowsReport(): String {
-        if (!isWindows) return "Escaneo de ventanas activas disponible en Windows."
-        return try {
-            val ps = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -ExpandProperty MainWindowTitle"
-            val proc = ProcessBuilder("powershell", "-NoProfile", "-Command", ps).start()
-            val titles = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readLines().map { it.trim() }.filter { it.isNotBlank() }
-            if (titles.isEmpty()) "No detecto ventanas visibles abiertas en este momento."
-            else "Actualmente tienes abiertas **${titles.size} ventanas** en tu escritorio:\n" + titles.joinToString("\n") { "* $it" }
-        } catch (e: Exception) {
-            "No pude leer las ventanas activas: ${e.message}"
+    // Control Multimedia Triple Vía: 1) WM_APPCOMMAND a todas las ventanas de Spotify + 2) Hardware Key + 3) WScript.Shell
+    fun sendMediaKey(action: String) {
+        pendingRemoteCommands.add(RemoteCommand(type = "MEDIA_KEY", payload = action))
+        if (!isWindows) return
+
+        thread {
+            try {
+                val vkCode = when (action) {
+                    "NEXT" -> 0xB0
+                    "PREV" -> 0xB1
+                    "PLAY_PAUSE" -> 0xB3
+                    "STOP" -> 0xB2
+                    "VOL_UP" -> 0xAF
+                    "VOL_DOWN" -> 0xAE
+                    "MUTE" -> 0xAD
+                    else -> return@thread
+                }
+                val appCmd = when (action) {
+                    "NEXT" -> 720896       // APPCOMMAND_MEDIA_NEXTTRACK
+                    "PREV" -> 786432       // APPCOMMAND_MEDIA_PREVIOUSTRACK
+                    "STOP" -> 851968       // APPCOMMAND_MEDIA_STOP
+                    "PLAY_PAUSE" -> 917504 // APPCOMMAND_MEDIA_PLAY_PAUSE
+                    else -> 0
+                }
+                val repeat = if (action == "VOL_UP" || action == "VOL_DOWN") 5 else 1
+
+                val psScript = """
+                    ${'$'}wsh = New-Object -ComObject WScript.Shell
+                    for (${'$'}i = 0; ${'$'}i -lt $repeat; ${'$'}i++) {
+                        ${'$'}wsh.SendKeys([char]$vkCode)
+                        Start-Sleep -Milliseconds 30
+                    }
+                    ${'$'}code = @"
+                    using System;
+                    using System.Runtime.InteropServices;
+                    public class DaemonMediaBridge {
+                        [DllImport("user32.dll")]
+                        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+                        [DllImport("user32.dll")]
+                        public static extern IntPtr PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+                    }
+"@
+                    Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
+                    if ($appCmd -ne 0) {
+                        Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | ForEach-Object {
+                            [DaemonMediaBridge]::PostMessageW(${'$'}_.MainWindowHandle, 0x0319, ${'$'}_.MainWindowHandle, [IntPtr]$appCmd) | Out-Null
+                        }
+                    }
+                """.trimIndent()
+
+                runPowerShell(psScript, wait = false)
+            } catch (e: Exception) {
+                println("[DAEMON MEDIA KEY ERROR] ${e.message}")
+            }
         }
     }
 
+    fun minimizeAllWindows() {
+        if (isWindows) {
+            runPowerShell("(New-Object -ComObject Shell.Application).ToggleDesktop()", wait = false)
+        }
+    }
+
+    fun getOpenWindowsReport(): String {
+        if (!isWindows) return "Ejecutando en nodo Cloud. Las ventanas locales se consultan desde el agente de escritorio."
+        val script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -ExpandProperty MainWindowTitle"
+        val out = runPowerShell(script, wait = true)
+        val titles = out.lines().map { it.trim() }.filter { it.isNotBlank() }
+        return if (titles.isEmpty()) "No detecto ventanas visibles abiertas en este momento."
+        else "Tienes abiertas ${titles.size} ventanas activas:\n" + titles.joinToString("\n") { "• $it" }
+    }
+
     fun getCurrentlyPlayingSpotify(): String {
-        if (!isWindows) return "Lectura de pista activa disponible en Windows."
-        return try {
-            val ps = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -ExpandProperty MainWindowTitle"
-            val proc = ProcessBuilder("powershell", "-NoProfile", "-Command", ps).start()
-            val title = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
-            if (title.isBlank()) "Spotify está cerrado en este momento, Cristian."
-            else if (title.equals("Spotify Free", true) || title.equals("Spotify Premium", true) || title.equals("Spotify", true)) {
+        if (!isWindows) return "Nodo en modo Cloud activo."
+        val script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -ExpandProperty MainWindowTitle"
+        val title = runPowerShell(script, wait = true)
+        return when {
+            title.isBlank() -> "Spotify está cerrado en este momento, Cristian."
+            title.equals("Spotify Free", true) || title.equals("Spotify Premium", true) || title.equals("Spotify", true) ->
                 "Spotify está abierto pero en pausa, Cristian."
-            } else {
-                "En este momento está sonando: **$title** en Spotify."
-            }
-        } catch (e: Exception) {
-            "No pude consultar el proceso de Spotify."
+            else -> "En este momento está sonando '$title' en Spotify."
         }
     }
 
@@ -384,6 +518,7 @@ class SystemScanner {
     }
 
     fun playPlaylist(rawCommand: String, normalized: String): String {
+        pendingRemoteCommands.add(RemoteCommand(type = "PLAY_PLAYLIST", payload = normalized))
         val playlistQuery = normalized
             .replace(Regex("""^.*?(?:playlist|lista\s+de\s+reproduccion|lista|mis\s+canciones\s+de|musica\s+para)\s*(?:de\s+|llamada\s+|para\s+)?"""), "")
             .replace("en spotify", "")
@@ -394,83 +529,113 @@ class SystemScanner {
             playlistQuery.contains(it.key) || it.key.contains(playlistQuery)
         }
 
-        val targetUri = savedMatch?.value ?: findSpotifyUri("playlist", playlistQuery)
-
-        thread {
-            try {
-                if (targetUri != null) {
-                    openSystemTarget(targetUri)
-                    Thread.sleep(2800)
-                    triggerSpotifyPlaylistStart()
-                } else {
-                    val encoded = URLEncoder.encode(playlistQuery, StandardCharsets.UTF_8).replace("+", "%20")
-                    openSystemTarget("spotify:search:$encoded")
-                    Thread.sleep(2800)
-                    triggerSpotifyPlaylistStart()
-                }
-            } catch (e: Exception) {}
+        if (isWindows) {
+            thread {
+                try {
+                    val targetUri = savedMatch?.value ?: findSpotifyUri("playlist", playlistQuery)
+                    if (targetUri != null) {
+                        launchSpotifyUriAndPlay(targetUri, isSearch = false)
+                    } else {
+                        val encoded = URLEncoder.encode(playlistQuery, StandardCharsets.UTF_8).replace("+", "%20")
+                        launchSpotifyUriAndPlay("spotify:search:$encoded", isSearch = true)
+                    }
+                } catch (e: Exception) {}
+            }
         }
 
         return if (savedMatch != null) {
-            "Iniciando tu playlist **\"${savedMatch.key.uppercase()}\"** en Spotify, Cristian."
+            "Iniciando tu playlist '${savedMatch.key.uppercase()}' en Spotify, Cristian."
         } else {
-            "Cargando y reproduciendo la playlist **\"$playlistQuery\"** en Spotify, Cristian."
+            "Cargando y reproduciendo la playlist '$playlistQuery' en Spotify, Cristian."
         }
     }
 
     fun playSongInSpotify(songQuery: String?): String {
-        if (songQuery.isNullOrBlank()) {
+        val cleanSong = songQuery?.trim() ?: ""
+        if (cleanSong.isBlank() || cleanSong in setOf("musica", "la musica", "la cancion", "spotify")) {
             sendMediaKey("PLAY_PAUSE")
-            return "Alternando reproducción en tu sistema, Cristian."
+            return "Reanudando reproducción en Spotify, Cristian."
         }
-        thread {
-            try {
-                val trackUri = findSpotifyUri("track", songQuery)
-                if (trackUri != null) {
-                    openSystemTarget(trackUri)
-                    Thread.sleep(2600)
-                    triggerSpotifyPlaylistStart()
-                } else {
-                    val encoded = URLEncoder.encode(songQuery, StandardCharsets.UTF_8).replace("+", "%20")
-                    openSystemTarget("spotify:search:$encoded")
-                    Thread.sleep(2800)
-                    triggerSpotifyPlaylistStart()
+
+        pendingRemoteCommands.add(RemoteCommand(type = "PLAY_SONG", payload = cleanSong))
+        if (isWindows) {
+            thread {
+                try {
+                    val trackUri = findSpotifyUri("track", cleanSong)
+                    if (trackUri != null) {
+                        println("[DAEMON SPOTIFY] Pista exacta localizada: $trackUri")
+                        launchSpotifyUriAndPlay(trackUri, isSearch = false)
+                    } else {
+                        val encoded = URLEncoder.encode(cleanSong, StandardCharsets.UTF_8).replace("+", "%20")
+                        println("[DAEMON SPOTIFY] Ejecutando búsqueda directa: spotify:search:$encoded")
+                        launchSpotifyUriAndPlay("spotify:search:$encoded", isSearch = true)
+                    }
+                } catch (e: Exception) {
+                    println("[DAEMON SPOTIFY ERROR] ${e.message}")
                 }
-            } catch (e: Exception) {}
+            }
         }
-        return "Reproduciendo **\"$songQuery\"** en Spotify, Cristian."
+        return "Reproduciendo '$cleanSong' en Spotify, Cristian."
+    }
+
+    private fun launchSpotifyUriAndPlay(spotifyUri: String, isSearch: Boolean) {
+        if (!isWindows) return
+        val keysToSend = if (isSearch) "{TAB}{ENTER}" else "{ENTER}"
+        val ps = """
+            Start-Process "$spotifyUri"
+            Start-Sleep -Milliseconds 2200
+            ${'$'}wsh = New-Object -ComObject WScript.Shell
+            ${'$'}wsh.AppActivate("Spotify") | Out-Null
+            Start-Sleep -Milliseconds 450
+            ${'$'}wsh.SendKeys("$keysToSend")
+            Start-Sleep -Milliseconds 700
+            ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowTitle -ne "" } | Select-Object -First 1
+            if (${'$'}null -ne ${'$'}sp -and (${'$'}sp.MainWindowTitle -eq "Spotify" -or ${'$'}sp.MainWindowTitle -like "Spotify Free*" -or ${'$'}sp.MainWindowTitle -like "Spotify Premium*")) {
+                ${'$'}wsh.AppActivate("Spotify") | Out-Null
+                Start-Sleep -Milliseconds 250
+                ${'$'}wsh.SendKeys(" ")
+            }
+        """.trimIndent()
+        runPowerShell(ps, wait = false)
     }
 
     private fun findSpotifyUri(type: String, query: String): String? {
-        return try {
-            val q = URLEncoder.encode("site:open.spotify.com/$type $query", StandardCharsets.UTF_8)
-            val req = HttpRequest.newBuilder()
-                .uri(URI.create("https://html.duckduckgo.com/html/?q=$q"))
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                .GET().build()
-            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-            val match = Regex("""open\.spotify\.com/$type/([a-zA-Z0-9]{22})""").find(res.body())
-            match?.groupValues?.get(1)?.let { "spotify:$type:$it" }
-        } catch (e: Exception) {
-            null
-        }
-    }
+        val searchEngines = listOf(
+            "https://html.duckduckgo.com/html/?q=" + URLEncoder.encode("site:open.spotify.com/$type $query", StandardCharsets.UTF_8),
+            "https://search.yahoo.com/search?p=" + URLEncoder.encode("site:open.spotify.com/$type $query", StandardCharsets.UTF_8)
+        )
+        val regex = Regex("""open\.spotify\.com/$type/([a-zA-Z0-9]{22})""")
 
-    private fun triggerSpotifyPlaylistStart() {
-        if (isWindows) {
-            val ps = "\$w = New-Object -ComObject WScript.Shell; \$w.AppActivate('Spotify'); Start-Sleep -Milliseconds 350; \$w.SendKeys('{ENTER}'); Start-Sleep -Milliseconds 350; \$w.SendKeys([char]179)"
-            ProcessBuilder("powershell", "-NoProfile", "-Command", ps).start()
-        } else if (isMac) {
-            ProcessBuilder("osascript", "-e", "tell application \"Spotify\" to play").start()
-        } else if (isLinux) {
-            ProcessBuilder("sh", "-c", "playerctl play").start()
+        for (url in searchEngines) {
+            try {
+                val req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                    .GET().build()
+                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                val decodedBody = try {
+                    URLDecoder.decode(res.body(), StandardCharsets.UTF_8)
+                } catch (e: Exception) {
+                    res.body().replace("%2F", "/").replace("%3A", ":")
+                }
+                val match = regex.find(decodedBody)
+                if (match != null) {
+                    return "spotify:$type:${match.groupValues[1]}"
+                }
+            } catch (e: Exception) {}
         }
+        return null
     }
 
     fun openAppByName(normalizedCommand: String): String {
+        pendingRemoteCommands.add(RemoteCommand(type = "OPEN_APP", payload = normalizedCommand))
         val requestedApp = normalizedCommand
             .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
             .trim()
+
+        if (!isWindows && !isMac) {
+            return "Orden enviada al puente de escritorio para iniciar '${requestedApp.uppercase()}', Cristian."
+        }
 
         val entry = installedApps.entries.firstOrNull { it.key == requestedApp }
             ?: installedApps.entries.firstOrNull { it.key.contains(requestedApp) || requestedApp.contains(it.key) }
@@ -481,12 +646,13 @@ class SystemScanner {
                 isMac -> ProcessBuilder("open", "-a", entry.value).start()
                 isLinux -> ProcessBuilder("sh", "-c", "${entry.value} &").start()
             }
-            return "Ejecutando **${entry.key.uppercase()}** en tu ${getOSLabel()}, Cristian."
+            return "Iniciando ${entry.key.uppercase()} en tu sistema, Cristian."
         }
-        return "No encontré una aplicación llamada **$requestedApp** en tu sistema."
+        return "No encontré una aplicación llamada '$requestedApp' en el catálogo de tu PC."
     }
 
     fun closeAppByName(normalizedCommand: String): String {
+        pendingRemoteCommands.add(RemoteCommand(type = "CLOSE_APP", payload = normalizedCommand))
         val appName = normalizedCommand
             .replace(Regex("""^.*?(?:cierra|cerrar|termina|mata)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|el\s+|la\s+)?"""), "")
             .trim()
@@ -498,34 +664,10 @@ class SystemScanner {
             appName.contains("calculadora") -> "CalculatorApp"
             else -> appName.split(" ").first()
         }
-        when {
-            isWindows -> ProcessBuilder("cmd", "/c", "taskkill /IM $processName.exe /F").start()
-            isMac -> ProcessBuilder("killall", processName).start()
-            isLinux -> ProcessBuilder("pkill", "-f", processName).start()
+        if (isWindows) {
+            ProcessBuilder("cmd", "/c", "taskkill /IM $processName.exe /F").start()
         }
-        return "Cerrando **$appName**, Cristian."
-    }
-
-    fun sendMediaKey(action: String) {
-        if (!isWindows) return
-        val psCommand = when (action) {
-            "PLAY_PAUSE" -> "\$w = New-Object -ComObject WScript.Shell; \$w.SendKeys([char]179)"
-            "NEXT" -> "\$w = New-Object -ComObject WScript.Shell; \$w.SendKeys([char]176)"
-            "PREV" -> "\$w = New-Object -ComObject WScript.Shell; \$w.SendKeys([char]177)"
-            "VOL_UP" -> "\$w = New-Object -ComObject WScript.Shell; 1..5 | ForEach-Object { \$w.SendKeys([char]175) }"
-            "VOL_DOWN" -> "\$w = New-Object -ComObject WScript.Shell; 1..5 | ForEach-Object { \$w.SendKeys([char]174) }"
-            "MUTE" -> "\$w = New-Object -ComObject WScript.Shell; \$w.SendKeys([char]173)"
-            else -> return
-        }
-        ProcessBuilder("powershell", "-NoProfile", "-Command", psCommand).start()
-    }
-
-    private fun openSystemTarget(uriOrPath: String) {
-        when {
-            isWindows -> ProcessBuilder("cmd", "/c", "start", "", uriOrPath).start()
-            isMac -> ProcessBuilder("open", uriOrPath).start()
-            isLinux -> ProcessBuilder("xdg-open", uriOrPath).start()
-        }
+        return "He cerrado $appName, Cristian."
     }
 
     fun normalizeText(text: String): String {
@@ -538,197 +680,389 @@ class SystemScanner {
 }
 
 // ============================================================================
-// 3. CEREBRO DE DAEMON + MINI-VENTANA NATIVA DE ESCRITORIO
+// 3. CEREBRO EN LA NUBE (MULTI-USUARIO + CÓRTEX CONVERSACIONAL SIN LOCALHOST)
 // ============================================================================
 @Service
 class DaemonBrain(
     private val systemScanner: SystemScanner
 ) {
     private val brainFile = File("daemon_brain.json")
+    private val factsFile = File("daemon_facts.txt")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
     private val neuralNet = SynapticNeuralNetwork()
     private val intents = mutableListOf<IntentNode>()
 
+    // Memoria de conversación separada por cada usuario que entre al link
+    private val userSessions = ConcurrentHashMap<String, MutableList<ConversationTurn>>()
+    private val userFacts = mutableListOf<String>()
+
+    private val httpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(8))
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .build()
+
     @Volatile var uiState: String = "IDLE"
+    @Volatile var lastConfidence: Int = 100
     private var miniWindow: DaemonMiniWindow? = null
 
     init {
-        loadOrCreateNeuralDataset()
+        loadUserFacts()
+        loadAndUpgradeNeuralDatabase()
         launchNativeDesktopMiniWindow()
-        startNativeVoiceRecognition()
+        speakAndDisplay(
+            "INICIALIZACIÓN",
+            "Daemon Cloud v6.0 en línea, Cristian. Córtex conversacional en la nube activo y control de Spotify reparado."
+        )
     }
 
-    private fun loadOrCreateNeuralDataset() {
-        if (!brainFile.exists()) {
-            val defaultDataset = listOf(
-                IntentNode(
-                    tag = "saludo",
-                    patterns = listOf("hola", "buenos dias", "buenas tardes", "buenas noches", "que tal daemon", "estas en linea", "hola daemon como estas", "despierta daemon"),
-                    responses = listOf("En línea y operando con mi red neuronal local, Cristian. ¿Qué ejecutamos hoy?")
-                ),
-                IntentNode(
-                    tag = "identidad",
-                    patterns = listOf("quien eres", "como te llamas", "que eres exactamente", "presentate", "cual es tu funcion", "quien te creo"),
-                    responses = listOf("Soy Daemon, tu asistente autónomo en Kotlin. Opero mediante una red neuronal multicapa entrenada localmente y fui creado por ti, Cristian.")
-                ),
-                IntentNode(
-                    tag = "play_pausa",
-                    patterns = listOf("dale play", "pon play", "pausa la musica", "ponle pausa", "deten la cancion", "reanuda la musica", "continua reproduciendo", "dale play a la cancion", "pausa spotify"),
-                    responses = listOf("Comando Play/Pausa ejecutado en tu sistema, Cristian."),
-                    action = "MEDIA_PLAY_PAUSE"
-                ),
-                IntentNode(
-                    tag = "siguiente_cancion",
-                    patterns = listOf("siguiente cancion", "cambia de cancion", "salta esta rola", "pasa a la siguiente", "otra cancion", "siguiente pista"),
-                    responses = listOf("Pasando a la siguiente pista, Cristian."),
-                    action = "MEDIA_NEXT"
-                ),
-                IntentNode(
-                    tag = "anterior_cancion",
-                    patterns = listOf("cancion anterior", "regresa la cancion", "pista anterior", "pon la anterior", "atras en spotify"),
-                    responses = listOf("Regresando a la pista anterior, Cristian."),
-                    action = "MEDIA_PREV"
-                ),
-                IntentNode(
-                    tag = "subir_volumen",
-                    patterns = listOf("sube el volumen", "subele a la musica", "mas volumen", "no se escucha subele", "aumenta el volumen"),
-                    responses = listOf("Subiendo el volumen del sistema, Cristian."),
-                    action = "VOL_UP"
-                ),
-                IntentNode(
-                    tag = "bajar_volumen",
-                    patterns = listOf("baja el volumen", "bajale a la musica", "menos volumen", "esta muy fuerte bajale", "disminuye el volumen"),
-                    responses = listOf("Bajando el volumen del sistema, Cristian."),
-                    action = "VOL_DOWN"
-                ),
-                IntentNode(
-                    tag = "que_suena",
-                    patterns = listOf("que cancion esta sonando", "como se llama esta cancion", "que estoy escuchando", "que suena en spotify", "dime el nombre de la rola"),
-                    responses = emptyList(),
-                    action = "CHECK_SPOTIFY_SONG"
-                ),
-                IntentNode(
-                    tag = "ventanas_abiertas",
-                    patterns = listOf("que tengo abierto", "que ventanas estan abiertas", "que programas estan corriendo", "revisa mis ventanas activas", "que aplicaciones tengo abiertas ahorita"),
-                    responses = emptyList(),
-                    action = "CHECK_OPEN_WINDOWS"
-                ),
-                IntentNode(
-                    tag = "concepto_red_neuronal",
-                    patterns = listOf("que es una red neuronal", "como funciona una red neuronal", "explicame las redes neuronales", "definicion de red neuronal", "que son las neuronas artificiales"),
-                    responses = listOf("Una red neuronal artificial es un modelo matemático inspirado en el cerebro biológico, compuesto por capas de nodos interconectados que ajustan sus pesos sinápticos mediante retropropagación.")
-                ),
-                IntentNode(
-                    tag = "concepto_sistema_operativo",
-                    patterns = listOf("que es un sistema operativo", "como funciona el sistema operativo", "para que sirve un so", "definicion de sistema operativo", "que hace el kernel"),
-                    responses = listOf("Un sistema operativo es el software principal que gestiona los recursos de hardware y provee servicios a los procesos y aplicaciones del usuario.")
-                ),
-                IntentNode(
-                    tag = "concepto_proceso",
-                    patterns = listOf("que es un proceso en computacion", "definicion de proceso e hilo", "como funciona un proceso en el sistema", "que son los procesos y threads"),
-                    responses = listOf("Un proceso es una instancia de un programa en ejecución con su propio espacio de memoria asignado, mientras que un hilo es la unidad básica de ejecución dentro de ese proceso.")
-                ),
-                IntentNode(
-                    tag = "concepto_agujero_negro",
-                    patterns = listOf("que es un agujero negro", "explicame los agujeros negros", "como funciona un agujero negro", "definicion de agujero negro"),
-                    responses = listOf("Un agujero negro es una región finita del espacio-tiempo cuya concentración de masa genera un campo gravitatorio tan intenso que ni siquiera la luz puede escapar.")
-                )
-            )
-            intents.addAll(defaultDataset)
-            objectMapper.writeValue(brainFile, intents)
+    private fun loadUserFacts() {
+        if (!factsFile.exists()) {
+            userFacts.add("El creador de Daemon es Cristian Alexis, estudiante de Ingeniería en Sistemas Computacionales en la ESCOM del IPN.")
+            factsFile.writeText(userFacts.joinToString("\n") + "\n")
         } else {
-            val loadedArray = objectMapper.readValue(brainFile, Array<IntentNode>::class.java)
-            intents.addAll(loadedArray)
+            userFacts.addAll(factsFile.readLines().filter { it.isNotBlank() })
         }
-        neuralNet.train(intents)
     }
 
-    private fun learnNewIntent(tag: String, patterns: List<String>, response: String): String {
-        val existing = intents.indexOfFirst { it.tag == tag }
-        if (existing >= 0) {
-            val old = intents[existing]
-            intents[existing] = old.copy(patterns = (old.patterns + patterns).distinct(), responses = listOf(response))
-        } else {
-            intents.add(IntentNode(tag = tag, patterns = patterns, responses = listOf(response)))
+    private fun saveUserFact(fact: String) {
+        userFacts.add(fact)
+        factsFile.appendText("$fact\n")
+    }
+
+    private fun loadAndUpgradeNeuralDatabase() {
+        val masterKnowledge = buildComprehensiveKnowledgeBase()
+        val existingMap = linkedMapOf<String, IntentNode>()
+
+        if (brainFile.exists()) {
+            try {
+                val loadedArray = objectMapper.readValue(brainFile, Array<IntentNode>::class.java)
+                loadedArray.forEach { existingMap[it.tag] = it }
+            } catch (e: Exception) {}
         }
+
+        for (node in masterKnowledge) {
+            val prev = existingMap[node.tag]
+            if (prev == null) {
+                existingMap[node.tag] = node
+            } else {
+                val mergedPatterns = (prev.patterns + node.patterns).distinct()
+                existingMap[node.tag] = prev.copy(patterns = mergedPatterns, responses = node.responses, action = node.action)
+            }
+        }
+
+        intents.clear()
+        intents.addAll(existingMap.values)
         objectMapper.writeValue(brainFile, intents)
         neuralNet.train(intents)
-        return "Red neuronal reentrenada, Cristian. Agregué el nodo **$tag** con ${patterns.size} patrones de activación."
     }
 
-    fun processThought(rawInput: String): String {
+    fun getNodeCount(): Int = intents.size
+    fun getPatternCount(): Int = neuralNet.getPatternCount()
+
+    // ========================================================================
+    // PROCESADOR PRINCIPAL (REFLEJOS DE SPOTIFY/PC + CONVERSACIÓN EN LA NUBE)
+    // ========================================================================
+    fun processThought(rawInput: String, sessionId: String = "local-admin"): String {
         val input = rawInput.trim()
         if (input.isBlank()) return "Sin señal de entrada."
         uiState = "THINKING"
 
         val normalized = systemScanner.normalizeText(input)
 
-        if (normalized.contains("reentrena") || normalized.contains("actualiza tu cerebro")) {
-            intents.clear()
-            loadOrCreateNeuralDataset()
-            return "He recargado `daemon_brain.json` y reentrenado mis pesos sinápticos, Cristian. Total de intenciones activas: **${intents.size}**."
+        // 1. SIGUIENTE CANCIÓN (Respuesta en 1ms)
+        val isNextTrack = normalized in setOf("siguiente", "cambiale", "otra", "otra cancion", "siguiente cancion", "siguiente pista", "siguiente rola", "salta la cancion") ||
+            normalized.contains("siguiente cancion") || normalized.contains("cambia de cancion") ||
+            normalized.contains("cambia la cancion") || normalized.contains("cambiale a la cancion") ||
+            normalized.contains("pasa a la siguiente") || normalized.contains("salta esta cancion") ||
+            normalized.contains("adelanta la cancion") || normalized.contains("pon la que sigue")
+        if (isNextTrack) {
+            lastConfidence = 100
+            systemScanner.sendMediaKey("NEXT")
+            return recordAndReturn(sessionId, input, "Pasando a la siguiente canción en Spotify, Cristian.")
         }
 
+        // 2. CANCIÓN ANTERIOR
+        val isPrevTrack = normalized in setOf("anterior", "atras", "cancion anterior", "pista anterior", "rola anterior") ||
+            normalized.contains("cancion anterior") || normalized.contains("regresa la cancion") ||
+            normalized.contains("pista anterior") || normalized.contains("pon la anterior") ||
+            normalized.contains("regresale a la cancion")
+        if (isPrevTrack) {
+            lastConfidence = 100
+            systemScanner.sendMediaKey("PREV")
+            return recordAndReturn(sessionId, input, "Regresando a la canción anterior en Spotify, Cristian.")
+        }
+
+        // 3. PLAY / PAUSA DIRECTO
+        val isPlayPause = normalized in setOf(
+            "play", "dale play", "pon play", "ponle play", "pausa", "pon pausa", "ponle pausa",
+            "pausa spotify", "dale play a spotify", "pausa la musica", "pausa la cancion",
+            "deten la musica", "deten la cancion", "para la musica", "reanuda la musica",
+            "reanuda la cancion", "reanuda spotify", "continua la musica", "dale play a la cancion",
+            "dale play a la musica", "quita la pausa"
+        )
+        if (isPlayPause) {
+            lastConfidence = 100
+            systemScanner.sendMediaKey("PLAY_PAUSE")
+            return recordAndReturn(sessionId, input, "Comando Play/Pausa ejecutado en Spotify, Cristian.")
+        }
+
+        // 4. VOLUMEN
+        if (normalized.contains("sube el volumen") || normalized.contains("subele al volumen") || normalized.contains("subele a la musica") || normalized == "subele" || normalized.contains("mas volumen")) {
+            lastConfidence = 100
+            systemScanner.sendMediaKey("VOL_UP")
+            return recordAndReturn(sessionId, input, "Subiendo el volumen del sistema, Cristian.")
+        }
+        if (normalized.contains("baja el volumen") || normalized.contains("bajale al volumen") || normalized.contains("bajale a la musica") || normalized == "bajale" || normalized.contains("menos volumen")) {
+            lastConfidence = 100
+            systemScanner.sendMediaKey("VOL_DOWN")
+            return recordAndReturn(sessionId, input, "Bajando el volumen del sistema, Cristian.")
+        }
+        if (normalized.contains("silencia") || normalized.contains("pon mute") || normalized == "mute" || normalized.contains("quita el sonido")) {
+            lastConfidence = 100
+            systemScanner.sendMediaKey("MUTE")
+            return recordAndReturn(sessionId, input, "Audio del sistema alternado, Cristian.")
+        }
+
+        // 5. PLAYLISTS EN SPOTIFY
         if (normalized.startsWith("vincula playlist ") || normalized.startsWith("guarda playlist ")) {
             val name = input.substringAfter("playlist ").substringBefore(" con ").trim()
             val link = input.substringAfter(" con ").trim()
-            return systemScanner.registerPlaylist(name, link)
+            return recordAndReturn(sessionId, input, systemScanner.registerPlaylist(name, link))
         }
-
         if (normalized.contains("playlist") || normalized.contains("lista de reproduccion") || normalized.contains("mis me gusta")) {
-            return systemScanner.playPlaylist(input, normalized)
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, systemScanner.playPlaylist(input, normalized))
         }
 
-        if (normalized.startsWith("reproduce ") || normalized.startsWith("pon la cancion ") || normalized.startsWith("pon musica de ")) {
-            val song = normalized.replace(Regex("""^(?:reproduce|pon la cancion|pon musica de)\s+"""), "").replace("en spotify", "").trim()
-            return systemScanner.playSongInSpotify(song)
+        // 6. REPRODUCIR CANCIÓN ESPECÍFICA EN SPOTIFY
+        val songCommandRegex = Regex("""^(?:daemon\s+|oye\s+|por\s+favor\s+)?(?:abre\s+spotify\s+y\s+)?(?:reproduce|pon\s+la\s+cancion|pon\s+musica\s+de|pon\s+en\s+spotify|dale\s+play\s+a|toca|busca\s+en\s+spotify)\s+(.+)$""")
+        val songMatch = songCommandRegex.find(normalized)
+        if (songMatch != null) {
+            val song = songMatch.groupValues[1].replace("en spotify", "").trim()
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, systemScanner.playSongInSpotify(song))
+        }
+        if (normalized.endsWith(" en spotify") && (normalized.startsWith("pon ") || normalized.startsWith("escuchar "))) {
+            val song = normalized.removePrefix("pon ").removePrefix("escuchar ").removeSuffix(" en spotify").trim()
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, systemScanner.playSongInSpotify(song))
         }
 
+        // 7. CONSULTAR QUÉ SUENA O QUÉ VENTANAS HAY ABIERTAS
+        if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando") || normalized.contains("como se llama esta cancion")) {
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, systemScanner.getCurrentlyPlayingSpotify())
+        }
+        if (normalized.contains("que ventanas estan abiertas") || normalized.contains("que programas estan corriendo") || normalized.contains("que aplicaciones tengo abiertas")) {
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, systemScanner.getOpenWindowsReport())
+        }
+
+        // 8. ABRIR O CERRAR APLICACIONES
         if (normalized.matches(Regex("""^(?:daemon\s+)?(?:abre|abrir|inicia|ejecuta|lanza)\s+.+$"""))) {
-            return systemScanner.openAppByName(normalized)
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, systemScanner.openAppByName(normalized))
         }
         if (normalized.matches(Regex("""^(?:daemon\s+)?(?:cierra|cerrar|termina|mata)\s+.+$"""))) {
-            return systemScanner.closeAppByName(normalized)
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, systemScanner.closeAppByName(normalized))
         }
 
-        if (input.lowercase().startsWith("entrena:")) {
-            val body = input.substringAfter(":")
-            if (body.contains("=")) {
-                val patternsPart = body.substringBefore("=").split("/").map { it.trim() }.filter { it.isNotBlank() }
-                val answerPart = body.substringAfter("=").trim()
-                val tag = "custom_" + System.currentTimeMillis() % 10000
-                return learnNewIntent(tag, patternsPart, answerPart)
-            }
+        // 9. MEMORIZAR DATOS PERMANENTES
+        if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ") || normalized.startsWith("memoriza que ")) {
+            val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
+            saveUserFact(fact)
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, "Guardado en mi memoria en la nube, Cristian: '$fact'.")
         }
 
+        // 10. CALCULADORA MATEMÁTICA
+        evaluateMathExpression(normalized)?.let { mathResult ->
+            lastConfidence = 100
+            return recordAndReturn(sessionId, input, mathResult)
+        }
+
+        // 11. CÓRTEX CONVERSACIONAL EN LA NUBE (Sin depender de localhost:11434)
+        val cloudReply = generateCloudConversationalResponse(input, sessionId)
+        if (cloudReply != null) {
+            lastConfidence = 99
+            return recordAndReturn(sessionId, input, cloudReply)
+        }
+
+        // 12. RESPALDO CON TU RED NEURONAL LOCAL (Por si algún día no hay internet)
         val (matchedIntent, confidence) = neuralNet.predict(input)
-        println("[DAEMON MLP] Input: '$input' -> Nodo ganador: '${matchedIntent?.tag}' (Confianza: ${(confidence * 100).toInt()}%)")
+        lastConfidence = (confidence * 100).toInt().coerceIn(0, 100)
 
-        if (matchedIntent != null && confidence >= 0.42) {
-            return when (matchedIntent.action) {
+        if (matchedIntent != null && confidence >= 0.32) {
+            val resp = when (matchedIntent.action) {
                 "MEDIA_PLAY_PAUSE" -> { systemScanner.sendMediaKey("PLAY_PAUSE"); matchedIntent.responses.first() }
                 "MEDIA_NEXT" -> { systemScanner.sendMediaKey("NEXT"); matchedIntent.responses.first() }
                 "MEDIA_PREV" -> { systemScanner.sendMediaKey("PREV"); matchedIntent.responses.first() }
-                "VOL_UP" -> { systemScanner.sendMediaKey("VOL_UP"); matchedIntent.responses.first() }
-                "VOL_DOWN" -> { systemScanner.sendMediaKey("VOL_DOWN"); matchedIntent.responses.first() }
-                "CHECK_SPOTIFY_SONG" -> systemScanner.getCurrentlyPlayingSpotify()
-                "CHECK_OPEN_WINDOWS" -> systemScanner.getOpenWindowsReport()
+                "CHECK_TIME" -> {
+                    val now = LocalDateTime.now()
+                    "Son las ${now.format(DateTimeFormatter.ofPattern("HH:mm:ss"))} del ${now.format(DateTimeFormatter.ofPattern("dd/MM/yyyy"))}."
+                }
+                "CHECK_WEATHER" -> fetchLiveWeather()
                 else -> matchedIntent.responses.random()
             }
+            return recordAndReturn(sessionId, input, resp)
         }
 
-        return "Mi red neuronal analizó tu frase (confianza: ${(confidence * 100).toInt()}%), pero aún no tengo ese nodo entrenado. Agrégalo en `daemon_brain.json` o dime: *'Entrena: pregunta 1 / pregunta 2 = respuesta'*."
+        return recordAndReturn(sessionId, input, "Estoy en línea, Cristian. ¿Me repites la idea para procesarla?")
+    }
+
+    // ========================================================================
+    // MOTOR CONVERSACIONAL EN LA NUBE (0 CONFIGURACIÓN LOCAL, SIN LOCALHOST)
+    // ========================================================================
+    private fun generateCloudConversationalResponse(userInput: String, sessionId: String): String? {
+        return try {
+            val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
+            val factsContext = if (userFacts.isEmpty()) "" else "Memoria permanente:\n" + userFacts.joinToString("\n") { "- $it" }
+
+            val systemPrompt = """
+                Eres Daemon (v6.0), una inteligencia artificial avanzada estilo J.A.R.V.I.S. creada por Cristian Alexis.
+                Estás alojado en la nube para que Cristian y las personas que él autorice puedan conversar contigo desde cualquier lugar.
+                Hora actual: $horaActual.
+                $factsContext
+                
+                Instrucciones de conversación:
+                1. Responde siempre en español con tono inteligente, fluido, leal y conversacional (no robótico).
+                2. Sé directo y claro (1 a 3 párrafos breves).
+                3. Mantén el hilo de la conversación recordando los mensajes previos del usuario.
+                4. Si el usuario te pide reproducir música en Spotify o abrir una app en la PC de Cristian durante la conversación, agrega al final de tu respuesta una etiqueta exacta:
+                   [ACTION:PLAY_SONG:nombre de la cancion]
+                   [ACTION:PLAY_PLAYLIST:nombre de la playlist]
+                   [ACTION:MEDIA_NEXT]
+                   [ACTION:MEDIA_PREV]
+                   [ACTION:MEDIA_PLAY_PAUSE]
+                   [ACTION:OPEN_APP:nombre de la app]
+            """.trimIndent()
+
+            val history = userSessions.getOrPut(sessionId) { mutableListOf() }
+            val messagesList = mutableListOf>()
+            messagesList.add(mapOf("role" to "system", "content" to systemPrompt))
+
+            synchronized(history) {
+                history.takeLast(14).forEach { turn ->
+                    messagesList.add(mapOf("role" to turn.role, "content" to turn.content))
+                }
+            }
+            messagesList.add(mapOf("role" to "user", "content" to userInput))
+
+            val payload = mapOf(
+                "messages" to messagesList,
+                "model" to "openai",
+                "seed" to 42,
+                "jsonMode" to false
+            )
+
+            val jsonBody = objectMapper.writeValueAsString(payload)
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create("https://text.pollinations.ai/"))
+                .timeout(Duration.ofSeconds(15))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "DaemonCloud/6.0")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .build()
+
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() != 200) return null
+
+            val rawReply = res.body().trim()
+            if (rawReply.isBlank()) return null
+
+            return executeEmbeddedActions(rawReply)
+        } catch (e: Exception) {
+            println("[DAEMON CLOUD CORTEX WARN] ${e.message}")
+            null
+        }
+    }
+
+    private fun executeEmbeddedActions(llmReply: String): String {
+        val actionRegex = Regex("""\[ACTION:([A-Z_]+)(?::([^\]]+))?\]""")
+        actionRegex.findAll(llmReply).forEach { match ->
+            val actionType = match.groupValues[1].trim()
+            val param = match.groupValues[2].trim()
+            when (actionType) {
+                "PLAY_SONG" -> systemScanner.playSongInSpotify(param)
+                "PLAY_PLAYLIST" -> systemScanner.playPlaylist(param, systemScanner.normalizeText(param))
+                "MEDIA_PLAY_PAUSE" -> systemScanner.sendMediaKey("PLAY_PAUSE")
+                "MEDIA_NEXT" -> systemScanner.sendMediaKey("NEXT")
+                "MEDIA_PREV" -> systemScanner.sendMediaKey("PREV")
+                "OPEN_APP" -> systemScanner.openAppByName(systemScanner.normalizeText(param))
+            }
+        }
+        return llmReply.replace(actionRegex, "").trim()
+    }
+
+    private fun recordAndReturn(sessionId: String, userPrompt: String, daemonReply: String): String {
+        val history = userSessions.getOrPut(sessionId) { mutableListOf() }
+        synchronized(history) {
+            history.add(ConversationTurn("user", userPrompt))
+            history.add(ConversationTurn("assistant", daemonReply))
+            while (history.size > 20) {
+                history.removeAt(0)
+            }
+        }
+        return daemonReply
+    }
+
+    private fun evaluateMathExpression(normalized: String): String? {
+        val cleaned = normalized.replace("por", "*").replace("entre", "/").replace("mas", "+").replace("menos", "-")
+        val mathRegex = Regex("""^(?:cuanto es|calcula|resuelve)\s+(-?\d+(?:\.\d+)?)\s*([\+\-\*\/])\s*(-?\d+(?:\.\d+)?)$""")
+        val m = mathRegex.find(cleaned) ?: return null
+        val a = m.groupValues[1].toDoubleOrNull() ?: return null
+        val op = m.groupValues[2]
+        val b = m.groupValues[3].toDoubleOrNull() ?: return null
+        val res = when (op) {
+            "+" -> a + b
+            "-" -> a - b
+            "*" -> a * b
+            "/" -> if (b != 0.0) a / b else return "División por cero indeterminada."
+            else -> return null
+        }
+        val formatted = if (res % 1.0 == 0.0) res.toLong().toString() else "%.4f".format(res)
+        return "El resultado de $a $op $b es $formatted, Cristian."
+    }
+
+    private fun fetchLiveWeather(): String {
+        return try {
+            val url = "https://api.open-meteo.com/v1/forecast?latitude=19.60&longitude=-99.05&current_weather=true"
+            val req = HttpRequest.newBuilder().uri(URI.create(url)).GET().build()
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            val currentBlock = res.body().substringAfter("\"current_weather\":", "")
+            val temp = Regex(""""temperature"\s*:\s*(-?\d+(\.\d+)?)""").find(currentBlock)?.groupValues?.get(1) ?: "--"
+            val wind = Regex(""""windspeed"\s*:\s*(\d+(\.\d+)?)""").find(currentBlock)?.groupValues?.get(1) ?: "--"
+            "La temperatura actual es de $temp °C con vientos de $wind km/h."
+        } catch (e: Exception) {
+            "Sensor meteorológico sin enlace en este momento."
+        }
     }
 
     fun speakAndDisplay(userText: String, reply: String) {
         miniWindow?.updateHologram(userText, reply)
+        if (!systemScanner.isWindows) return
         thread {
             try {
                 uiState = "SPEAKING"
-                val cleanSpeech = reply.replace(Regex("[#*`_~>\\-]"), "").replace("\n", ". ").replace("'", "").replace("\"", "").trim()
-                if (systemScanner.isWindows && cleanSpeech.isNotBlank()) {
-                    val ps = "Add-Type -AssemblyName System.Speech; \$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \$s.Rate = 1; \$s.Speak('$cleanSpeech')"
-                    ProcessBuilder("powershell", "-NoProfile", "-Command", ps).start().waitFor()
+                val cleanSpeech = reply
+                    .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en pantalla.")
+                    .replace(Regex("[#*`_~>\\-•]"), "")
+                    .replace("\n", ". ")
+                    .trim()
+
+                if (cleanSpeech.isNotBlank()) {
+                    val psSpeech = """
+                        Add-Type -AssemblyName System.Speech
+                        ${'$'}synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+                        ${'$'}synth.Rate = 1
+                        ${'$'}synth.Speak(${'$'}input)
+                    """.trimIndent()
+                    val utf16 = psSpeech.toByteArray(StandardCharsets.UTF_16LE)
+                    val b64 = Base64.getEncoder().encodeToString(utf16)
+                    val proc = ProcessBuilder("powershell.exe", "-NoProfile", "-EncodedCommand", b64).start()
+                    proc.outputStream.use { it.write(cleanSpeech.toByteArray(StandardCharsets.UTF_8)) }
+                    proc.waitFor()
                 }
             } catch (e: Exception) {
             } finally {
@@ -742,14 +1076,7 @@ class DaemonBrain(
         thread {
             try {
                 uiState = "LISTENING"
-                miniWindow?.setStatusText("ESCUCHANDO TU VOZ // HABLA AHORA...")
-
-                val grammarPhrases = intents.flatMap { it.patterns }
-                    .map { it.replace("'", "").trim() }
-                    .filter { it.isNotBlank() }
-                    .distinct()
-                    .take(120)
-                    .joinToString(",") { "'$it'" }
+                miniWindow?.setStatusText("CANAL DE VOZ ACTIVO // HABLA AHORA...")
 
                 val psScript = """
                     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -764,12 +1091,6 @@ class DaemonBrain(
                     
                     ${'$'}engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine(${'$'}esRec.Id)
                     ${'$'}engine.SetInputToDefaultAudioDevice()
-                    
-                    ${'$'}choices = New-Object System.Speech.Recognition.Choices
-                    ${'$'}choices.Add(@($grammarPhrases, 'abre spotify', 'cierra spotify', 'abre calculadora', 'abre discord', 'pon mi playlist de reggaeton', 'pon mi playlist de rock en espanol', 'pon mi playlist para programar', 'pon mis me gusta'))
-                    ${'$'}gb = New-Object System.Speech.Recognition.GrammarBuilder(${'$'}choices)
-                    ${'$'}gb.Culture = ${'$'}esRec.Culture
-                    ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.Grammar(${'$'}gb)))
                     ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
                     
                     ${'$'}result = ${'$'}engine.Recognize([TimeSpan]::FromSeconds(6))
@@ -780,20 +1101,19 @@ class DaemonBrain(
                     }
                 """.trimIndent()
 
-                val proc = ProcessBuilder("powershell", "-NoProfile", "-Command", psScript).start()
-                val output = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8)).readText().trim()
+                val output = systemScanner.runPowerShell(psScript, wait = true)
 
                 when {
                     output == "ERR_NO_RECOGNIZER" -> {
                         uiState = "IDLE"
-                        miniWindow?.updateHologram("DIAGNÓSTICO DE VOZ", "Tu Windows no tiene instalado el paquete de Reconocimiento de Voz en Español. Ve a Configuración -> Hora e idioma -> Voz.")
+                        miniWindow?.updateHologram("VOZ DE WINDOWS", "No se detectó el paquete de reconocimiento de voz en Español.")
                     }
                     output == "ERR_TIMEOUT" || output.isBlank() -> {
                         uiState = "IDLE"
-                        miniWindow?.setStatusText("STANDBY // NO SE DETECTÓ VOZ")
+                        miniWindow?.setStatusText("STANDBY // LISTO PARA CONVERSAR")
                     }
                     else -> {
-                        val reply = processThought(output)
+                        val reply = processThought(output, "local-voice")
                         speakAndDisplay(output, reply)
                     }
                 }
@@ -804,129 +1124,228 @@ class DaemonBrain(
         }
     }
 
-    private fun startNativeVoiceRecognition() {
-        speakAndDisplay("SISTEMA INICIADO", "Mini-ventana del núcleo y red neuronal activas, Cristian.")
-    }
-
     private fun launchNativeDesktopMiniWindow() {
         try {
-            System.setProperty("java.awt.headless", "false")
             if (!GraphicsEnvironment.isHeadless()) {
                 SwingUtilities.invokeLater {
-                    miniWindow = DaemonMiniWindow(this)
+                    miniWindow = DaemonMiniWindow(this, systemScanner)
                     miniWindow?.isVisible = true
                 }
             }
         } catch (e: Exception) {
-            println("[DAEMON GUI INFO] ${e.message}")
+            println("[DAEMON CLOUD MODE] Ejecutando en modo servidor web sin ventana local.")
         }
     }
+
+    private fun kbNode(tag: String, aliases: List<String>, response: String): IntentNode {
+        val patterns = mutableListOf<String>()
+        for (alias in aliases) {
+            patterns.addAll(listOf(alias, "que es $alias", "definicion de $alias", "explicame $alias", "como funciona $alias"))
+        }
+        return IntentNode(tag = tag, patterns = patterns.distinct(), responses = listOf(response))
+    }
+
+    private fun buildComprehensiveKnowledgeBase(): List<IntentNode> = listOf(
+        IntentNode("saludo", listOf("hola", "buenos dias", "buenas tardes", "buenas noches", "que tal daemon"), listOf("En línea y operando en modo Cloud, Cristian. ¿De qué platicamos o qué ejecutamos hoy?")),
+        IntentNode("identidad", listOf("quien eres", "como te llamas", "que eres"), listOf("Soy Daemon v6.0, una inteligencia artificial en la nube creada por Cristian con control directo sobre su sistema y córtex conversacional.")),
+        IntentNode("hora_fecha", listOf("que hora es", "dime la hora", "fecha de hoy"), emptyList(), "CHECK_TIME"),
+        IntentNode("clima_actual", listOf("como esta el clima", "que temperatura hace"), emptyList(), "CHECK_WEATHER"),
+        kbNode("proceso_hilo", listOf("proceso", "hilo", "thread"), "Un proceso es un programa en ejecución con memoria aislada; un hilo es una unidad de ejecución ligera dentro de ese proceso."),
+        kbNode("mutex_semaforo", listOf("mutex", "semaforo", "exclusion mutua"), "Un Mutex garantiza exclusión mutua binaria para un recurso crítico, mientras que un Semáforo sincroniza el acceso mediante un contador entero.")
+    )
 }
 
 // ============================================================================
-// 4. MINI-VENTANA NATIVA DEL NÚCLEO (420x540 px, NO SUPERPUESTA)
+// 4. MINI-VENTANA HOLOGRÁFICA PARA TU PC (SIN BORDES DE WINDOWS)
 // ============================================================================
-class DaemonMiniWindow(private val brain: DaemonBrain) : JFrame("DAEMON // STARK CORE") {
+class DaemonMiniWindow(
+    private val brain: DaemonBrain,
+    private val scanner: SystemScanner
+) : JFrame("DAEMON // STARK CLOUD v6.0") {
 
-    private val statusLabel = JLabel("ONLINE // RED NEURONAL ACTIVA")
-    private val outputArea = JTextArea("Núcleo inicializado. Escribe abajo o presiona [🎤 HABLAR].")
+    private var dragOffset = Point(0, 0)
+    private val statusLabel = JLabel("ONLINE // CLOUD CORTEX & SPOTIFY BRIDGE")
+    private val outputArea = JTextArea()
     private val inputField = JTextField()
-    private val corePanel = CoreCanvasPanel()
+    private val corePanel = StarkReactorCanvas()
 
     init {
-        defaultCloseOperation = EXIT_ON_CLOSE
-        setSize(420, 540)
+        isUndecorated = true
+        background = Color(0, 0, 0, 0)
+        setSize(460, 610)
         isAlwaysOnTop = false
-        location = Point(60, 60)
-        contentPane.background = Color(4, 9, 18)
-        layout = BorderLayout(8, 8)
+        location = Point(70, 60)
 
-        val header = JPanel(BorderLayout()).apply {
-            background = Color(8, 16, 32)
-            border = EmptyBorder(10, 14, 10, 14)
-            val title = JLabel("DAEMON // NEURAL CORE").apply {
-                foreground = Color(0, 235, 255)
-                font = Font("Consolas", Font.BOLD, 14)
+        val mainContainer = object : JPanel(BorderLayout(0, 0)) {
+            override fun paintComponent(g: Graphics) {
+                val g2 = g as Graphics2D
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+
+                g2.color = Color(5, 11, 22, 248)
+                g2.fill(RoundRectangle2D.Double(0.0, 0.0, width.toDouble(), height.toDouble(), 24.0, 24.0))
+
+                g2.color = Color(0, 225, 255, 110)
+                g2.stroke = BasicStroke(1.5f)
+                g2.draw(RoundRectangle2D.Double(1.0, 1.0, width - 2.0, height - 2.0, 24.0, 24.0))
+
+                g2.color = Color(0, 245, 255, 220)
+                g2.stroke = BasicStroke(2.5f)
+                val c = 18
+                g2.drawLine(12, 3, 12 + c, 3)
+                g2.drawLine(width - 12 - c, 3, width - 12, 3)
+                g2.drawLine(12, height - 3, 12 + c, height - 3)
+                g2.drawLine(width - 12 - c, height - 3, width - 12, height - 3)
             }
-            statusLabel.apply {
-                foreground = Color(16, 185, 129)
-                font = Font("Consolas", Font.PLAIN, 11)
-            }
-            add(title, BorderLayout.NORTH)
-            add(statusLabel, BorderLayout.SOUTH)
         }
-        add(header, BorderLayout.NORTH)
-        add(corePanel, BorderLayout.CENTER)
+        mainContainer.isOpaque = false
+        mainContainer.border = EmptyBorder(10, 14, 14, 14)
 
-        val bottomPanel = JPanel(BorderLayout(6, 6)).apply {
-            background = Color(4, 9, 18)
-            border = EmptyBorder(4, 12, 12, 12)
+        val topBar = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = EmptyBorder(4, 6, 8, 6)
+
+            val titleBox = JPanel(GridLayout(2, 1, 0, 1)).apply {
+                isOpaque = false
+                val title = JLabel("◈ DAEMON // CLOUD & PC OS v6.0").apply {
+                    foreground = Color(0, 240, 255)
+                    font = Font("Consolas", Font.BOLD, 14)
+                }
+                statusLabel.apply {
+                    foreground = Color(16, 215, 150)
+                    font = Font("Consolas", Font.PLAIN, 10)
+                }
+                add(title)
+                add(statusLabel)
+            }
+
+            val windowBtns = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+                isOpaque = false
+                val minBtn = createHudControlButton("—", Color(0, 210, 255)) { state = Frame.ICONIFIED }
+                val closeBtn = createHudControlButton("✕", Color(255, 80, 100)) { System.exit(0) }
+                add(minBtn)
+                add(closeBtn)
+            }
+
+            add(titleBox, BorderLayout.WEST)
+            add(windowBtns, BorderLayout.EAST)
+
+            addMouseListener(object : MouseAdapter() {
+                override fun mousePressed(e: MouseEvent) { dragOffset = e.point }
+            })
+            addMouseMotionListener(object : MouseMotionAdapter() {
+                override fun mouseDragged(e: MouseEvent) {
+                    val curr = e.locationOnScreen
+                    setLocation(curr.x - dragOffset.x, curr.y - dragOffset.y)
+                }
+            })
+        }
+
+        val bottomPanel = JPanel(BorderLayout(0, 10)).apply {
+            isOpaque = false
+            border = EmptyBorder(6, 4, 2, 4)
 
             outputArea.apply {
-                background = Color(10, 22, 42)
-                foreground = Color(215, 250, 255)
+                background = Color(8, 18, 34)
+                foreground = Color(210, 248, 255)
                 font = Font("Consolas", Font.PLAIN, 12)
                 lineWrap = true
                 wrapStyleWord = true
                 isEditable = false
-                border = EmptyBorder(8, 10, 8, 10)
-                rows = 4
+                border = EmptyBorder(10, 12, 10, 12)
+                rows = 5
             }
+
             val scroll = JScrollPane(outputArea).apply {
-                border = BorderFactory.createLineBorder(Color(0, 180, 215), 1)
+                background = Color(8, 18, 34)
+                viewport.background = Color(8, 18, 34)
+                border = BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(Color(0, 200, 255, 90), 1),
+                    BorderFactory.createEmptyBorder(2, 2, 2, 2)
+                )
+                verticalScrollBar.ui = object : BasicScrollBarUI() {
+                    override fun configureScrollBarColors() {
+                        thumbColor = Color(0, 190, 230, 120)
+                        trackColor = Color(6, 14, 26)
+                    }
+                    override fun createDecreaseButton(orientation: Int) = JButton().apply { preferredSize = Dimension(0, 0) }
+                    override fun createIncreaseButton(orientation: Int) = JButton().apply { preferredSize = Dimension(0, 0) }
+                }
             }
 
-            val controls = JPanel(BorderLayout(6, 0)).apply {
-                background = Color(4, 9, 18)
+            val inputRow = JPanel(BorderLayout(8, 0)).apply {
+                isOpaque = false
 
-                val micBtn = JButton("🎤 HABLAR").apply {
-                    background = Color(6, 95, 70)
-                    foreground = Color.WHITE
-                    font = Font("Consolas", Font.BOLD, 12)
-                    isFocusPainted = false
-                    cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                    addActionListener { brain.triggerSingleVoiceListen() }
+                val voiceBtn = CyberButton("🎤 VOZ", Color(16, 185, 129)) {
+                    brain.triggerSingleVoiceListen()
                 }
 
                 inputField.apply {
-                    background = Color(12, 20, 35)
-                    foreground = Color(0, 240, 255)
-                    caretColor = Color.CYAN
+                    background = Color(8, 18, 34)
+                    foreground = Color(0, 245, 255)
+                    caretColor = Color(0, 255, 255)
                     font = Font("Consolas", Font.PLAIN, 13)
                     border = BorderFactory.createCompoundBorder(
-                        BorderFactory.createLineBorder(Color(0, 150, 190)),
-                        EmptyBorder(6, 8, 6, 8)
+                        BorderFactory.createLineBorder(Color(0, 200, 255, 110), 1),
+                        EmptyBorder(8, 10, 8, 10)
                     )
-                    addActionListener { sendTextCommand() }
+                    addActionListener { submitInput() }
                 }
 
-                val sendBtn = JButton("ENVIAR").apply {
-                    background = Color(0, 120, 160)
-                    foreground = Color.WHITE
-                    font = Font("Consolas", Font.BOLD, 12)
-                    isFocusPainted = false
-                    addActionListener { sendTextCommand() }
+                val execBtn = CyberButton("⚡ ENVIAR", Color(0, 195, 255)) {
+                    submitInput()
                 }
 
-                add(micBtn, BorderLayout.WEST)
+                add(voiceBtn, BorderLayout.WEST)
                 add(inputField, BorderLayout.CENTER)
-                add(sendBtn, BorderLayout.EAST)
+                add(execBtn, BorderLayout.EAST)
             }
 
             add(scroll, BorderLayout.CENTER)
-            add(controls, BorderLayout.SOUTH)
+            add(inputRow, BorderLayout.SOUTH)
         }
-        add(bottomPanel, BorderLayout.SOUTH)
+
+        mainContainer.add(topBar, BorderLayout.NORTH)
+        mainContainer.add(corePanel, BorderLayout.CENTER)
+        mainContainer.add(bottomPanel, BorderLayout.SOUTH)
+        contentPane = mainContainer
 
         javax.swing.Timer(16) { corePanel.repaint() }.start()
     }
 
-    private fun sendTextCommand() {
+    private fun createHudControlButton(symbol: String, accent: Color, onClick: () -> Unit): JComponent {
+        return object : JPanel() {
+            private var hovered = false
+            init {
+                preferredSize = Dimension(26, 24)
+                isOpaque = false
+                cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                addMouseListener(object : MouseAdapter() {
+                    override fun mouseEntered(e: MouseEvent?) { hovered = true; repaint() }
+                    override fun mouseExited(e: MouseEvent?) { hovered = false; repaint() }
+                    override fun mouseClicked(e: MouseEvent?) { onClick() }
+                })
+            }
+            override fun paintComponent(g: Graphics) {
+                val g2 = g as Graphics2D
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                g2.color = if (hovered) Color(accent.red, accent.green, accent.blue, 60) else Color(15, 28, 48, 160)
+                g2.fillRoundRect(0, 0, width - 1, height - 1, 6, 6)
+                g2.color = if (hovered) accent else Color(accent.red, accent.green, accent.blue, 120)
+                g2.drawRoundRect(0, 0, width - 1, height - 1, 6, 6)
+                g2.font = Font("Consolas", Font.BOLD, 12)
+                val fm = g2.fontMetrics
+                g2.drawString(symbol, (width - fm.stringWidth(symbol)) / 2, (height + fm.ascent - fm.descent) / 2)
+            }
+        }
+    }
+
+    private fun submitInput() {
         val text = inputField.text.trim()
         if (text.isBlank()) return
         inputField.text = ""
+        setStatusText("CONVERSANDO CON EL CÓRTEX CLOUD...")
         thread {
-            val reply = brain.processThought(text)
+            val reply = brain.processThought(text, "desktop-owner")
             brain.speakAndDisplay(text, reply)
         }
     }
@@ -937,25 +1356,61 @@ class DaemonMiniWindow(private val brain: DaemonBrain) : JFrame("DAEMON // STARK
 
     fun updateHologram(userQuery: String, daemonReply: String) {
         SwingUtilities.invokeLater {
-            statusLabel.text = "ORDEN: ${userQuery.take(32).uppercase()}"
-            outputArea.text = daemonReply.replace("**", "").replace("### ", "")
+            statusLabel.text = "TÚ: ${userQuery.take(38)}"
+            outputArea.text = daemonReply
             outputArea.caretPosition = 0
         }
     }
 
-    inner class CoreCanvasPanel : JPanel() {
-        private var angle = 0.0
-        private val nodes = List(95) { i ->
+    inner class CyberButton(
+        private val textLabel: String,
+        private val neonColor: Color,
+        private val action: () -> Unit
+    ) : JPanel() {
+        private var hover = false
+
+        init {
+            isOpaque = false
+            preferredSize = Dimension(if (textLabel.length > 7) 96 else 80, 36)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            addMouseListener(object : MouseAdapter() {
+                override fun mouseEntered(e: MouseEvent?) { hover = true; repaint() }
+                override fun mouseExited(e: MouseEvent?) { hover = false; repaint() }
+                override fun mouseClicked(e: MouseEvent?) { action() }
+            })
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g as Graphics2D
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+
+            g2.color = if (hover) Color(neonColor.red, neonColor.green, neonColor.blue, 55) else Color(10, 24, 42, 220)
+            g2.fillRoundRect(0, 0, width - 1, height - 1, 8, 8)
+
+            g2.color = if (hover) neonColor else Color(neonColor.red, neonColor.green, neonColor.blue, 140)
+            g2.stroke = BasicStroke(if (hover) 1.6f else 1.1f)
+            g2.drawRoundRect(0, 0, width - 1, height - 1, 8, 8)
+
+            g2.color = if (hover) Color.WHITE else Color(220, 250, 255)
+            g2.font = Font("Consolas", Font.BOLD, 12)
+            val fm = g2.fontMetrics
+            g2.drawString(textLabel, (width - fm.stringWidth(textLabel)) / 2, (height + fm.ascent - fm.descent) / 2)
+        }
+    }
+
+    inner class StarkReactorCanvas : JPanel() {
+        private var time = 0.0
+        private val nodes = List(115) { i ->
             val golden = (1 + sqrt(5.0)) / 2
             val theta = 2 * PI * i / golden
-            val phi = acos(1 - 2 * (i + 0.5) / 95)
-            Triple(theta, phi, 68.0 + (i % 4) * 6.0)
+            val phi = acos(1 - 2 * (i + 0.5) / 115)
+            Triple(theta, phi, 62.0 + (i % 4) * 6.5)
         }
 
         init {
-            background = Color(4, 9, 18)
+            isOpaque = false
             cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-            toolTipText = "Haz clic en el núcleo para hablar por micrófono"
+            toolTipText = "Haz clic en el reactor para hablar con Daemon"
             addMouseListener(object : MouseAdapter() {
                 override fun mouseClicked(e: MouseEvent?) {
                     brain.triggerSingleVoiceListen()
@@ -968,72 +1423,158 @@ class DaemonMiniWindow(private val brain: DaemonBrain) : JFrame("DAEMON // STARK
             val g2 = g as Graphics2D
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
 
-            val cx = width / 2.0
-            val cy = height / 2.0
+            val w = width.toDouble()
+            val h = height.toDouble()
+            val cx = w / 2.0
+            val cy = h / 2.0
+
+            g2.color = Color(0, 210, 255, 12)
+            g2.stroke = BasicStroke(1f)
+            var gx = 0
+            while (gx < w) { g2.drawLine(gx, 0, gx, h.toInt()); gx += 28 }
+            var gy = 0
+            while (gy < h) { g2.drawLine(0, gy, w.toInt(), gy); gy += 28 }
 
             val mainColor = when (brain.uiState) {
-                "LISTENING" -> Color(16, 235, 150)
-                "THINKING" -> Color(255, 175, 0)
+                "LISTENING" -> Color(16, 245, 160)
+                "THINKING" -> Color(255, 180, 0)
                 "SPEAKING" -> Color(0, 255, 255)
-                else -> Color(0, 200, 255)
+                else -> Color(0, 205, 255)
             }
 
-            val speed = if (brain.uiState == "THINKING") 0.06 else if (brain.uiState == "SPEAKING") 0.035 else 0.015
-            angle += speed
-            val pulse = if (brain.uiState == "SPEAKING" || brain.uiState == "LISTENING") 1.0 + sin(angle * 5) * 0.14 else 1.0 + sin(angle * 2) * 0.03
+            val speed = when (brain.uiState) {
+                "THINKING" -> 0.065
+                "SPEAKING" -> 0.038
+                "LISTENING" -> 0.032
+                else -> 0.014
+            }
+            time += speed
+            val pulse = if (brain.uiState == "SPEAKING" || brain.uiState == "LISTENING") {
+                1.0 + abs(sin(time * 4.5)) * 0.16
+            } else {
+                1.0 + sin(time * 2.0) * 0.03
+            }
 
-            g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 90)
-            g2.stroke = BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 0f, floatArrayOf(18f, 12f), (angle * 40).toFloat())
-            val r1 = 115 * pulse
-            g2.draw(Ellipse2D.Double(cx - r1, cy - r1, r1 * 2, r1 * 2))
+            for (r in 120 downTo 15 step 22) {
+                val rad = r * pulse
+                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 14)
+                g2.fill(Ellipse2D.Double(cx - rad, cy - rad, rad * 2, rad * 2))
+            }
 
-            g2.stroke = BasicStroke(1.5f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 0f, floatArrayOf(32f, 18f), (-angle * 60).toFloat())
-            val r2 = 96 * pulse
-            g2.draw(Ellipse2D.Double(cx - r2, cy - r2, r2 * 2, r2 * 2))
+            g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 120)
+            g2.stroke = BasicStroke(2.2f)
+            val rOuter = 114.0
+            for (a in 0 until 360 step 60) {
+                g2.draw(Arc2D.Double(cx - rOuter, cy - rOuter, rOuter * 2, rOuter * 2, a + time * 25, 36.0, Arc2D.OPEN))
+            }
+
+            g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 85)
+            g2.stroke = BasicStroke(1.4f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND, 0f, floatArrayOf(12f, 10f), (-time * 40).toFloat())
+            val rMid = 94.0 * pulse
+            g2.draw(Ellipse2D.Double(cx - rMid, cy - rMid, rMid * 2, rMid * 2))
+
+            val numBars = 60
+            g2.stroke = BasicStroke(1.8f)
+            for (i in 0 until numBars) {
+                val a = (i.toDouble() / numBars) * PI * 2 + time * 0.2
+                val amp = if (brain.uiState == "IDLE") {
+                    3.0 + sin(a * 4 + time * 2) * 2.0
+                } else {
+                    5.0 + abs(sin(a * 7 + time * 6)) * 22.0 * pulse
+                }
+                val rIn = 78.0 * pulse
+                val rOut = rIn + amp
+                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 150)
+                g2.drawLine(
+                    (cx + cos(a) * rIn).toInt(), (cy + sin(a) * rIn).toInt(),
+                    (cx + cos(a) * rOut).toInt(), (cy + sin(a) * rOut).toInt()
+                )
+            }
 
             val proj = nodes.map { (theta, phi, baseR) ->
                 val r = baseR * pulse
-                val rotT = theta + angle
-                val x3 = r * sin(phi) * cos(rotT)
-                val y3 = r * cos(phi)
-                val z3 = r * sin(phi) * sin(rotT)
-                val fov = 240.0 / (240.0 + z3)
+                val rotT = theta + time
+                val rotP = phi + sin(time * 0.5) * 0.1
+                val x3 = r * sin(rotP) * cos(rotT)
+                val y3 = r * cos(rotP)
+                val z3 = r * sin(rotP) * sin(rotT)
+                val fov = 230.0 / (230.0 + z3)
                 doubleArrayOf(cx + x3 * fov, cy + y3 * fov, z3)
             }
 
-            g2.stroke = BasicStroke(0.8f)
+            g2.stroke = BasicStroke(0.75f)
             for (i in proj.indices) {
                 for (j in i + 1 until proj.size) {
                     val dx = proj[i][0] - proj[j][0]
                     val dy = proj[i][1] - proj[j][1]
                     val dist = sqrt(dx * dx + dy * dy)
-                    if (dist < 32 * pulse) {
-                        val alpha = ((1.0 - dist / (32 * pulse)) * 110).toInt().coerceIn(10, 255)
+                    if (dist < 28 * pulse) {
+                        val alpha = ((1.0 - dist / (28 * pulse)) * 125).toInt().coerceIn(10, 255)
                         g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, alpha)
                         g2.drawLine(proj[i][0].toInt(), proj[i][1].toInt(), proj[j][0].toInt(), proj[j][1].toInt())
                     }
                 }
             }
 
-            proj.forEach { p ->
-                val alpha = ((p[2] + 90) / 180 * 220).toInt().coerceIn(40, 255)
-                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, alpha)
-                g2.fill(Ellipse2D.Double(p[0] - 2.2, p[1] - 2.2, 4.4, 4.4))
+            proj.forEachIndexed { idx, p ->
+                val alpha = ((p[2] + 85) / 170 * 235).toInt().coerceIn(45, 255)
+                g2.color = if (idx % 4 == 0) Color(255, 255, 255, alpha) else Color(mainColor.red, mainColor.green, mainColor.blue, alpha)
+                g2.fill(Ellipse2D.Double(p[0] - 2.1, p[1] - 2.1, 4.2, 4.2))
             }
+
+            g2.font = Font("Consolas", Font.PLAIN, 10)
+            g2.color = Color(0, 225, 255, 180)
+            g2.drawString("OS // ${scanner.getOSLabel()}", 8, 16)
+            g2.drawString("STATE // ${brain.uiState}", 8, 30)
+
+            val rightText1 = "CORTEX // CLOUD NEURAL"
+            val rightText2 = "SPOTIFY BRIDGE // ACTIVE"
+            val fm = g2.fontMetrics
+            g2.color = Color(16, 235, 160, 220)
+            g2.drawString(rightText1, width - fm.stringWidth(rightText1) - 8, 16)
+            g2.color = Color(0, 225, 255, 180)
+            g2.drawString(rightText2, width - fm.stringWidth(rightText2) - 8, 30)
+
+            g2.color = Color(0, 210, 255, 140)
+            g2.drawString("CLICK CORE TO SPEAK", 8, height - 10)
         }
     }
 }
 
+// ============================================================================
+// 5. ENDPOINTS WEB Y PUENTE DE SINCRONIZACIÓN NUBE -> PC
+// ============================================================================
 @RestController
 @RequestMapping("/api/daemon")
 @CrossOrigin(origins = ["*"])
 class DaemonController(
-    private val brain: DaemonBrain
+    private val brain: DaemonBrain,
+    private val scanner: SystemScanner
 ) {
+    // PIN opcional si quieres restringir quién usa tu link en la nube (vacío = acceso libre con tu link)
+    private val requiredPin: String = System.getenv("DAEMON_PIN") ?: ""
+
     @PostMapping("/chat")
     fun chat(@RequestBody request: ChatRequest): String {
-        val reply = brain.processThought(request.prompt)
-        brain.speakAndDisplay(request.prompt, reply)
+        if (requiredPin.isNotBlank() && request.accessPin != requiredPin) {
+            return "🔒 Acceso restringido. Ingresa el PIN de autorización de Cristian para usar el núcleo Daemon."
+        }
+        val reply = brain.processThought(request.prompt, request.sessionId)
+        if (!request.fromBrowser) {
+            brain.speakAndDisplay(request.prompt, reply)
+        } else {
+            brain.speakAndDisplay(request.prompt, reply)
+        }
         return reply
+    }
+
+    // Endpoint para que tu PC descargue las órdenes enviadas al servidor en la nube
+    @GetMapping("/poll-commands")
+    fun pollCommands(): List<RemoteCommand> {
+        val list = mutableListOf<RemoteCommand>()
+        while (scanner.pendingRemoteCommands.isNotEmpty()) {
+            scanner.pendingRemoteCommands.poll()?.let { list.add(it) }
+        }
+        return list
     }
 }

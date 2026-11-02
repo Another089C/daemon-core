@@ -7,6 +7,8 @@ import org.springframework.boot.runApplication
 class DaemonApplication
 
 fun main(args: Array<String>) {
-	System.setProperty("java.awt.headless", "false")
-	runApplication<DaemonApplication>(*args)
+    // Si corre en tu PC activa la mini-ventana; si corre en un servidor en la nube usa modo Cloud
+    val isCloudServer = System.getenv("RENDER") != null || System.getenv("RAILWAY_ENVIRONMENT") != null
+    System.setProperty("java.awt.headless", if (isCloudServer) "true" else "false")
+    runApplication<DaemonApplication>(*args)
 }

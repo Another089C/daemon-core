@@ -3,517 +3,130 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DAEMON // STARK AUDIO CORE</title>
+    <title>DAEMON // CLOUD NEURAL INTERFACE</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
     <style>
         body {
-            margin: 0;
-            background-color: #010409;
-            background-image: radial-gradient(circle at 50% 50%, rgba(0, 210, 255, 0.12) 0%, rgba(0, 20, 40, 0.4) 45%, #010409 100%);
+            background-color: #020611;
+            background-image: radial-gradient(circle at 50% 35%, rgba(0, 225, 255, 0.14) 0%, #020611 70%);
             font-family: 'JetBrains Mono', monospace;
             overflow: hidden;
-            user-select: none;
         }
         .font-hud { font-family: 'Orbitron', sans-serif; }
-
-        .hologram-projection {
-            background: rgba(2, 16, 36, 0.6);
-            backdrop-filter: blur(10px);
-            border-top: 1px solid rgba(0, 240, 255, 0.45);
-            border-bottom: 1px solid rgba(0, 240, 255, 0.45);
-            box-shadow: 0 0 40px rgba(0, 240, 255, 0.15), inset 0 0 25px rgba(0, 240, 255, 0.08);
-            transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+        .glass-panel {
+            background: rgba(6, 16, 34, 0.78);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(0, 230, 255, 0.35);
+            box-shadow: 0 0 30px rgba(0, 225, 255, 0.12);
         }
-
-        .prose h1, .prose h2, .prose h3 { color: #00f0ff; font-family: 'Orbitron', sans-serif; font-size: 0.95rem; letter-spacing: 0.1em; margin: 0.4rem 0; }
-        .prose strong { color: #fde047; font-weight: 600; }
-        .prose hr { border-color: rgba(0, 240, 255, 0.25); margin: 0.5rem 0; }
-        .prose pre { background: rgba(0, 10, 20, 0.8); border: 1px solid rgba(0, 240, 255, 0.3); padding: 0.6rem; border-radius: 0.4rem; overflow-x: auto; }
-
         ::-webkit-scrollbar { width: 4px; }
-        ::-webkit-scrollbar-thumb { background: rgba(0, 240, 255, 0.4); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: rgba(0, 230, 255, 0.4); border-radius: 4px; }
     </style>
 </head>
-<body class="h-screen w-screen relative flex flex-col justify-between text-cyan-100">
+<body class="h-screen w-screen flex flex-col justify-between text-cyan-100 select-none">
 
-    <!-- CANVAS PANTALLA COMPLETA: EL NÚCLEO DE DAEMON -->
-    <canvas id="stark-canvas" class="fixed inset-0 w-full h-full z-0 cursor-pointer" title="Haz clic en el núcleo (o mantén ESPACIO) para hablar"></canvas>
+    <!-- CANVAS DEL REACTOR EN FONDO -->
+    <canvas id="reactor-canvas" class="fixed inset-0 w-full h-full z-0 pointer-events-none"></canvas>
 
-    <!-- TELEMETRÍA SUPERIOR -->
-    <header class="relative z-10 flex justify-between items-start p-6 pointer-events-none">
-        <div class="space-y-1">
-            <div class="flex items-center space-x-2.5">
-                <span id="core-indicator" class="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_12px_#00f0ff]"></span>
-                <span class="font-hud font-bold tracking-[0.25em] text-sm text-cyan-300/90">DAEMON // MK-III VOICE</span>
+    <!-- CABECERA -->
+    <header class="relative z-10 flex justify-between items-center px-5 py-3 border-b border-cyan-500/20 bg-slate-950/60 backdrop-blur-md">
+        <div class="flex items-center space-x-3">
+            <span id="status-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_10px_#10b981]"></span>
+            <div>
+                <h1 class="font-hud text-xs sm:text-sm font-bold tracking-[0.2em] text-cyan-300">DAEMON // CLOUD CORTEX v6.0</h1>
+                <p id="status-text" class="text-[10px] tracking-widest text-emerald-400">GLOBAL CLOUD ACCESS // READY</p>
             </div>
-            <p id="state-text" class="text-[10px] tracking-[0.2em] text-cyan-500/80 uppercase pl-5">ONLINE // CLICK CORE OR HOLD [SPACE] TO SPEAK</p>
         </div>
-
-        <div class="text-right space-y-1 pointer-events-auto flex items-center space-x-3">
-            <div class="hidden sm:block text-[10px] tracking-[0.15em] text-cyan-500/70 mr-2">
-                <div>AUDIO: <span id="mic-status" class="text-emerald-400">READY</span></div>
-                <div>PING: <span id="ping-val" class="text-cyan-300">-- ms</span></div>
-            </div>
-            <button id="sfx-toggle" class="border border-cyan-500/40 bg-cyan-950/30 hover:bg-cyan-900/50 text-cyan-300 px-3 py-1.5 rounded text-[10px] font-hud tracking-widest transition cursor-pointer">
-                ⚡ SFX: ON
-            </button>
-            <button id="tts-toggle" class="border border-cyan-500/40 bg-cyan-950/30 hover:bg-cyan-900/50 text-cyan-300 px-3 py-1.5 rounded text-[10px] font-hud tracking-widest transition cursor-pointer">
-                🔊 VOZ: ON
-            </button>
-        </div>
+        <button id="tts-btn" class="border border-cyan-500/40 bg-cyan-950/40 hover:bg-cyan-900/60 text-cyan-300 px-3 py-1 rounded text-[10px] font-hud tracking-wider cursor-pointer">
+            🔊 VOZ: ON
+        </button>
     </header>
 
-    <!-- PROYECCIÓN HOLOGRÁFICA DE RESPUESTA -->
-    <div id="hologram-box" class="relative z-10 max-w-2xl w-[90%] mx-auto mt-auto mb-4 hologram-projection rounded-lg p-5 opacity-0 pointer-events-none translate-y-4">
-        <div class="flex justify-between items-center mb-2 border-b border-cyan-500/20 pb-1.5">
-            <span id="hologram-title" class="font-hud text-[10px] tracking-[0.25em] text-cyan-400">TRANSMISIÓN // DAEMON</span>
-            <button onclick="hideHologram()" class="text-cyan-500 hover:text-cyan-200 text-xs font-bold px-1.5 cursor-pointer">✕</button>
+    <!-- HISTORIAL DE CONVERSACIÓN TIPO CHAT HOLOGRÁFICO -->
+    <main id="chat-stream" class="relative z-10 flex-1 max-w-2xl w-[94%] mx-auto my-3 overflow-y-auto space-y-3 p-3 select-text">
+        <div class="glass-panel rounded-xl p-3.5 text-xs sm:text-sm text-cyan-100 border-l-4 border-l-cyan-400">
+            <div class="font-hud text-[10px] text-cyan-400 tracking-widest mb-1">DAEMON // CORE</div>
+            Enlace en la nube establecido. Puedes conversar libremente conmigo de cualquier tema o pedirme que controle Spotify y las aplicaciones del sistema.
         </div>
-        <div id="hologram-content" class="text-sm text-cyan-50/95 leading-relaxed max-h-52 overflow-y-auto prose prose-invert select-text"></div>
-    </div>
+    </main>
 
-    <!-- BARRA DE COMANDO HÍBRIDA (VOZ + TEXTO) -->
-    <footer class="relative z-10 pb-6 px-4 w-full max-w-xl mx-auto">
-        <form id="command-form" class="flex items-center space-x-2 bg-slate-950/70 backdrop-blur-md border border-cyan-500/30 rounded-full px-4 py-1.5 shadow-[0_0_25px_rgba(0,240,255,0.12)] focus-within:border-cyan-400 transition-all">
-            
-            <!-- Botón de Grabación de Voz -->
-            <button type="button" id="mic-btn" class="text-cyan-400 hover:text-emerald-400 p-2 rounded-full transition cursor-pointer relative" title="Clic para iniciar/detener grabación de voz">
-                <span id="mic-ring" class="hidden absolute inset-0 rounded-full bg-emerald-400/30 animate-ping"></span>
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5 relative z-10" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" />
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M19 10v2a7 7 0 01-14 0v-2M12 19v4m-4 0h8" />
-                </svg>
-            </button>
-
-            <input 
-                id="prompt-input" 
-                type="text" 
-                placeholder="Mantén [ESPACIO] para hablar o escribe aquí..." 
+    <!-- BARRA DE ENTRADA -->
+    <footer class="relative z-10 pb-5 px-4 max-w-2xl w-full mx-auto">
+        <form id="chat-form" class="glass-panel rounded-full flex items-center px-3 py-1.5 space-x-2">
+            <input
+                id="chat-input"
+                type="text"
+                placeholder="Conversa con Daemon o pide una canción..."
                 autocomplete="off"
-                class="flex-1 bg-transparent text-xs sm:text-sm text-cyan-100 placeholder-cyan-600/70 focus:outline-none px-2 py-1.5"
+                class="flex-1 bg-transparent text-xs sm:text-sm text-cyan-100 placeholder-cyan-600 focus:outline-none px-3 py-1.5"
             />
-
-            <button type="submit" class="font-hud text-[10px] tracking-[0.2em] text-cyan-300 hover:text-white bg-cyan-500/20 hover:bg-cyan-500/40 border border-cyan-400/40 rounded-full px-4 py-1.5 transition cursor-pointer">
+            <button type="submit" class="font-hud text-[10px] tracking-widest bg-cyan-500/25 hover:bg-cyan-500/45 border border-cyan-400/50 text-cyan-200 px-4 py-2 rounded-full transition cursor-pointer">
                 ENVIAR
             </button>
         </form>
     </footer>
 
     <script>
-        // =====================================================
-        // 1. SINTETIZADOR DE EFECTOS SCI-FI (WEB AUDIO API)
-        // =====================================================
-        let audioCtx = null;
-        let sfxEnabled = true;
+        // ID de sesión único por cada dispositivo o persona que entre a tu link
+        const sessionId = localStorage.getItem('daemon_sid') || ('usr_' + Math.random().toString(36).substring(2, 10));
+        localStorage.setItem('daemon_sid', sessionId);
 
-        function initAudioCtx() {
-            if (!audioCtx) {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            }
-            if (audioCtx.state === 'suspended') audioCtx.resume();
-        }
-
-        function playStarkSFX(type) {
-            if (!sfxEnabled) return;
-            initAudioCtx();
-            const now = audioCtx.currentTime;
-            const osc = audioCtx.createOscillator();
-            const gain = audioCtx.createGain();
-            osc.connect(gain);
-            gain.connect(audioCtx.destination);
-
-            if (type === 'listen_start') {
-                // Pulso ascendente de activación del reactor
-                osc.type = 'sine';
-                osc.frequency.setValueAtTime(320, now);
-                osc.frequency.exponentialRampToValueAtTime(880, now + 0.14);
-                gain.gain.setValueAtTime(0.08, now);
-                gain.gain.exponentialRampToValueAtTime(0.001, now + 0.16);
-                osc.start(now);
-                osc.stop(now + 0.16);
-            } else if (type === 'listen_stop') {
-                // Cierre de captura y envío
-                osc.type = 'triangle';
-                osc.frequency.setValueAtTime(740, now);
-                osc.frequency.exponentialRampToValueAtTime(440, now + 0.12);
-                gain.gain.setValueAtTime(0.08, now);
-                gain.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
-                osc.start(now);
-                osc.stop(now + 0.14);
-            } else if (type === 'response_ready') {
-                // Acorde holográfico corto
-                osc.type = 'sine';
-                osc.frequency.setValueAtTime(587.33, now); // D5
-                osc.frequency.setValueAtTime(880, now + 0.07); // A5
-                gain.gain.setValueAtTime(0.06, now);
-                gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
-                osc.start(now);
-                osc.stop(now + 0.22);
-            }
-        }
-
-        document.getElementById('sfx-toggle').addEventListener('click', (e) => {
-            sfxEnabled = !sfxEnabled;
-            e.target.textContent = sfxEnabled ? '⚡ SFX: ON' : '⚡ SFX: OFF';
-        });
-
-        // =====================================================
-        // 2. RECONOCIMIENTO DE VOZ INSTANTÁNEO EN TIEMPO REAL
-        // =====================================================
-        let mediaRecorder = null;
-        let analyser = null;
-        let freqData = null;
-        let isRecording = false;
-        let recognition = null;
-        let liveTranscript = '';
-
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SpeechRecognition) {
-            recognition = new SpeechRecognition();
-            recognition.lang = 'es-MX';
-            recognition.continuous = true;
-            recognition.interimResults = true;
-
-            recognition.onresult = (event) => {
-                let text = '';
-                for (let i = 0; i < event.results.length; i++) {
-                    text += event.results[i][0].transcript;
-                }
-                liveTranscript = text.trim();
-                document.getElementById('prompt-input').value = liveTranscript;
-            };
-        }
-
-        async function toggleVoiceRecording() {
-            if (isRecording) {
-                stopVoiceRecording();
-            } else {
-                await startVoiceRecording();
-            }
-        }
-
-        async function startVoiceRecording() {
-            if (isRecording) return;
-            try {
-                initAudioCtx();
-                window.speechSynthesis.cancel();
-                liveTranscript = '';
-                document.getElementById('prompt-input').value = '';
-
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                const source = audioCtx.createMediaStreamSource(stream);
-                analyser = audioCtx.createAnalyser();
-                analyser.fftSize = 256;
-                source.connect(analyser);
-                freqData = new Uint8Array(analyser.frequencyBinCount);
-                window.currentAudioStream = stream;
-
-                if (recognition) {
-                    try { recognition.start(); } catch (e) {}
-                }
-
-                isRecording = true;
-                playStarkSFX('listen_start');
-                document.getElementById('mic-ring').classList.remove('hidden');
-                document.getElementById('mic-status').textContent = 'LISTENING';
-                setCoreState('LISTENING', 'LISTENING // HABLA AHORA (SUELTA ESPACIO PARA EJECUTAR)');
-            } catch (err) {
-                showHologram('ERROR DE MICRÓFONO', `No se pudo acceder al micrófono: **${err.message}**`);
-            }
-        }
-
-        function stopVoiceRecording() {
-            if (!isRecording) return;
-            isRecording = false;
-            playStarkSFX('listen_stop');
-            document.getElementById('mic-ring').classList.add('hidden');
-            document.getElementById('mic-status').textContent = 'READY';
-
-            if (recognition) {
-                try { recognition.stop(); } catch (e) {}
-            }
-            if (window.currentAudioStream) {
-                window.currentAudioStream.getTracks().forEach(t => t.stop());
-            }
-            analyser = null;
-
-            setTimeout(() => {
-                const finalPrompt = document.getElementById('prompt-input').value.trim();
-                if (finalPrompt) {
-                    document.getElementById('prompt-input').value = '';
-                    sendToDaemon(finalPrompt, null);
-                } else {
-                    setCoreState('IDLE', 'ONLINE // CLICK CORE OR HOLD [SPACE] TO SPEAK');
-                }
-            }, 150);
-        }
-
-        // =====================================================
-        // 3. MOTOR HOLOGRÁFICO 3D CON REACCIÓN DE FRECUENCIAS
-        // =====================================================
-        const canvas = document.getElementById('stark-canvas');
-        const ctx = canvas.getContext('2d');
-        let width, height, cx, cy;
-
-        function resize() {
-            width = canvas.width = window.innerWidth;
-            height = canvas.height = window.innerHeight;
-            cx = width / 2;
-            cy = height / 2 - 20;
-        }
-        window.addEventListener('resize', resize);
-        resize();
-
-        let coreState = 'IDLE';
-        let time = 0;
-        let voiceEnergy = 0;
-
-        const NODES = 160;
-        const nodes = [];
-        const goldenRatio = (1 + Math.sqrt(5)) / 2;
-        for (let i = 0; i < NODES; i++) {
-            const theta = 2 * Math.PI * i / goldenRatio;
-            const phi = Math.acos(1 - 2 * (i + 0.5) / NODES);
-            nodes.push({ theta, phi, baseR: 95 + (i % 5) * 8, offset: Math.random() * Math.PI * 2 });
-        }
-
-        function getPalette() {
-            if (coreState === 'THINKING') return { main: '#ffaa00', sec: '#ff5500', glow: 'rgba(255, 170, 0, 0.28)', speed: 0.045 };
-            if (coreState === 'SPEAKING') return { main: '#00ffff', sec: '#38bdf8', glow: 'rgba(0, 255, 255, 0.38)', speed: 0.025 };
-            if (coreState === 'LISTENING') return { main: '#10b981', sec: '#00f0ff', glow: 'rgba(16, 185, 129, 0.35)', speed: 0.025 };
-            return { main: '#00d8ff', sec: '#0284c7', glow: 'rgba(0, 216, 255, 0.18)', speed: 0.01 };
-        }
-
-        function drawGyroRing(radius, tiltX, rotZ, dashArray, lineWidth, color, alpha = 0.6) {
-            ctx.save();
-            ctx.translate(cx, cy);
-            ctx.rotate(rotZ);
-            ctx.scale(1, Math.max(0.22, Math.abs(Math.cos(tiltX))));
-            ctx.strokeStyle = color;
-            ctx.globalAlpha = alpha;
-            ctx.lineWidth = lineWidth;
-            if (dashArray.length) ctx.setLineDash(dashArray);
-            ctx.beginPath();
-            ctx.arc(0, 0, radius, 0, Math.PI * 2);
-            ctx.stroke();
-            ctx.restore();
-        }
-
-        function animate() {
-            ctx.clearRect(0, 0, width, height);
-            const pal = getPalette();
-            time += pal.speed;
-
-            // Calcular energía real del micrófono si está escuchando
-            if (coreState === 'LISTENING' && analyser && freqData) {
-                analyser.getByteFrequencyData(freqData);
-                let sum = 0;
-                for (let i = 0; i < 40; i++) sum += freqData[i];
-                voiceEnergy = (sum / (40 * 255)) * 0.85;
-            } else if (coreState === 'SPEAKING') {
-                voiceEnergy = 0.22 + Math.abs(Math.sin(time * 7)) * 0.35 + Math.random() * 0.12;
-            } else if (coreState === 'THINKING') {
-                voiceEnergy = 0.18 + Math.sin(time * 8) * 0.12;
-            } else {
-                voiceEnergy = Math.sin(time * 2) * 0.04;
-            }
-
-            const scaleBoost = 1 + voiceEnergy;
-
-            // Halo del Reactor
-            const radial = ctx.createRadialGradient(cx, cy, 5, cx, cy, 245 * scaleBoost);
-            radial.addColorStop(0, pal.main);
-            radial.addColorStop(0.25, pal.glow);
-            radial.addColorStop(1, 'transparent');
-            ctx.fillStyle = radial;
-            ctx.beginPath();
-            ctx.arc(cx, cy, 245 * scaleBoost, 0, Math.PI * 2);
-            ctx.fill();
-
-            // Anillos Giroscópicos
-            drawGyroRing(235, 0, time * 0.2, [8, 22, 2, 22], 1.5, pal.sec, 0.45);
-            drawGyroRing(205 * (1 + voiceEnergy * 0.25), 0, -time * 0.4, [60, 35, 10, 35], 2, pal.main, 0.65);
-            drawGyroRing(175, time * 0.7, time * 0.5, [30, 15], 1.5, pal.main, 0.5);
-            drawGyroRing(155, -time * 0.5, -time * 0.8, [15, 10, 4, 10], 1.2, pal.sec, 0.6);
-
-            // Analizador de Onda Radial (72 barras)
-            const bars = 72;
-            ctx.save();
-            ctx.translate(cx, cy);
-            ctx.rotate(time * 0.12);
-            for (let i = 0; i < bars; i++) {
-                const a = (i / bars) * Math.PI * 2;
-                let barAmp = 5;
-                if (coreState === 'LISTENING' && freqData) {
-                    barAmp = (freqData[i % 64] / 255) * 65;
-                } else if (coreState !== 'IDLE') {
-                    barAmp = Math.abs(Math.sin(a * 6 + time * 4)) * 42 * voiceEnergy;
-                }
-                const rInner = 132;
-                const rOuter = rInner + 4 + barAmp;
-                ctx.strokeStyle = i % 2 === 0 ? pal.main : pal.sec;
-                ctx.globalAlpha = 0.65;
-                ctx.lineWidth = 2.2;
-                ctx.beginPath();
-                ctx.moveTo(Math.cos(a) * rInner, Math.sin(a) * rInner);
-                ctx.lineTo(Math.cos(a) * rOuter, Math.sin(a) * rOuter);
-                ctx.stroke();
-            }
-            ctx.restore();
-
-            // Esfera Neuronal 3D
-            const projected = [];
-            nodes.forEach((n) => {
-                const rotTheta = n.theta + time * 0.8;
-                const rotPhi = n.phi + Math.sin(time * 0.5 + n.offset) * 0.12;
-                const r = n.baseR * scaleBoost;
-
-                const x3d = r * Math.sin(rotPhi) * Math.cos(rotTheta);
-                const y3d = r * Math.cos(rotPhi);
-                const z3d = r * Math.sin(rotPhi) * Math.sin(rotTheta);
-
-                const fov = 320 / (320 + z3d);
-                projected.push({ x: cx + x3d * fov, y: cy + y3d * fov, z: z3d, fov });
-            });
-
-            ctx.lineWidth = 0.8;
-            for (let i = 0; i < projected.length; i++) {
-                for (let j = i + 1; j < projected.length; j++) {
-                    const dx = projected[i].x - projected[j].x;
-                    const dy = projected[i].y - projected[j].y;
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist < 42 * scaleBoost) {
-                        ctx.strokeStyle = pal.main;
-                        ctx.globalAlpha = (1 - dist / (42 * scaleBoost)) * 0.38;
-                        ctx.beginPath();
-                        ctx.moveTo(projected[i].x, projected[i].y);
-                        ctx.lineTo(projected[j].x, projected[j].y);
-                        ctx.stroke();
-                    }
-                }
-            }
-
-            projected.forEach((p, idx) => {
-                ctx.fillStyle = idx % 3 === 0 ? '#ffffff' : pal.main;
-                ctx.globalAlpha = Math.max(0.2, (p.z + 120) / 240);
-                ctx.beginPath();
-                ctx.arc(p.x, p.y, 2.2 * p.fov, 0, Math.PI * 2);
-                ctx.fill();
-            });
-
-            ctx.globalAlpha = 1;
-            requestAnimationFrame(animate);
-        }
-        animate();
-
-        function setCoreState(state, statusLabel) {
-            coreState = state;
-            const stateText = document.getElementById('state-text');
-            const ind = document.getElementById('core-indicator');
-            stateText.textContent = statusLabel;
-
-            if (state === 'THINKING') {
-                ind.className = 'w-2.5 h-2.5 rounded-full bg-amber-400 shadow-[0_0_12px_#ffaa00] animate-ping';
-                stateText.className = 'text-[10px] tracking-[0.2em] text-amber-400 uppercase pl-5';
-            } else if (state === 'SPEAKING') {
-                ind.className = 'w-2.5 h-2.5 rounded-full bg-cyan-300 shadow-[0_0_15px_#00ffff] animate-pulse';
-                stateText.className = 'text-[10px] tracking-[0.2em] text-cyan-300 uppercase pl-5';
-            } else if (state === 'LISTENING') {
-                ind.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_15px_#10b981] animate-ping';
-                stateText.className = 'text-[10px] tracking-[0.2em] text-emerald-400 uppercase pl-5';
-            } else {
-                ind.className = 'w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_12px_#00f0ff]';
-                stateText.className = 'text-[10px] tracking-[0.2em] text-cyan-500/80 uppercase pl-5';
-            }
-        }
-
-        // =====================================================
-        // 4. SÍNTESIS DE VOZ NEURAL (TTS) Y ENVÍO AL BACKEND
-        // =====================================================
         let ttsEnabled = true;
-        let voices = [];
+        let coreState = 'IDLE';
 
-        function loadVoices() {
-            voices = window.speechSynthesis.getVoices();
-        }
-        if ('speechSynthesis' in window) {
-            loadVoices();
-            window.speechSynthesis.onvoiceschanged = loadVoices;
-        }
-
-        document.getElementById('tts-toggle').addEventListener('click', (e) => {
+        document.getElementById('tts-btn').addEventListener('click', (e) => {
             ttsEnabled = !ttsEnabled;
             e.target.textContent = ttsEnabled ? '🔊 VOZ: ON' : '🔇 VOZ: OFF';
             if (!ttsEnabled) window.speechSynthesis.cancel();
         });
 
-        function speakResponse(rawMarkdown) {
-            if (!ttsEnabled || !('speechSynthesis' in window)) {
-                setCoreState('IDLE', 'ONLINE // CLICK CORE OR HOLD [SPACE] TO SPEAK');
-                return;
+        function speakText(text) {
+            if (!ttsEnabled || !('speechSynthesis' in window)) return;
+            window.speechSynthesis.cancel();
+            const clean = text.replace(/[#*`_~>-]/g, '').trim();
+            const u = new SpeechSynthesisUtterance(clean);
+            u.lang = 'es-MX';
+            u.rate = 1.05;
+            u.onstart = () => coreState = 'SPEAKING';
+            u.onend = () => coreState = 'IDLE';
+            window.speechSynthesis.speak(u);
+        }
+
+        const chatStream = document.getElementById('chat-stream');
+        const chatForm = document.getElementById('chat-form');
+        const chatInput = document.getElementById('chat-input');
+        const statusText = document.getElementById('status-text');
+
+        function appendBubble(role, text) {
+            const div = document.createElement('div');
+            if (role === 'USER') {
+                div.className = 'glass-panel rounded-xl p-3 text-xs sm:text-sm text-emerald-100 ml-auto max-w-[85%] border-r-4 border-r-emerald-400';
+                div.innerHTML = `<div class="font-hud text-[9px] text-emerald-400 tracking-widest mb-1 text-right">TÚ</div><div>${text}</div>`;
+            } else {
+                div.className = 'glass-panel rounded-xl p-3.5 text-xs sm:text-sm text-cyan-50 mr-auto max-w-[92%] border-l-4 border-l-cyan-400 prose prose-invert';
+                div.innerHTML = `<div class="font-hud text-[9px] text-cyan-400 tracking-widest mb-1">DAEMON // CORTEX</div><div>${marked.parse(text)}</div>`;
             }
-            window.speechSynthesis.cancel();
-
-            const cleanText = rawMarkdown
-                .replace(/```[\s\S]*?```/g, 'Bloque de código en pantalla.')
-                .replace(/[#*`_~>-]/g, '')
-                .replace(/\[(.*?)\]\(.*?\)/g, '$1')
-                .trim();
-
-            const utterance = new SpeechSynthesisUtterance(cleanText);
-            
-            // Seleccionar la mejor voz en español disponible en el sistema
-            const esVoice = voices.find(v => v.lang.includes('es-MX') && v.name.includes('Natural'))
-                         || voices.find(v => v.lang.includes('es-MX'))
-                         || voices.find(v => v.lang.startsWith('es'));
-            if (esVoice) utterance.voice = esVoice;
-
-            utterance.lang = 'es-MX';
-            utterance.rate = 1.06;
-            utterance.pitch = 0.95;
-
-            utterance.onstart = () => setCoreState('SPEAKING', 'VOCALIZING // AUDIO TRANSMISSION');
-            utterance.onend = () => setCoreState('IDLE', 'ONLINE // CLICK CORE OR HOLD [SPACE] TO SPEAK');
-            utterance.onerror = () => setCoreState('IDLE', 'ONLINE // CLICK CORE OR HOLD [SPACE] TO SPEAK');
-
-            window.speechSynthesis.speak(utterance);
+            chatStream.appendChild(div);
+            chatStream.scrollTop = chatStream.scrollHeight;
         }
 
-        const hologramBox = document.getElementById('hologram-box');
-        const hologramContent = document.getElementById('hologram-content');
-        const hologramTitle = document.getElementById('hologram-title');
-        const commandForm = document.getElementById('command-form');
-        const promptInput = document.getElementById('prompt-input');
-        const pingVal = document.getElementById('ping-val');
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const prompt = chatInput.value.trim();
+            if (!prompt) return;
+            chatInput.value = '';
 
-        function showHologram(title, markdownText) {
-            hologramTitle.textContent = title;
-            hologramContent.innerHTML = marked.parse(markdownText);
-            hologramBox.classList.remove('opacity-0', 'pointer-events-none', 'translate-y-4');
-            hologramBox.classList.add('opacity-100', 'pointer-events-auto', 'translate-y-0');
-        }
+            appendBubble('USER', prompt);
+            coreState = 'THINKING';
+            statusText.textContent = 'PROCESSING IN CLOUD CORTEX...';
 
-        function hideHologram() {
-            hologramBox.classList.add('opacity-0', 'pointer-events-none', 'translate-y-4');
-            hologramBox.classList.remove('opacity-100', 'pointer-events-auto', 'translate-y-0');
-        }
-
-        async function sendToDaemon(promptText, base64Audio = null) {
-            window.speechSynthesis.cancel();
-            setCoreState('THINKING', 'PROCESSING // MULTIMODAL NEURAL MATRIX');
-            showHologram(
-                base64Audio ? 'TRANSMISIÓN DE VOZ ENVIADA' : `ORDEN // "${promptText.slice(0, 35)}..."`,
-                '*Analizando frecuencias de audio y ejecutando skills en el contenedor...*'
-            );
-
-            const t0 = performance.now();
             try {
                 const res = await fetch('/api/daemon/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt: promptText, audio: base64Audio })
+                    body: JSON.stringify({ prompt, sessionId, fromBrowser: true })
                 });
 
                 const ms = Math.round(performance.now() - t0);
@@ -522,24 +135,38 @@
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
                 const reply = await res.text();
-                playStarkSFX('response_ready');
-                setCoreState('SPEAKING', 'TRANSMITTING // VOICE & HOLOGRAM');
-                showHologram('PROYECCIÓN DE DATOS // DAEMON', reply);
-                speakResponse(reply);
-
+                appendBubble('DAEMON', reply);
+                statusText.textContent = 'GLOBAL CLOUD ACCESS // READY';
+                coreState = 'IDLE';
+                speakText(reply);
             } catch (err) {
-                setCoreState('IDLE', 'ERROR // LINK FAILED');
-                showHologram('ALERTA DE ENLACE', `**Fallo al procesar en el núcleo:** ${err.message}`);
+                appendBubble('DAEMON', 'Error de conexión con el servidor Daemon.');
+                coreState = 'IDLE';
             }
-        }
-
-        commandForm.addEventListener('submit', (e) => {
-            e.preventDefault();
-            const prompt = promptInput.value.trim();
-            if (!prompt) return;
-            promptInput.value = '';
-            sendToDaemon(prompt, null);
         });
+
+        // Animación ligera del reactor de fondo
+        const canvas = document.getElementById('reactor-canvas');
+        const ctx = canvas.getContext('2d');
+        let w, h, t = 0;
+        function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function draw() {
+            ctx.clearRect(0, 0, w, h);
+            t += coreState === 'THINKING' ? 0.05 : 0.015;
+            const cx = w / 2, cy = h / 2;
+            ctx.strokeStyle = coreState === 'THINKING' ? 'rgba(255,180,0,0.22)' : 'rgba(0,225,255,0.16)';
+            ctx.lineWidth = 1.5;
+            for (let r = 90; r <= 210; r += 40) {
+                ctx.beginPath();
+                ctx.arc(cx, cy, r + Math.sin(t * 2) * 6, t, t + Math.PI * 1.4);
+                ctx.stroke();
+            }
+            requestAnimationFrame(draw);
+        }
+        draw();
     </script>
 </body>
 </html>
