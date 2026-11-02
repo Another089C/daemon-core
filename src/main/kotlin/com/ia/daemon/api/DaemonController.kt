@@ -32,12 +32,20 @@ import kotlin.concurrent.thread
 import kotlin.math.*
 
 // ============================================================================
-// MODELOS DE DATOS
+// MODELOS DE DATOS DE CUENTAS, ROLES Y BÓVEDA EN LA NUBE
 // ============================================================================
 data class ChatRequest(
     val prompt: String = "",
-    val audio: String? = null,
+    val username: String = "",
+    val password: String = "",
     val fromBrowser: Boolean = true
+)
+
+data class IntentNode(
+    val tag: String = "",
+    val patterns: List<String> = emptyList(),
+    val responses: List<String> = emptyList(),
+    val action: String = "NONE"
 )
 
 data class WorkspaceMode(
@@ -53,6 +61,29 @@ data class WorkspaceMode(
 data class ChatMessage(
     val role: String = "",
     val content: String = ""
+)
+
+data class UserAccount(
+    val username: String = "",
+    var password: String = "",
+    var role: String = "USER", // "ADMIN" (Cristian) o "USER"
+    val personalFacts: MutableList<String> = mutableListOf(),
+    val personalKnowledge: MutableList<IntentNode> = mutableListOf(),
+    val personalModes: MutableList<WorkspaceMode> = mutableListOf(),
+    val recentHistory: MutableList<ChatMessage> = mutableListOf(),
+    var updatedAt: Long = System.currentTimeMillis()
+)
+
+data class CloudVaultState(
+    var lastUpdated: Long = System.currentTimeMillis(),
+    val globalKnowledge: MutableList<IntentNode> = mutableListOf(),
+    val accounts: MutableList<UserAccount> = mutableListOf()
+)
+
+data class LocalDeviceConfig(
+    var cloudDatabaseUrl: String = "",
+    var currentUsername: String = "cristian",
+    var currentPassword: String = "admin2026"
 )
 
 data class OllamaOptions(
@@ -75,10 +106,434 @@ data class CloudChatPayload(
 )
 
 // ============================================================================
-// 1. MOTOR DEL SISTEMA DE BAJO CONSUMO + ENFOQUE SIN DUPLICAR PESTAÑAS
+// 1. SERVICIO DE BÓVEDA EN LA NUBE MULTI-DISPOSITIVO + CUENTA DE ADMINISTRADOR
 // ============================================================================
 @Service
-class SystemScanner {
+class CloudVaultService {
+
+    private val vaultCacheFile = File("daemon_cloud_vault.json")
+    private val configFile = File("daemon_device_config.json")
+    private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
+
+    private val httpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(5))
+        .followRedirects(HttpClient.Redirect.NORMAL)
+        .build()
+
+    var deviceConfig = LocalDeviceConfig()
+    var vault = CloudVaultState()
+
+    @Volatile var cloudSyncStatus: String = "LOCAL CACHE"
+
+    init {
+        loadDeviceConfig()
+        loadOrInitializeVault()
+        startBackgroundCloudSync()
+    }
+
+    private fun loadDeviceConfig() {
+        val envUrl = System.getenv("DAEMON_CLOUD_DB_URL") ?: ""
+        if (configFile.exists()) {
+            try {
+                deviceConfig = objectMapper.readValue(configFile, LocalDeviceConfig::class.java)
+            } catch (e: Exception) {}
+        }
+        if (envUrl.isNotBlank() && deviceConfig.cloudDatabaseUrl.isBlank()) {
+            deviceConfig.cloudDatabaseUrl = envUrl
+        }
+        saveDeviceConfig()
+    }
+
+    fun saveDeviceConfig() {
+        try {
+            objectMapper.writeValue(configFile, deviceConfig)
+        } catch (e: Exception) {}
+    }
+
+    private fun loadOrInitializeVault() {
+        if (vaultCacheFile.exists()) {
+            try {
+                vault = objectMapper.readValue(vaultCacheFile, CloudVaultState::class.java)
+            } catch (e: Exception) {}
+        }
+
+        // Garantizar que la Base de Conocimientos Global tenga los nodos maestros
+        if (vault.globalKnowledge.isEmpty()) {
+            vault.globalKnowledge.addAll(buildMasterGlobalKnowledge())
+        }
+
+        // Garantizar que SIEMPRE exista tu Cuenta Maestra de Administrador ("cristian")
+        val adminExists = vault.accounts.any { it.username.equals("cristian", true) }
+        if (!adminExists) {
+            val adminAccount = UserAccount(
+                username = "cristian",
+                password = deviceConfig.currentPassword.ifBlank { "admin2026" },
+                role = "ADMIN",
+                personalFacts = mutableListOf(
+                    "Es Cristian Alexis, creador y Administrador Maestro de Daemon.",
+                    "Estudia Ingeniería en Sistemas Computacionales en la ESCOM del IPN."
+                ),
+                personalKnowledge = mutableListOf(),
+                personalModes = buildDefaultModesForUser("Cristian"),
+                recentHistory = mutableListOf(),
+                updatedAt = System.currentTimeMillis()
+            )
+            vault.accounts.add(adminAccount)
+        } else {
+            // Asegurar que cristian siempre conserve el rol ADMIN
+            vault.accounts.firstOrNull { it.username.equals("cristian", true) }?.role = "ADMIN"
+        }
+
+        saveLocalVaultCache()
+        pullFromCloudNow()
+    }
+
+    fun saveLocalVaultCache() {
+        try {
+            vault.lastUpdated = System.currentTimeMillis()
+            objectMapper.writeValue(vaultCacheFile, vault)
+        } catch (e: Exception) {}
+    }
+
+    // ========================================================================
+    // SINCRONIZACIÓN REAL EN LA NUBE (FIREBASE REALTIME DB / REST CLOUD SERVER)
+    // ========================================================================
+    private fun resolveCloudRestUrl(): String? {
+        val raw = deviceConfig.cloudDatabaseUrl.trim()
+        if (raw.isBlank()) return null
+        return when {
+            raw.contains("firebaseio.com") || raw.contains("firebasedatabase.app") -> {
+                val base = raw.trimEnd('/')
+                if (base.endsWith(".json")) base else "$base/daemon_vault.json"
+            }
+            else -> {
+                val base = raw.trimEnd('/')
+                if (base.endsWith("/api/daemon/cloud-vault")) base else "$base/api/daemon/cloud-vault"
+            }
+        }
+    }
+
+    fun pushToCloudAsync() {
+        saveLocalVaultCache()
+        val url = resolveCloudRestUrl() ?: return
+        thread(isDaemon = true) {
+            try {
+                val json = objectMapper.writeValueAsString(vault)
+                val req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(6))
+                    .header("Content-Type", "application/json")
+                    .PUT(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
+                    .build()
+                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                cloudSyncStatus = if (res.statusCode() in 200..299) "CLOUD SYNCED ☁" else "CLOUD ERR ${res.statusCode()}"
+            } catch (e: Exception) {
+                cloudSyncStatus = "OFFLINE CACHE"
+            }
+        }
+    }
+
+    fun pullFromCloudNow(): Boolean {
+        val url = resolveCloudRestUrl() ?: return false
+        return try {
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(5))
+                .GET()
+                .build()
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() == 200 && res.body().isNotBlank() && res.body().trim() != "null") {
+                val remoteVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
+                mergeCloudVault(remoteVault)
+                cloudSyncStatus = "CLOUD SYNCED ☁"
+                true
+            } else {
+                // Si la nube está vacía por primera vez, subimos nuestra bóveda inicial
+                pushToCloudAsync()
+                true
+            }
+        } catch (e: Exception) {
+            cloudSyncStatus = "OFFLINE CACHE"
+            false
+        }
+    }
+
+    // Fusiona inteligentemente las cuentas y conocimientos de la nube con el dispositivo actual
+    @Synchronized
+    fun mergeCloudVault(remote: CloudVaultState) {
+        // 1. Fusionar conocimientos globales del Administrador
+        for (rNode in remote.globalKnowledge) {
+            val idx = vault.globalKnowledge.indexOfFirst { it.tag.equals(rNode.tag, true) }
+            if (idx < 0) {
+                vault.globalKnowledge.add(rNode)
+            } else if (remote.lastUpdated >= vault.lastUpdated) {
+                vault.globalKnowledge[idx] = rNode
+            }
+        }
+
+        // 2. Fusionar cuentas de usuario (gana la versión más reciente de cada usuario)
+        for (rAcc in remote.accounts) {
+            val localIdx = vault.accounts.indexOfFirst { it.username.equals(rAcc.username, true) }
+            if (localIdx < 0) {
+                vault.accounts.add(rAcc)
+            } else {
+                val localAcc = vault.accounts[localIdx]
+                if (rAcc.updatedAt >= localAcc.updatedAt) {
+                    val mergedFacts = (localAcc.personalFacts + rAcc.personalFacts).distinct().toMutableList()
+                    val mergedKnow = (localAcc.personalKnowledge + rAcc.personalKnowledge).distinctBy { it.tag }.toMutableList()
+                    vault.accounts[localIdx] = rAcc.copy(
+                        role = if (rAcc.username.equals("cristian", true)) "ADMIN" else rAcc.role,
+                        personalFacts = mergedFacts,
+                        personalKnowledge = mergedKnow
+                    )
+                }
+            }
+        }
+        objectMapper.writeValue(vaultCacheFile, vault)
+    }
+
+    private fun startBackgroundCloudSync() {
+        thread(isDaemon = true, name = "Daemon-Cloud-Vault-Sync") {
+            while (true) {
+                try {
+                    if (deviceConfig.cloudDatabaseUrl.isNotBlank()) {
+                        pullFromCloudNow()
+                    }
+                } catch (e: Exception) {}
+                Thread.sleep(15000) // Sincronización silenciosa cada 15 segundos
+            }
+        }
+    }
+
+    // ========================================================================
+    // GESTIÓN DE CUENTAS Y PRIVILEGIOS DE ADMINISTRADOR
+    // ========================================================================
+    fun getCurrentAccount(): UserAccount {
+        return vault.accounts.firstOrNull { it.username.equals(deviceConfig.currentUsername, true) }
+            ?: vault.accounts.first()
+    }
+
+    fun isAdminLoggedIn(): Boolean = getCurrentAccount().role.equals("ADMIN", true)
+
+    fun loginOrSwitchUser(username: String, password: String): String {
+        pullFromCloudNow()
+        val cleanUser = username.trim().lowercase()
+        val acc = vault.accounts.firstOrNull { it.username.equals(cleanUser, true) }
+            ?: return "El usuario '$cleanUser' no existe en la nube de Daemon. Puedes crearlo con: 'registrar usuario $cleanUser clave <tu_clave>'."
+
+        if (acc.password != password.trim()) {
+            return "Contraseña incorrecta para la cuenta '$cleanUser'."
+        }
+
+        deviceConfig.currentUsername = acc.username
+        deviceConfig.currentPassword = acc.password
+        saveDeviceConfig()
+
+        val badge = if (acc.role == "ADMIN") "👑 ADMINISTRADOR MAESTRO" else "👤 USUARIO ESTÁNDAR"
+        return "Sesión iniciada en la nube como '${acc.username.uppercase()}' [$badge]. Se cargaron ${acc.personalFacts.size} recuerdos personales y ${acc.personalKnowledge.size} nodos propios."
+    }
+
+    fun registerNewUser(username: String, password: String, role: String = "USER"): String {
+        pullFromCloudNow()
+        val cleanUser = username.trim().lowercase().replace(Regex("[^a-z0-9_]"), "")
+        if (cleanUser.length < 3) return "El nombre de usuario debe tener al menos 3 caracteres."
+        if (vault.accounts.any { it.username.equals(cleanUser, true) }) {
+            return "El usuario '$cleanUser' ya está registrado en la nube."
+        }
+
+        val newAcc = UserAccount(
+            username = cleanUser,
+            password = password.trim().ifBlank { "1234" },
+            role = if (cleanUser == "cristian") "ADMIN" else role,
+            personalFacts = mutableListOf("Usuario registrado en Daemon Cloud: $cleanUser"),
+            personalKnowledge = mutableListOf(),
+            personalModes = buildDefaultModesForUser(cleanUser),
+            recentHistory = mutableListOf(),
+            updatedAt = System.currentTimeMillis()
+        )
+        vault.accounts.add(newAcc)
+        deviceConfig.currentUsername = newAcc.username
+        deviceConfig.currentPassword = newAcc.password
+        saveDeviceConfig()
+        pushToCloudAsync()
+
+        return "Cuenta en la nube creada e iniciada para '${newAcc.username.uppercase()}'. Todo lo que platiques o le enseñes estará disponible en cualquiera de tus dispositivos."
+    }
+
+    fun addPersonalFactToCurrentUser(fact: String): String {
+        val acc = getCurrentAccount()
+        if (!acc.personalFacts.contains(fact)) {
+            acc.personalFacts.add(fact)
+            acc.updatedAt = System.currentTimeMillis()
+            pushToCloudAsync()
+        }
+        return "Guardado en la memoria en la nube de '${acc.username.uppercase()}': '$fact'. Disponible en todos tus dispositivos."
+    }
+
+    fun addPersonalKnowledgeToCurrentUser(tag: String, patterns: List<String>, response: String): String {
+        val acc = getCurrentAccount()
+        acc.personalKnowledge.removeIf { it.tag.equals(tag, true) }
+        acc.personalKnowledge.add(IntentNode(tag = tag, patterns = patterns, responses = listOf(response)))
+        acc.updatedAt = System.currentTimeMillis()
+        pushToCloudAsync()
+        return "Conocimiento guardado en la cuenta personal de '${acc.username.uppercase()}' (${patterns.size} patrones)."
+    }
+
+    // --- FUNCIONES EXCLUSIVAS DE ADMINISTRADOR (CRISTIAN) ---
+    fun adminAddGlobalKnowledge(tag: String, patterns: List<String>, response: String): String {
+        if (!isAdminLoggedIn()) {
+            return "⛔ Acceso denegado. Solo la cuenta de Administrador (Cristian) puede modificar la Base de Conocimiento Global."
+        }
+        vault.globalKnowledge.removeIf { it.tag.equals(tag, true) }
+        vault.globalKnowledge.add(IntentNode(tag = tag, patterns = patterns, responses = listOf(response)))
+        pushToCloudAsync()
+        return "👑 [ADMIN] Nodo global '$tag' agregado a la nube. Ahora está activo para todas las cuentas y dispositivos."
+    }
+
+    fun adminDeleteGlobalKnowledge(targetTag: String): String {
+        if (!isAdminLoggedIn()) {
+            return "⛔ Acceso denegado. Requiere permisos de Administrador."
+        }
+        val removed = vault.globalKnowledge.removeIf { it.tag.contains(targetTag, true) }
+        pushToCloudAsync()
+        return if (removed) "👑 [ADMIN] Nodo global '$targetTag' eliminado de la nube."
+        else "👑 [ADMIN] No se encontró un nodo global con el identificador '$targetTag'."
+    }
+
+    fun adminListUsers(): String {
+        if (!isAdminLoggedIn()) return "⛔ Comando exclusivo para la cuenta de Administrador."
+        val summary = vault.accounts.joinToString("\n") { acc ->
+            "• ${acc.username.uppercase()} [${acc.role}] -> ${acc.personalFacts.size} recuerdos | ${acc.personalKnowledge.size} nodos"
+        }
+        return "👑 [PANEL DE ADMINISTRADOR // USUARIOS EN LA NUBE (${vault.accounts.size})]\n$summary"
+    }
+
+    fun adminDeleteUser(targetUser: String): String {
+        if (!isAdminLoggedIn()) return "⛔ Comando exclusivo para el Administrador."
+        val clean = targetUser.trim().lowercase()
+        if (clean == "cristian") return "👑 No puedes eliminar la cuenta maestra del creador."
+        val removed = vault.accounts.removeIf { it.username.equals(clean, true) }
+        pushToCloudAsync()
+        return if (removed) "👑 [ADMIN] Cuenta '$clean' eliminada de la nube." else "No se encontró el usuario '$clean'."
+    }
+
+    fun adminSetUserRole(targetUser: String, newRole: String): String {
+        if (!isAdminLoggedIn()) return "⛔ Comando exclusivo para el Administrador."
+        val acc = vault.accounts.firstOrNull { it.username.equals(targetUser.trim(), true) }
+            ?: return "No existe el usuario '$targetUser'."
+        acc.role = newRole.uppercase()
+        acc.updatedAt = System.currentTimeMillis()
+        pushToCloudAsync()
+        return "👑 [ADMIN] El rol de '${acc.username.uppercase()}' fue actualizado a ${acc.role}."
+    }
+
+    fun adminSetCloudDatabaseUrl(newUrl: String): String {
+        if (!isAdminLoggedIn()) return "⛔ Solo el Administrador puede cambiar el servidor de base de datos en la nube."
+        deviceConfig.cloudDatabaseUrl = newUrl.trim()
+        saveDeviceConfig()
+        val ok = pullFromCloudNow()
+        pushToCloudAsync()
+        return if (ok) {
+            "👑 [ADMIN] Base de datos en la nube conectada y sincronizada en: ${deviceConfig.cloudDatabaseUrl}"
+        } else {
+            "👑 [ADMIN] URL guardada (${deviceConfig.cloudDatabaseUrl}). Se sincronizará en cuanto haya conexión."
+        }
+    }
+
+    // Busca una respuesta primero en la base personal del usuario activo y luego en la base Global del Admin
+    fun findKnowledgeMatch(normalizedInput: String): String? {
+        val currentAcc = getCurrentAccount()
+        val allNodes = currentAcc.personalKnowledge + vault.globalKnowledge
+
+        for (node in allNodes) {
+            for (pat in node.patterns) {
+                val normPat = normalizeSimple(pat)
+                if (normPat.isNotBlank() && (normalizedInput == normPat || normalizedInput.contains(normPat))) {
+                    return node.responses.firstOrNull()
+                }
+            }
+        }
+        return null
+    }
+
+    private fun normalizeSimple(text: String): String {
+        val temp = Normalizer.normalize(text.lowercase(), Normalizer.Form.NFD)
+        return temp.replace(Regex("[\\p{InCombiningDiacriticalMarks}]"), "")
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    fun buildDefaultModesForUser(userLabel: String): MutableList<WorkspaceMode> = mutableListOf(
+        WorkspaceMode(
+            id = "TRABAJO",
+            name = "PROTOCOLO TRABAJO",
+            triggers = listOf("vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar"),
+            appsToOpen = listOf("vscode", "notion", "opera gx"),
+            appsToClose = emptyList(),
+            spotifyPlaylist = "mis me gusta",
+            greeting = "Modo Trabajo activo para $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+        ),
+        WorkspaceMode(
+            id = "TAREA",
+            name = "PROTOCOLO TAREA",
+            triggers = listOf("vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea"),
+            appsToOpen = listOf("vscode", "notion", "opera gx"),
+            appsToClose = listOf("discord", "steam"),
+            spotifyPlaylist = "mis me gusta",
+            greeting = "Modo Tarea activo para $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+        ),
+        WorkspaceMode(
+            id = "ESTUDIO",
+            name = "PROTOCOLO ESTUDIO",
+            triggers = listOf("vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom"),
+            appsToOpen = listOf("notion", "opera gx", "vscode"),
+            appsToClose = listOf("discord", "steam"),
+            spotifyPlaylist = "mis me gusta",
+            greeting = "Modo Estudio activo para $userLabel. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+        ),
+        WorkspaceMode(
+            id = "GAMING",
+            name = "PROTOCOLO GAMING",
+            triggers = listOf("vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar"),
+            appsToOpen = listOf("discord"),
+            appsToClose = listOf("vscode", "notion"),
+            spotifyPlaylist = "mis me gusta",
+            greeting = "Modo Gaming activo para $userLabel. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+        )
+    )
+
+    private fun buildMasterGlobalKnowledge(): List<IntentNode> = listOf(
+        IntentNode(
+            tag = "global_identidad",
+            patterns = listOf("quien eres", "que es daemon", "como funcionas"),
+            responses = listOf("Soy Daemon v11.0, un sistema operativo de inteligencia artificial con memoria sincronizada en la nube por cuenta de usuario y administrado por Cristian Alexis.")
+        ),
+        IntentNode(
+            tag = "global_proceso_hilo",
+            patterns = listOf("que es un proceso", "diferencia entre proceso e hilo", "que es un thread"),
+            responses = listOf("Un proceso es un programa en ejecución con su propio espacio de memoria aislado; un hilo (thread) es una unidad ligera de ejecución que comparte la memoria de ese proceso.")
+        ),
+        IntentNode(
+            tag = "global_mutex_semaforo",
+            patterns = listOf("que es un mutex", "diferencia entre mutex y semaforo"),
+            responses = listOf("Un Mutex es un cerrojo binario de exclusión mutua para proteger secciones críticas, mientras que un Semáforo emplea un contador entero para sincronizar múltiples hilos o procesos.")
+        ),
+        IntentNode(
+            tag = "global_fpga_vhdl",
+            patterns = listOf("que es una fpga", "que es vhdl"),
+            responses = listOf("Una FPGA es un circuito integrado de hardware digital reconfigurable que se programa mediante lenguajes de descripción de hardware como VHDL para sintetizar lógica paralela real.")
+        )
+    )
+}
+
+// ============================================================================
+// 2. MOTOR MULTIPLATAFORMA DEL SISTEMA OPERATIVO (WINDOWS / MACOS / LINUX)
+// ============================================================================
+@Service
+class SystemScanner(
+    private val cloudVault: CloudVaultService
+) {
 
     val osName: String = System.getProperty("os.name").lowercase()
     val isWindows = osName.contains("win")
@@ -87,16 +542,13 @@ class SystemScanner {
 
     private val installedApps = mutableMapOf("init" to "init").apply { clear() }
     private val playlistsFile = File("daemon_playlists.json")
-    private val modesFile = File("daemon_modes.json")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
-
     private val savedPlaylists = mutableMapOf("init" to "init").apply { clear() }
-    val workspaceModes = mutableListOf(WorkspaceMode()).apply { clear() }
 
     @Volatile var activeModeName: String = "NÚCLEO ACTIVO"
     @Volatile var currentSpotifyTrack: String = "ACTIVO"
-    @Volatile var cachedCpuLoad: Int = 6
-    @Volatile var cachedRamMb: Int = 58
+    @Volatile var cachedCpuLoad: Int = 4
+    @Volatile var cachedRamMb: Int = 54
     @Volatile var isFullPanelVisible: Boolean = false
     @Volatile private var lastMediaActionTimestamp: Long = 0L
 
@@ -108,14 +560,13 @@ class SystemScanner {
     init {
         scanInstalledApplications()
         loadPlaylists()
-        loadWorkspaceModes()
         ensureDesktopAndStartupApp()
         startLowPowerTelemetryMonitor()
     }
 
     fun getOSLabel(): String = when {
-        isWindows -> "WINDOWS"
-        isMac -> "MACOS"
+        isWindows -> "WIN"
+        isMac -> "MAC"
         isLinux -> "LINUX"
         else -> "OS"
     }
@@ -166,21 +617,16 @@ class SystemScanner {
         } catch (e: Exception) { "" }
     }
 
-    // ========================================================================
-    // TELEMETRÍA ECOLÓGICA: NO CREA PROCESOS CUANDO ESTÁ EN MODO NÚCLEO CHIQUITO
-    // ========================================================================
     private fun startLowPowerTelemetryMonitor() {
         thread(isDaemon = true, name = "Daemon-Eco-Telemetry") {
             var gcCounter = 0
             while (true) {
                 try {
-                    // Liberar memoria basura periódicamente para mantener la RAM muy baja
                     gcCounter++
                     if (gcCounter >= 6) {
                         gcCounter = 0
                         System.gc()
                     }
-
                     val rt = Runtime.getRuntime()
                     cachedRamMb = ((rt.totalMemory() - rt.freeMemory()) / (1024 * 1024)).toInt().coerceAtLeast(24)
 
@@ -188,13 +634,12 @@ class SystemScanner {
                     val load = (osBean.processCpuLoad * 100).toInt()
                     cachedCpuLoad = if (load in 1..100) load else 2
 
-                    // SOLO consultar Spotify si el panel grande está abierto (0% gasto de CPU en modo núcleo)
                     if (isFullPanelVisible) {
                         val status = getSpotifyStatusAndTrack()
                         currentSpotifyTrack = when {
                             status == "CLOSED" -> "SPOTIFY CERRADO"
                             status == "PAUSED" -> "EN PAUSA"
-                            else -> status.removePrefix("PLAYING:").take(34)
+                            else -> status.removePrefix("PLAYING:").take(32)
                         }
                     }
                 } catch (e: Exception) {}
@@ -246,9 +691,7 @@ class SystemScanner {
         }
     }
 
-    // ========================================================================
-    // ENFOQUE INTELIGENTE DE APLICACIONES (SI YA ESTÁ ABIERTA, SOLO LA AMPLÍA)
-    // ========================================================================
+    // Si la aplicación ya está abierta, solo la amplía y pone al frente sin abrir nuevas pestañas
     fun openOrFocusApp(normalizedCommand: String): String {
         val requestedApp = normalizedCommand
             .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
@@ -288,7 +731,6 @@ class SystemScanner {
         val exePath = if (canonical == "opera gx") (findWindowsOperaGX() ?: entry?.value) else entry?.value
 
         if (processName.isNotBlank()) {
-            // Verifica si el proceso ya existe: si existe, SOLO restaura/amplía su ventana sin abrir otra pestaña
             val psFocusOrLaunch = """
                 ${'$'}procs = @(Get-Process -Name "$processName" -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 })
                 if (${'$'}procs.Count -gt 0) {
@@ -309,15 +751,15 @@ class SystemScanner {
 
             val status = runPowerShell(psFocusOrLaunch, wait = true)
             if (status.contains("FOCUSED")) {
-                return "Ampliando ventana activa de ${canonical.uppercase()}, Cristian."
+                return "Ampliando ventana activa de ${canonical.uppercase()}."
             }
         }
 
         if (exePath != null) {
             ProcessBuilder("cmd", "/c", "start", "", exePath).start()
-            return "Iniciando ${canonical.uppercase()}, Cristian."
+            return "Iniciando ${canonical.uppercase()}."
         }
-        return "No encontré '$canonical' instalado en tu PC."
+        return "No encontré '$canonical' instalado en este dispositivo."
     }
 
     private fun openOrFocusMacApp(canonical: String): String {
@@ -331,7 +773,6 @@ class SystemScanner {
             else -> installedApps[canonical] ?: canonical
         }
 
-        // En macOS: si ya está abierta, solo la desminimiza del Dock y la trae al frente sin abrir nuevas ventanas
         val script = """
             if application "$macAppName" is running then
                 tell application "$macAppName" to activate
@@ -355,26 +796,20 @@ class SystemScanner {
         """.trimIndent()
 
         val result = runAppleScript(script, wait = true)
-        return if (result == "FOCUSED") {
-            "Ampliando ${macAppName.uppercase()} en tu Mac, Cristian."
-        } else {
-            "Iniciando ${macAppName.uppercase()} en tu Mac, Cristian."
-        }
+        return if (result == "FOCUSED") "Ampliando ${macAppName.uppercase()} en tu Mac."
+        else "Iniciando ${macAppName.uppercase()} en tu Mac."
     }
 
     private fun openOrFocusLinuxApp(canonical: String): String {
         val entry = installedApps.entries.firstOrNull { it.key == canonical }
         val target = entry?.value ?: canonical
         runLinuxShell("wmctrl -a \"$canonical\" || $target &")
-        return "Activando ${canonical.uppercase()}, Cristian."
+        return "Activando ${canonical.uppercase()}."
     }
 
-    // ========================================================================
-    // CONTROL MULTIMEDIA DE SPOTIFY
-    // ========================================================================
     fun controlSpotifyExact(command: String): String {
         val now = System.currentTimeMillis()
-        if (now - lastMediaActionTimestamp < 450) return "Comando en proceso, Cristian."
+        if (now - lastMediaActionTimestamp < 450) return "Comando en proceso."
         lastMediaActionTimestamp = now
 
         val state = getSpotifyStatusAndTrack()
@@ -383,74 +818,43 @@ class SystemScanner {
 
         if (!isOpen && (command == "PLAY" || command == "NEXT" || command == "PREV")) {
             playLikedSongsInSpotify(forceRestart = true)
-            return "Abriendo Spotify e iniciando tus canciones de Mis Me Gusta, Cristian."
+            return "Abriendo Spotify e iniciando tus canciones de Mis Me Gusta."
         }
 
         return when {
             isWindows -> {
                 when (command) {
                     "PAUSE" -> {
-                        if (!isPlaying) return "Spotify ya está en pausa, Cristian."
+                        if (!isPlaying) return "Spotify ya está en pausa."
                         triggerWindowsMediaKey(0xB3, 1)
                         currentSpotifyTrack = "EN PAUSA"
-                        "Música en pausa, Cristian."
+                        "Música en pausa."
                     }
                     "PLAY" -> {
-                        if (isPlaying) return "La música ya se está reproduciendo, Cristian."
+                        if (isPlaying) return "La música ya se está reproduciendo."
                         triggerWindowsMediaKey(0xB3, 1)
-                        "Reanudando reproducción en Spotify, Cristian."
+                        "Reanudando reproducción en Spotify."
                     }
-                    "NEXT" -> {
-                        triggerWindowsMediaKey(0xB0, 1)
-                        "Siguiente canción en Spotify, Cristian."
-                    }
-                    "PREV" -> {
-                        triggerWindowsMediaKey(0xB1, 1)
-                        "Canción anterior en Spotify, Cristian."
-                    }
+                    "NEXT" -> { triggerWindowsMediaKey(0xB0, 1); "Siguiente canción en Spotify." }
+                    "PREV" -> { triggerWindowsMediaKey(0xB1, 1); "Canción anterior en Spotify." }
                     else -> "Comando ejecutado."
                 }
             }
             isMac -> {
                 when (command) {
-                    "PAUSE" -> {
-                        runAppleScript("tell application \"Spotify\" to pause")
-                        currentSpotifyTrack = "EN PAUSA"
-                        "Música en pausa en tu Mac, Cristian."
-                    }
-                    "PLAY" -> {
-                        runAppleScript("tell application \"Spotify\" to play")
-                        "Reanudando reproducción en Spotify, Cristian."
-                    }
-                    "NEXT" -> {
-                        runAppleScript("tell application \"Spotify\" to next track")
-                        "Siguiente canción en Spotify, Cristian."
-                    }
-                    "PREV" -> {
-                        runAppleScript("tell application \"Spotify\" to previous track")
-                        "Canción anterior en Spotify, Cristian."
-                    }
+                    "PAUSE" -> { runAppleScript("tell application \"Spotify\" to pause"); currentSpotifyTrack = "EN PAUSA"; "Música en pausa." }
+                    "PLAY" -> { runAppleScript("tell application \"Spotify\" to play"); "Reanudando reproducción en Spotify." }
+                    "NEXT" -> { runAppleScript("tell application \"Spotify\" to next track"); "Siguiente canción en Spotify." }
+                    "PREV" -> { runAppleScript("tell application \"Spotify\" to previous track"); "Canción anterior en Spotify." }
                     else -> "Comando ejecutado."
                 }
             }
             isLinux -> {
                 when (command) {
-                    "PAUSE" -> {
-                        runLinuxShell("playerctl -p spotify pause")
-                        "Música en pausa, Cristian."
-                    }
-                    "PLAY" -> {
-                        runLinuxShell("playerctl -p spotify play")
-                        "Reanudando reproducción en Spotify, Cristian."
-                    }
-                    "NEXT" -> {
-                        runLinuxShell("playerctl -p spotify next")
-                        "Siguiente canción, Cristian."
-                    }
-                    "PREV" -> {
-                        runLinuxShell("playerctl -p spotify previous")
-                        "Canción anterior, Cristian."
-                    }
+                    "PAUSE" -> { runLinuxShell("playerctl -p spotify pause"); "Música en pausa." }
+                    "PLAY" -> { runLinuxShell("playerctl -p spotify play"); "Reanudando reproducción." }
+                    "NEXT" -> { runLinuxShell("playerctl -p spotify next"); "Siguiente canción." }
+                    "PREV" -> { runLinuxShell("playerctl -p spotify previous"); "Canción anterior." }
                     else -> "Comando ejecutado."
                 }
             }
@@ -472,14 +876,13 @@ class SystemScanner {
         runPowerShell(ps, wait = false)
     }
 
-    // Si Spotify ya está reproduciendo cuando presionas un Modo por 2da vez, no reinicia la lista
     fun playLikedSongsInSpotify(forceRestart: Boolean = false): String {
         thread {
             try {
                 if (!forceRestart) {
                     val currentStatus = getSpotifyStatusAndTrack()
                     if (currentStatus.startsWith("PLAYING:")) {
-                        currentSpotifyTrack = currentStatus.removePrefix("PLAYING:").take(34)
+                        currentSpotifyTrack = currentStatus.removePrefix("PLAYING:").take(32)
                         return@thread
                     }
                 }
@@ -521,7 +924,7 @@ class SystemScanner {
                 }
             } catch (e: Exception) {}
         }
-        return "Reproduciendo tus canciones de Mis Me Gusta en Spotify, Cristian."
+        return "Reproduciendo tus canciones de Mis Me Gusta en Spotify."
     }
 
     fun controlBrowserVideo(): String {
@@ -558,7 +961,7 @@ class SystemScanner {
                 runLinuxShell("xdotool search --onlyvisible --Regexp 'Opera|Chrome|Firefox' windowactivate --sync key k")
             }
         }
-        return "Alternando reproducción del video en tu navegador sin alterar Spotify, Cristian."
+        return "Alternando reproducción del video en el navegador sin alterar Spotify."
     }
 
     fun changeSystemVolume(direction: String): String {
@@ -586,9 +989,9 @@ class SystemScanner {
             }
         }
         return when (direction) {
-            "UP" -> "Subiendo volumen del sistema, Cristian."
-            "DOWN" -> "Bajando volumen del sistema, Cristian."
-            else -> "Audio del sistema alternado, Cristian."
+            "UP" -> "Subiendo volumen del sistema."
+            "DOWN" -> "Bajando volumen del sistema."
+            else -> "Audio del sistema alternado."
         }
     }
 
@@ -622,11 +1025,8 @@ class SystemScanner {
             }
         } catch (e: Exception) {}
 
-        return if (platform == "YOUTUBE") {
-            "Buscando '$cleanQuery' en YouTube dentro de Opera GX, Cristian."
-        } else {
-            "Buscando '$cleanQuery' en Opera GX, Cristian."
-        }
+        return if (platform == "YOUTUBE") "Buscando '$cleanQuery' en YouTube dentro de Opera GX."
+        else "Buscando '$cleanQuery' en Opera GX."
     }
 
     private fun findWindowsOperaGX(): String? {
@@ -641,52 +1041,6 @@ class SystemScanner {
         return candidates.firstOrNull { it.exists() }?.absolutePath ?: installedApps["opera gx"]
     }
 
-    private fun loadWorkspaceModes() {
-        val defaultModes = listOf(
-            WorkspaceMode(
-                id = "TRABAJO",
-                name = "PROTOCOLO TRABAJO",
-                triggers = listOf("vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar", "modo programacion", "activa modo trabajo"),
-                appsToOpen = listOf("vscode", "notion", "opera gx"),
-                appsToClose = emptyList(),
-                spotifyPlaylist = "mis me gusta",
-                greeting = "Modo Trabajo activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
-            ),
-            WorkspaceMode(
-                id = "TAREA",
-                name = "PROTOCOLO TAREA",
-                triggers = listOf("vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea", "activa modo tarea"),
-                appsToOpen = listOf("vscode", "notion", "opera gx"),
-                appsToClose = listOf("discord", "steam"),
-                spotifyPlaylist = "mis me gusta",
-                greeting = "Modo Tarea activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y tu lista Mis Me Gusta en Spotify."
-            ),
-            WorkspaceMode(
-                id = "ESTUDIO",
-                name = "PROTOCOLO ESTUDIO",
-                triggers = listOf("vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom", "hora de estudiar", "activa modo estudio"),
-                appsToOpen = listOf("notion", "opera gx", "vscode"),
-                appsToClose = listOf("discord", "steam"),
-                spotifyPlaylist = "mis me gusta",
-                greeting = "Modo Estudio activo, Cristian. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
-            ),
-            WorkspaceMode(
-                id = "GAMING",
-                name = "PROTOCOLO GAMING",
-                triggers = listOf("vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar", "activa modo gaming"),
-                appsToOpen = listOf("discord"),
-                appsToClose = listOf("vscode", "notion"),
-                spotifyPlaylist = "mis me gusta",
-                greeting = "Modo Gaming activo, Cristian. Liberando recursos de trabajo, enfocando Discord y reproduciendo tu música."
-            )
-        )
-
-        workspaceModes.clear()
-        workspaceModes.addAll(defaultModes)
-        try { objectMapper.writeValue(modesFile, workspaceModes) } catch (e: Exception) {}
-    }
-
-    // Ejecuta el modo enfocando las ventanas existentes sin abrir pestañas duplicadas
     fun executeWorkspaceMode(mode: WorkspaceMode): String {
         activeModeName = mode.id
         thread {
@@ -712,7 +1066,8 @@ class SystemScanner {
         return mode.greeting
     }
 
-    fun createCustomMode(name: String, appsList: List<String>): String {
+    fun createCustomModeForCurrentUser(name: String, appsList: List<String>): String {
+        val acc = cloudVault.getCurrentAccount()
         val cleanId = normalizeText(name).uppercase().replace(" ", "_")
         val newMode = WorkspaceMode(
             id = cleanId,
@@ -721,12 +1076,13 @@ class SystemScanner {
             appsToOpen = appsList.map { normalizeText(it) },
             appsToClose = emptyList(),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Activando modo $cleanId y enfocando tus aplicaciones, Cristian."
+            greeting = "Activando modo $cleanId de la cuenta ${acc.username.uppercase()}."
         )
-        workspaceModes.removeIf { it.id == cleanId }
-        workspaceModes.add(newMode)
-        objectMapper.writeValue(modesFile, workspaceModes)
-        return "Modo '$cleanId' guardado exitosamente, Cristian."
+        acc.personalModes.removeIf { it.id == cleanId }
+        acc.personalModes.add(newMode)
+        acc.updatedAt = System.currentTimeMillis()
+        cloudVault.pushToCloudAsync()
+        return "Modo '$cleanId' guardado en la cuenta en la nube de '${acc.username.uppercase()}'."
     }
 
     fun scanInstalledApplications(): Int {
@@ -846,7 +1202,7 @@ class SystemScanner {
                 runLinuxShell("pkill -f \"$appName\"")
             }
         }
-        return "He cerrado $appName, Cristian."
+        return "He cerrado $appName."
     }
 
     fun minimizeAllWindows() {
@@ -879,11 +1235,11 @@ class SystemScanner {
     fun getCurrentlyPlayingSpotify(): String {
         val state = getSpotifyStatusAndTrack()
         return when {
-            state == "CLOSED" -> "Spotify está cerrado en este momento, Cristian."
-            state == "PAUSED" -> "Spotify está abierto pero en pausa, Cristian."
+            state == "CLOSED" -> "Spotify está cerrado en este momento."
+            state == "PAUSED" -> "Spotify está abierto pero en pausa."
             else -> {
                 val track = state.removePrefix("PLAYING:")
-                currentSpotifyTrack = track.take(34)
+                currentSpotifyTrack = track.take(32)
                 "Está sonando '$track' en Spotify."
             }
         }
@@ -922,7 +1278,7 @@ class SystemScanner {
         }
         savedPlaylists[cleanName] = uri
         savePlaylists()
-        return "Playlist '$cleanName' vinculada a $uri, Cristian."
+        return "Playlist '$cleanName' vinculada a $uri."
     }
 
     fun playPlaylist(rawCommand: String, normalized: String): String {
@@ -954,7 +1310,7 @@ class SystemScanner {
             } catch (e: Exception) {}
         }
 
-        return "Iniciando playlist '$playlistQuery' en Spotify, Cristian."
+        return "Iniciando playlist '$playlistQuery' en Spotify."
     }
 
     fun playSongInSpotify(songQuery: String?): String {
@@ -977,7 +1333,7 @@ class SystemScanner {
                 }
             } catch (e: Exception) {}
         }
-        return "Reproduciendo '$cleanSong' en Spotify, Cristian."
+        return "Reproduciendo '$cleanSong' en Spotify."
     }
 
     private fun launchSpotifyUriAndPlay(spotifyUri: String, isSearch: Boolean) {
@@ -1039,7 +1395,6 @@ class SystemScanner {
         return null
     }
 
-    // Configura los lanzadores de auto-arranque con límite estricto de RAM (-Xms32m -Xmx128m -XX:+UseSerialGC)
     fun ensureDesktopAndStartupApp(): String {
         return try {
             val workingDir = File(System.getProperty("user.dir")).absolutePath
@@ -1125,25 +1480,6 @@ class SystemScanner {
                     cmdFile.setExecutable(true)
                     "Auto-inicio ligero registrado en macOS."
                 }
-                isLinux -> {
-                    val home = System.getProperty("user.home")
-                    val javaBin = System.getProperty("java.home") + "/bin/java"
-                    val autostartDir = File("$home/.config/autostart")
-                    if (!autostartDir.exists()) autostartDir.mkdirs()
-
-                    val desktopEntry = File(autostartDir, "daemon-ai.desktop")
-                    val content = """
-                        [Desktop Entry]
-                        Type=Application
-                        Name=Daemon AI
-                        Exec="$javaBin" -Xms32m -Xmx128m -XX:+UseSerialGC -jar "${jarFile.absolutePath}"
-                        Path=$workingDir
-                        Terminal=false
-                        X-GNOME-Autostart-enabled=true
-                    """.trimIndent()
-                    desktopEntry.writeText(content, StandardCharsets.UTF_8)
-                    "Auto-inicio ligero registrado en Linux."
-                }
                 else -> ""
             }
         } catch (e: Exception) { "" }
@@ -1159,17 +1495,14 @@ class SystemScanner {
 }
 
 // ============================================================================
-// 2. CEREBRO DE DAEMON + VOZ MULTIPLATAFORMA + WAKE WORD ("DAEMON")
+// 3. CEREBRO DE DAEMON CON MEMORIA POR USUARIO EN LA NUBE + COMANDOS ADMIN
 // ============================================================================
 @Service
 class DaemonBrain(
-    private val systemScanner: SystemScanner
+    private val systemScanner: SystemScanner,
+    val cloudVault: CloudVaultService
 ) {
-    private val factsFile = File("daemon_facts.txt")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
-
-    private val conversationHistory = mutableListOf(ChatMessage("", "")).apply { clear() }
-    private val userFacts = mutableListOf("").apply { clear() }
 
     private val ollamaUrl = "http://localhost:11434/api/chat"
     private var ollamaModel = "qwen2.5:1.5b"
@@ -1188,13 +1521,13 @@ class DaemonBrain(
     private val wakeWords = listOf("daemon", "daimon", "deimon", "daymon", "demon", "damon")
 
     init {
-        loadUserFacts()
         checkOllamaStatus()
         launchStarkHologramHUD()
         startContinuousWakeWordEar()
+        val acc = cloudVault.getCurrentAccount()
         speakAndDisplay(
-            "NÚCLEO OPTIMIZADO",
-            "Daemon v10.0 activo en modo de bajo consumo sobre ${systemScanner.getOSLabel()}, Cristian."
+            "NÚCLEO CLOUD v11.0",
+            "Daemon en línea sobre ${systemScanner.getOSLabel()}. Sesión activa: ${acc.username.uppercase()} (${acc.role})."
         )
     }
 
@@ -1276,7 +1609,7 @@ class DaemonBrain(
                             if (cleanCommand.isBlank() || cleanCommand in setOf("oye", "hola", "estas ahi", "me escuchas")) {
                                 directListenUntil = System.currentTimeMillis() + 8000L
                                 uiState = "LISTENING"
-                                speakAndDisplay("DAEMON", "Sí, Cristian, te escucho.")
+                                speakAndDisplay("DAEMON", "Sí, ${cloudVault.getCurrentAccount().username}, te escucho.")
                             } else {
                                 directListenUntil = 0L
                                 val reply = processThought(cleanCommand)
@@ -1295,25 +1628,10 @@ class DaemonBrain(
     fun activateDirectVoiceListenWindow() {
         directListenUntil = System.currentTimeMillis() + 8000L
         uiState = "LISTENING"
-        starkHud?.setStatusText("TE ESCUCHO, CRISTIAN...")
+        starkHud?.setStatusText("TE ESCUCHO (${cloudVault.getCurrentAccount().username.uppercase()})...")
         if (systemScanner.isMac) {
-            // En macOS, si el núcleo está minimizado, un clic izquierdo abre el panel para recibir tu orden
             starkHud?.setOrbMode(false)
         }
-    }
-
-    private fun loadUserFacts() {
-        if (!factsFile.exists()) {
-            userFacts.add("El creador y usuario de Daemon es Cristian Alexis, estudiante de Ingeniería en Sistemas Computacionales en la ESCOM del IPN.")
-            factsFile.writeText(userFacts.joinToString("\n") + "\n")
-        } else {
-            userFacts.addAll(factsFile.readLines().filter { it.isNotBlank() })
-        }
-    }
-
-    private fun saveUserFact(fact: String) {
-        userFacts.add(fact)
-        factsFile.appendText("$fact\n")
     }
 
     private fun checkOllamaStatus(): Boolean {
@@ -1341,6 +1659,9 @@ class DaemonBrain(
         }
     }
 
+    // ========================================================================
+    // PROCESADOR CENTRAL (CUENTAS, ADMIN, MODOS POR USUARIO, SPOTIFY Y CHAT)
+    // ========================================================================
     fun processThought(rawInput: String): String {
         val input = rawInput.trim()
         if (input.isBlank()) return "Sin señal de entrada."
@@ -1351,17 +1672,94 @@ class DaemonBrain(
             normalized = normalized.replace(Regex("""^(?:oye\s+|hola\s+)?$w\b\s*"""), "").trim()
         }
 
-        if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
-            starkHud?.setOrbMode(false)
-            return recordAndReturn(input, "Desplegando el panel completo, Cristian.")
-        }
-        if (normalized.contains("modo nucleo") || normalized.contains("minimiza el panel") || normalized.contains("hazte chiquito")) {
-            starkHud?.setOrbMode(true)
-            return recordAndReturn(input, "Contrayendo a modo núcleo flotante, Cristian.")
+        // --------------------------------------------------------------------
+        // A) GESTIÓN DE CUENTAS Y SESIONES EN LA NUBE
+        // --------------------------------------------------------------------
+        // Ej: "iniciar sesion como cristian clave admin2026"
+        val loginRegex = Regex("""^(?:iniciar\s+sesion|inicia\s+sesion|login|cambiar\s+a\s+usuario|entrar\s+como)\s+(?:como\s+)?([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
+        loginRegex.find(input)?.let { m ->
+            val reply = cloudVault.loginOrSwitchUser(m.groupValues[1], m.groupValues[2])
+            starkHud?.refreshAccountBadges()
+            return reply
         }
 
-        // 1. MODOS (SI LA APLICACIÓN YA ESTÁ ABIERTA, SOLO LA AMPLÍA Y ENFOCA)
-        for (mode in systemScanner.workspaceModes) {
+        // Ej: "registrar usuario mich clave 1234"
+        val registerRegex = Regex("""^(?:registrar\s+usuario|crear\s+cuenta|nuevo\s+usuario|registra\s+a)\s+([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
+        registerRegex.find(input)?.let { m ->
+            val reply = cloudVault.registerNewUser(m.groupValues[1], m.groupValues[2])
+            starkHud?.refreshAccountBadges()
+            return reply
+        }
+
+        if (normalized in setOf("quien soy", "que cuenta esta activa", "mi cuenta", "estado de mi cuenta")) {
+            val acc = cloudVault.getCurrentAccount()
+            return "Estás conectado con la cuenta '${acc.username.uppercase()}' (Rol: ${acc.role}). Tienes ${acc.personalFacts.size} recuerdos personales y ${acc.personalKnowledge.size} conocimientos propios sincronizados en la nube (${cloudVault.cloudSyncStatus})."
+        }
+
+        if (normalized.contains("sincronizar nube") || normalized.contains("sincroniza ahora") || normalized == "sync") {
+            val ok = cloudVault.pullFromCloudNow()
+            cloudVault.pushToCloudAsync()
+            return if (ok) "Sincronización con la nube completada exitosamente."
+            else "Memoria guardada en caché local. Configura la URL de tu nube desde el botón [👑 ADMIN] para sincronizar entre dispositivos."
+        }
+
+        // --------------------------------------------------------------------
+        // B) COMANDOS EXCLUSIVOS DE LA CUENTA DE ADMINISTRADOR (CRISTIAN)
+        // --------------------------------------------------------------------
+        if (input.lowercase().startsWith("admin global:") || input.lowercase().startsWith("admin entrena:")) {
+            val body = input.substringAfter(":")
+            if (body.contains("=")) {
+                val patterns = body.substringBefore("=").split("/").map { it.trim() }.filter { it.isNotBlank() }
+                val response = body.substringAfter("=").trim()
+                val tag = "global_" + (System.currentTimeMillis() % 100000)
+                return cloudVault.adminAddGlobalKnowledge(tag, patterns, response)
+            }
+        }
+
+        if (normalized.startsWith("admin lista de usuarios") || normalized == "admin usuarios") {
+            return cloudVault.adminListUsers()
+        }
+
+        if (normalized.startsWith("admin elimina usuario ")) {
+            val target = normalized.removePrefix("admin elimina usuario ").trim()
+            return cloudVault.adminDeleteUser(target)
+        }
+
+        if (normalized.startsWith("admin haz administrador a ")) {
+            val target = normalized.removePrefix("admin haz administrador a ").trim()
+            return cloudVault.adminSetUserRole(target, "ADMIN")
+        }
+
+        if (input.lowercase().startsWith("admin nube ") || input.lowercase().startsWith("conecta nube ")) {
+            val url = input.substringAfter("nube ").trim()
+            return cloudVault.adminSetCloudDatabaseUrl(url)
+        }
+
+        // --------------------------------------------------------------------
+        // C) APRENDIZAJE PERSONAL EN LA NUBE (LIGADO A LA CUENTA ACTIVA)
+        // --------------------------------------------------------------------
+        if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ") || normalized.startsWith("memoriza que ")) {
+            val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
+            return recordAndReturn(input, cloudVault.addPersonalFactToCurrentUser(fact))
+        }
+
+        if (input.lowercase().startsWith("entrena:")) {
+            val body = input.substringAfter(":")
+            if (body.contains("=")) {
+                val patterns = body.substringBefore("=").split("/").map { it.trim() }.filter { it.isNotBlank() }
+                val response = body.substringAfter("=").trim()
+                val tag = "usr_" + (System.currentTimeMillis() % 100000)
+                return recordAndReturn(input, cloudVault.addPersonalKnowledgeToCurrentUser(tag, patterns, response))
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // D) MODOS DE TRABAJO DEL USUARIO ACTIVO
+        // --------------------------------------------------------------------
+        val currentAcc = cloudVault.getCurrentAccount()
+        val activeModes = if (currentAcc.personalModes.isNotEmpty()) currentAcc.personalModes else cloudVault.buildDefaultModesForUser(currentAcc.username)
+
+        for (mode in activeModes) {
             val matchedTrigger = mode.triggers.any { t ->
                 val normT = systemScanner.normalizeText(t)
                 normalized == normT || normalized.contains(normT)
@@ -1375,10 +1773,21 @@ class DaemonBrain(
         createModeRegex.find(normalized)?.let { m ->
             val modeName = m.groupValues[1].trim()
             val apps = m.groupValues[2].split(",", " y ").map { it.trim() }.filter { it.isNotBlank() }
-            return recordAndReturn(input, systemScanner.createCustomMode(modeName, apps))
+            return recordAndReturn(input, systemScanner.createCustomModeForCurrentUser(modeName, apps))
         }
 
-        // 2. BÚSQUEDA EN OPERA GX Y YOUTUBE
+        // --------------------------------------------------------------------
+        // E) CONTROL DE VENTANAS, OPERA GX, VIDEO Y SPOTIFY
+        // --------------------------------------------------------------------
+        if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
+            starkHud?.setOrbMode(false)
+            return recordAndReturn(input, "Desplegando el panel completo.")
+        }
+        if (normalized.contains("modo nucleo") || normalized.contains("minimiza el panel") || normalized.contains("hazte chiquito")) {
+            starkHud?.setOrbMode(true)
+            return recordAndReturn(input, "Contrayendo a modo núcleo flotante.")
+        }
+
         val ytSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+youtube\s+y\s+)?(?:busca\s+en\s+youtube|buscar\s+en\s+youtube|pon\s+un\s+video\s+de|busca\s+un\s+video\s+de)\s+(.+)$""")
         ytSearchRegex.find(normalized)?.let { m ->
             val query = m.groupValues[1].replace("en opera gx", "").trim()
@@ -1391,14 +1800,12 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.searchInOperaGX(query, "GOOGLE"))
         }
 
-        // 3. VIDEO EN NAVEGADOR VS SPOTIFY
         if (normalized.contains("video") || normalized.contains("youtube")) {
             if (normalized.contains("pausa") || normalized.contains("deten") || normalized.contains("play") || normalized.contains("reanuda") || normalized.contains("continua")) {
                 return recordAndReturn(input, systemScanner.controlBrowserVideo())
             }
         }
 
-        // 4. CONTROL EXACTO DE SPOTIFY
         val isPauseOrder = normalized in setOf(
             "pausa", "pon pausa", "ponle pausa", "pausa spotify", "pausa la musica",
             "pausa la cancion", "deten la musica", "deten la cancion", "para la musica", "pausar"
@@ -1465,7 +1872,6 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
 
-        // 5. VENTANAS Y APLICACIONES (USA ENFOQUE INTELIGENTE SIN DUPLICAR)
         if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando")) {
             return recordAndReturn(input, systemScanner.getCurrentlyPlayingSpotify())
         }
@@ -1474,7 +1880,7 @@ class DaemonBrain(
         }
         if (normalized.contains("minimiza todo") || normalized.contains("muestra el escritorio")) {
             systemScanner.minimizeAllWindows()
-            return recordAndReturn(input, "Despejando el escritorio, Cristian.")
+            return recordAndReturn(input, "Despejando el escritorio.")
         }
 
         if (normalized.matches(Regex("""^(?:abre|abrir|inicia|ejecuta|lanza)\s+.+$"""))) {
@@ -1484,12 +1890,16 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.closeAppByName(normalized))
         }
 
-        if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ")) {
-            val fact = input.replace(Regex("""^(?:recuerda|aprende)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
-            saveUserFact(fact)
-            return recordAndReturn(input, "Integrado en mi memoria permanente, Cristian: '$fact'.")
+        // --------------------------------------------------------------------
+        // F) BASE DE CONOCIMIENTO EN LA NUBE (PERSONAL DEL USUARIO + GLOBAL ADMIN)
+        // --------------------------------------------------------------------
+        cloudVault.findKnowledgeMatch(normalized)?.let { exactNodeReply ->
+            return recordAndReturn(input, exactNodeReply)
         }
 
+        // --------------------------------------------------------------------
+        // G) CÓRTEX CONVERSACIONAL CON LA MEMORIA EN LA NUBE DEL USUARIO ACTIVO
+        // --------------------------------------------------------------------
         if (isOllamaOnline) {
             generateOllamaConversationalResponse(input)?.let { reply ->
                 return recordAndReturn(input, reply)
@@ -1500,21 +1910,27 @@ class DaemonBrain(
             return recordAndReturn(input, reply)
         }
 
-        return recordAndReturn(input, "En línea sobre ${systemScanner.getOSLabel()}, Cristian. ¿Qué orden ejecutamos?")
+        return recordAndReturn(input, "En línea (${currentAcc.username.uppercase()}). ¿Qué orden ejecutamos?")
     }
 
     private fun buildSystemPrompt(): String {
+        val acc = cloudVault.getCurrentAccount()
         val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
-        val factsContext = if (userFacts.isEmpty()) "" else "Datos sobre Cristian:\n" + userFacts.joinToString("\n") { "- $it" }
+        val factsContext = if (acc.personalFacts.isEmpty()) "" else "Memoria en la nube de ${acc.username}:\n" + acc.personalFacts.joinToString("\n") { "- $it" }
+        val globalContext = if (cloudVault.vault.globalKnowledge.isEmpty()) "" else "Base de conocimiento global del Administrador:\n" +
+            cloudVault.vault.globalKnowledge.take(15).joinToString("\n") { "- ${it.tag}: ${it.responses.firstOrNull() ?: ""}" }
+
         return """
-            Eres Daemon (v10.0), el asistente de inteligencia artificial multiplataforma estilo J.A.R.V.I.S. creado por Cristian Alexis.
-            Estás ejecutándote sobre ${systemScanner.getOSLabel()}. Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
+            Eres Daemon (v11.0), un asistente de inteligencia artificial estilo J.A.R.V.I.S. con memoria en la nube multi-dispositivo, creado y administrado por Cristian Alexis.
+            Actualmente estás atendiendo a la cuenta: ${acc.username.uppercase()} (Rol: ${acc.role}) en un dispositivo ${systemScanner.getOSLabel()}.
+            Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
+            $globalContext
             
             Directrices:
-            1. Habla siempre en español de forma inteligente, leal y fluida.
+            1. Habla siempre en español de forma inteligente, leal y fluida, dirigiéndote a ${acc.username}.
             2. Sé conciso (1 a 2 párrafos cortos).
-            3. Si Cristian te pide ejecutar una acción durante la charla, añade al final una etiqueta exacta:
+            3. Si ${acc.username} te pide ejecutar una acción durante la charla, añade al final una etiqueta exacta:
                [ACTION:MODE_WORK]
                [ACTION:MODE_HOMEWORK]
                [ACTION:MODE_STUDY]
@@ -1531,9 +1947,10 @@ class DaemonBrain(
     }
 
     private fun buildMessageHistory(userInput: String): List<ChatMessage> {
+        val acc = cloudVault.getCurrentAccount()
         val list = mutableListOf(ChatMessage("system", buildSystemPrompt()))
-        synchronized(conversationHistory) {
-            conversationHistory.takeLast(10).forEach { turn ->
+        synchronized(acc.recentHistory) {
+            acc.recentHistory.takeLast(10).forEach { turn ->
                 list.add(ChatMessage(turn.role, turn.content))
             }
         }
@@ -1582,7 +1999,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkCore/10.0")
+                .header("User-Agent", "DaemonStarkCloud/11.0")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -1598,14 +2015,16 @@ class DaemonBrain(
     }
 
     private fun executeEmbeddedActions(llmReply: String): String {
+        val acc = cloudVault.getCurrentAccount()
+        val modes = if (acc.personalModes.isNotEmpty()) acc.personalModes else cloudVault.buildDefaultModesForUser(acc.username)
         val actionRegex = Regex("""\[ACTION:([A-Z_]+)(?::([^\]]+))?\]""")
         actionRegex.findAll(llmReply).forEach { match ->
             val actionType = match.groupValues[1].trim()
             val param = match.groupValues[2].trim()
             when (actionType) {
-                "MODE_WORK" -> systemScanner.workspaceModes.firstOrNull { it.id == "TRABAJO" }?.let { systemScanner.executeWorkspaceMode(it) }
-                "MODE_HOMEWORK" -> systemScanner.workspaceModes.firstOrNull { it.id == "TAREA" }?.let { systemScanner.executeWorkspaceMode(it) }
-                "MODE_STUDY" -> systemScanner.workspaceModes.firstOrNull { it.id == "ESTUDIO" }?.let { systemScanner.executeWorkspaceMode(it) }
+                "MODE_WORK" -> modes.firstOrNull { it.id == "TRABAJO" }?.let { systemScanner.executeWorkspaceMode(it) }
+                "MODE_HOMEWORK" -> modes.firstOrNull { it.id == "TAREA" }?.let { systemScanner.executeWorkspaceMode(it) }
+                "MODE_STUDY" -> modes.firstOrNull { it.id == "ESTUDIO" }?.let { systemScanner.executeWorkspaceMode(it) }
                 "PLAY_LIKED" -> systemScanner.playLikedSongsInSpotify(forceRestart = false)
                 "PLAY_SONG" -> systemScanner.playSongInSpotify(param)
                 "PAUSE_MUSIC" -> systemScanner.controlSpotifyExact("PAUSE")
@@ -1620,14 +2039,18 @@ class DaemonBrain(
         return llmReply.replace(actionRegex, "").trim()
     }
 
+    // Guarda la conversación en la cuenta del usuario activo y la sincroniza en la nube
     private fun recordAndReturn(userPrompt: String, daemonReply: String): String {
-        synchronized(conversationHistory) {
-            conversationHistory.add(ChatMessage("user", userPrompt))
-            conversationHistory.add(ChatMessage("assistant", daemonReply))
-            while (conversationHistory.size > 16) {
-                conversationHistory.removeAt(0)
+        val acc = cloudVault.getCurrentAccount()
+        synchronized(acc.recentHistory) {
+            acc.recentHistory.add(ChatMessage("user", userPrompt))
+            acc.recentHistory.add(ChatMessage("assistant", daemonReply))
+            while (acc.recentHistory.size > 14) {
+                acc.recentHistory.removeAt(0)
             }
         }
+        acc.updatedAt = System.currentTimeMillis()
+        cloudVault.pushToCloudAsync()
         return daemonReply
     }
 
@@ -1639,7 +2062,7 @@ class DaemonBrain(
                 uiState = "SPEAKING"
                 val cleanSpeech = reply
                     .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en pantalla.")
-                    .replace(Regex("[#*`_~>\\-•]"), "")
+                    .replace(Regex("[#*`_~>\\-•👑⛔☁👤]"), "")
                     .replace("\n", ". ")
                     .trim()
 
@@ -1679,7 +2102,7 @@ class DaemonBrain(
             System.setProperty("java.awt.headless", "false")
             if (!GraphicsEnvironment.isHeadless()) {
                 SwingUtilities.invokeLater {
-                    starkHud = StarkHologramHUD(this, systemScanner)
+                    starkHud = StarkHologramHUD(this, systemScanner, cloudVault)
                     starkHud?.isVisible = true
                 }
             }
@@ -1688,11 +2111,12 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 3. INTERFAZ ULTRA-LIGERA (REPINTADO PARCIAL DEL REACTOR = ~2% CPU EN MAC)
+// 4. INTERFAZ HOLOGRÁFICA CON SELECTOR DE CUENTA EN LA NUBE Y CONSOLA ADMIN
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
-    private val scanner: SystemScanner
+    private val scanner: SystemScanner,
+    private val cloudVault: CloudVaultService
 ) : JFrame("DAEMON CORE") {
 
     private var pressPoint = Point(0, 0)
@@ -1700,12 +2124,13 @@ class StarkHologramHUD(
     private var wasDragged = false
 
     private var isMiniOrbMode = true
-    private val fullWidth = 680
-    private val fullHeight = 520
+    private val fullWidth = 700
+    private val fullHeight = 530
     private val orbSize = 104
 
     private val bgSpaceDark = Color(4, 10, 20)
     private val statusLabel = JLabel("ONLINE // CLIC DERECHO PARA EXPANDIR")
+    private val accountBadgeLabel = JLabel("")
     private val outputArea = JTextArea()
     private val inputField = JTextField()
     private val hudCanvas = HolographicChassisPanel()
@@ -1731,16 +2156,18 @@ class StarkHologramHUD(
         hudCanvas.isOpaque = true
         hudCanvas.background = bgSpaceDark
 
-        // 1. CABECERA DEL PANEL COMPLETO
+        refreshAccountBadges()
+
+        // 1. CABECERA CON BOTÓN DE CUENTA EN LA NUBE Y CONSOLA DE ADMINISTRADOR
         val headerBar = JPanel(BorderLayout()).apply {
             isOpaque = false
-            border = EmptyBorder(2, 8, 6, 8)
+            border = EmptyBorder(2, 6, 6, 6)
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON v10.0 (${scanner.getOSLabel()})").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON CLOUD v11.0").apply {
                     foreground = Color(0, 242, 255)
-                    font = Font("Monospaced", Font.BOLD, 14)
+                    font = Font("Monospaced", Font.BOLD, 13)
                 }
                 statusLabel.apply {
                     foreground = Color(255, 195, 0)
@@ -1750,10 +2177,14 @@ class StarkHologramHUD(
                 add(statusLabel)
             }
 
-            val rightControls = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
+            val rightControls = JPanel(FlowLayout(FlowLayout.RIGHT, 5, 0)).apply {
                 isOpaque = false
-                val orbBtn = createHoloButton("◉ MODO NÚCLEO", Color(255, 185, 0), 112) { setOrbMode(true) }
+                val accountBtn = createHoloButton("👤 CUENTA", Color(16, 235, 160), 82) { openAccountSwitcherDialog() }
+                val adminBtn = createHoloButton("👑 ADMIN", Color(255, 185, 0), 78) { openAdminConsoleDialog() }
+                val orbBtn = createHoloButton("◉ NÚCLEO", Color(0, 225, 255), 82) { setOrbMode(true) }
                 val closeBtn = createHoloButton("✕", Color(255, 70, 90), 28) { System.exit(0) }
+                add(accountBtn)
+                add(adminBtn)
                 add(orbBtn)
                 add(closeBtn)
             }
@@ -1771,7 +2202,7 @@ class StarkHologramHUD(
                 preferredSize = Dimension(150, 220)
                 border = EmptyBorder(12, 2, 12, 2)
 
-                val lbl = JLabel("◢ MODOS").apply {
+                val lbl = JLabel("◢ MODOS DE CUENTA").apply {
                     foreground = Color(0, 230, 255)
                     font = Font("Monospaced", Font.BOLD, 11)
                 }
@@ -1787,7 +2218,7 @@ class StarkHologramHUD(
                 preferredSize = Dimension(150, 220)
                 border = EmptyBorder(12, 2, 12, 2)
 
-                val lbl = JLabel("◣ SPOTIFY & VIDEO").apply {
+                val lbl = JLabel("◣ SPOTIFY & CLOUD").apply {
                     foreground = Color(255, 195, 0)
                     font = Font("Monospaced", Font.BOLD, 11)
                     horizontalAlignment = SwingConstants.RIGHT
@@ -1796,7 +2227,7 @@ class StarkHologramHUD(
                 add(createHoloButton("▶ PLAY SPOTIFY", Color(16, 235, 160), 145) { runQuickCommand("dale play") })
                 add(createHoloButton("⏸ PAUSA SPOTIFY", Color(255, 185, 0), 145) { runQuickCommand("pausa") })
                 add(createHoloButton("⏭ SIGUIENTE", Color(0, 225, 255), 145) { runQuickCommand("siguiente cancion") })
-                add(createHoloButton("⏮ ANTERIOR", Color(160, 140, 255), 145) { runQuickCommand("cancion anterior") })
+                add(createHoloButton("☁ SYNC AHORA", Color(160, 140, 255), 145) { runQuickCommand("sincronizar nube") })
             }
 
             add(leftWing, BorderLayout.WEST)
@@ -1892,7 +2323,7 @@ class StarkHologramHUD(
                 if (SwingUtilities.isRightMouseButton(e) || e.clickCount == 2) {
                     setOrbMode(!isMiniOrbMode)
                 } else if (SwingUtilities.isLeftMouseButton(e)) {
-                    if (isMiniOrbMode || (e.y in 90..310 && e.x in 190..490)) {
+                    if (isMiniOrbMode || (e.y in 90..310 && e.x in 190..510)) {
                         brain.activateDirectVoiceListenWindow()
                     }
                 }
@@ -1909,8 +2340,6 @@ class StarkHologramHUD(
             }
         })
 
-        // RELOJ INTELIGENTE DE BAJO CONSUMO:
-        // En el panel grande SOLO repinta el cuadro central del Reactor (180, 62, 320, 275), ahorrando 85% de CPU en Mac
         javax.swing.Timer(45) {
             if (System.currentTimeMillis() < brain.directListenUntil && brain.uiState == "IDLE") {
                 brain.uiState = "LISTENING"
@@ -1921,10 +2350,99 @@ class StarkHologramHUD(
             if (isMiniOrbMode) {
                 hudCanvas.repaint()
             } else {
-                // Solo redibuja la región central del reactor; los botones y textos NO se redibujan cada frame
-                hudCanvas.repaint(180, 62, 320, 275)
+                hudCanvas.repaint(180, 62, 340, 275)
             }
         }.start()
+    }
+
+    fun refreshAccountBadges() {
+        val acc = cloudVault.getCurrentAccount()
+        val roleIcon = if (acc.role == "ADMIN") "👑 ADMIN" else "👤 USER"
+        accountBadgeLabel.text = "${acc.username.uppercase()} [$roleIcon]"
+        hudCanvas.repaint()
+    }
+
+    // Ventana rápida para Iniciar Sesión, Cambiar de Cuenta o Registrar Nuevo Usuario en la Nube
+    private fun openAccountSwitcherDialog() {
+        val acc = cloudVault.getCurrentAccount()
+        val options = arrayOf("Iniciar Sesión / Cambiar Cuenta", "Registrar Nueva Cuenta", "Cancelar")
+        val choice = JOptionPane.showOptionDialog(
+            this,
+            "Cuenta activa en este dispositivo: ${acc.username.uppercase()} (${acc.role})\nEstado de Nube: ${cloudVault.cloudSyncStatus}\nRecuerdos sincronizados: ${acc.personalFacts.size}",
+            "DAEMON CLOUD // CUENTA DE USUARIO",
+            JOptionPane.DEFAULT_OPTION,
+            JOptionPane.INFORMATION_MESSAGE,
+            null,
+            options,
+            options[0]
+        )
+
+        if (choice == 0) {
+            val user = JOptionPane.showInputDialog(this, "Nombre de usuario:", acc.username) ?: return
+            val pass = JOptionPane.showInputDialog(this, "Contraseña / PIN para '$user':") ?: return
+            val msg = cloudVault.loginOrSwitchUser(user, pass)
+            refreshAccountBadges()
+            brain.speakAndDisplay("CAMBIO DE CUENTA", msg)
+        } else if (choice == 1) {
+            val user = JOptionPane.showInputDialog(this, "Nuevo nombre de usuario:") ?: return
+            val pass = JOptionPane.showInputDialog(this, " Define una contraseña / PIN:") ?: return
+            val msg = cloudVault.registerNewUser(user, pass)
+            refreshAccountBadges()
+            brain.speakAndDisplay("NUEVA CUENTA", msg)
+        }
+    }
+
+    // Consola exclusiva para la Cuenta de Administrador de Cristian
+    private fun openAdminConsoleDialog() {
+        if (!cloudVault.isAdminLoggedIn()) {
+            val pass = JOptionPane.showInputDialog(this, "🔒 Ingresa la clave de Administrador Maestro (cristian):") ?: return
+            val loginRes = cloudVault.loginOrSwitchUser("cristian", pass)
+            refreshAccountBadges()
+            if (!cloudVault.isAdminLoggedIn()) {
+                brain.speakAndDisplay("ADMIN", loginRes)
+                return
+            }
+        }
+
+        val options = arrayOf(
+            "1. Conectar URL de Base de Datos Cloud",
+            "2. Agregar Conocimiento Global (Todos los Usuarios)",
+            "3. Ver Lista de Usuarios en la Nube",
+            "4. Cerrar"
+        )
+        val sel = JOptionPane.showOptionDialog(
+            this,
+            "👑 CONSOLA MAESTRA DE ADMINISTRADOR (CRISTIAN)\nURL Cloud actual: ${cloudVault.deviceConfig.cloudDatabaseUrl.ifBlank { "Modo Caché Local (Sin URL externa)" }}\nNodos Globales: ${cloudVault.vault.globalKnowledge.size} | Cuentas Registradas: ${cloudVault.vault.accounts.size}",
+            "👑 DAEMON // ADMIN CORE",
+            JOptionPane.DEFAULT_OPTION,
+            JOptionPane.WARNING_MESSAGE,
+            null,
+            options,
+            options[0]
+        )
+
+        when (sel) {
+            0 -> {
+                val url = JOptionPane.showInputDialog(
+                    this,
+                    "Pega la URL de tu Firebase Realtime Database o Servidor Daemon Cloud\n(Ej: https://tu-daemon-default-rtdb.firebaseio.com):",
+                    cloudVault.deviceConfig.cloudDatabaseUrl
+                ) ?: return
+                val msg = cloudVault.adminSetCloudDatabaseUrl(url)
+                brain.speakAndDisplay("ADMIN CLOUD", msg)
+            }
+            1 -> {
+                val patternsRaw = JOptionPane.showInputDialog(this, "Escribe las formas de preguntarlo separadas por '/' (Ej: que es escom / donde estudia cristian):") ?: return
+                val answer = JOptionPane.showInputDialog(this, "Escribe la respuesta oficial que aprenderán todos los dispositivos:") ?: return
+                val tag = "global_" + (System.currentTimeMillis() % 100000)
+                val msg = cloudVault.adminAddGlobalKnowledge(tag, patternsRaw.split("/").map { it.trim() }, answer)
+                brain.speakAndDisplay("ADMIN GLOBAL", msg)
+            }
+            2 -> {
+                val report = cloudVault.adminListUsers()
+                updateHologram("ADMIN USUARIOS", report)
+            }
+        }
     }
 
     fun setOrbMode(mini: Boolean) {
@@ -1978,7 +2496,7 @@ class StarkHologramHUD(
 
     fun updateHologram(userQuery: String, daemonReply: String) {
         SwingUtilities.invokeLater {
-            statusLabel.text = "ORDEN // ${userQuery.take(44).uppercase()}"
+            statusLabel.text = "ORDEN // ${userQuery.take(40).uppercase()}"
             outputArea.text = daemonReply
             outputArea.caretPosition = 0
         }
@@ -2048,9 +2566,6 @@ class StarkHologramHUD(
         }
     }
 
-    // ========================================================================
-    // MOTOR GRÁFICO LIGERO (36 NODOS + DIRTY REGION = FLUIDEZ EN INTEL i3 / MAC)
-    // ========================================================================
     inner class HolographicChassisPanel : JPanel(true) {
         private var t = 0.0
         private val nodeCount = 36
@@ -2125,12 +2640,10 @@ class StarkHologramHUD(
             val w = width.toDouble()
             val cut = 26
 
-            // Borde del chasis
             g2.color = dimMainColor
             g2.stroke = strokeBorder
             g2.drawRect(2, 2, width - 5, height - 5)
 
-            // Esquinas Stark
             g2.color = colorGold
             g2.stroke = strokeCorner
             g2.drawLine(2, 2, 2 + cut, 2)
@@ -2146,16 +2659,16 @@ class StarkHologramHUD(
             val cy = 195.0
             drawFloatingArcReactor(g2, cx, cy, 1.0, mainColor, dimMainColor, glowColor, pulse, false)
 
-            // Telemetría real de bajo consumo (Muestra CPU y MB reales de Daemon)
             g2.font = telemetryFont
             g2.color = colorTelemetryCyan
-            g2.drawString("CPU: ${scanner.cachedCpuLoad}%", 188, 76)
-            g2.drawString("RAM: ${scanner.cachedRamMb} MB", 435, 76)
+            g2.drawString("CPU:${scanner.cachedCpuLoad}% RAM:${scanner.cachedRamMb}MB", 184, 76)
+            g2.drawString(cloudVault.cloudSyncStatus, 418, 76)
 
+            val acc = cloudVault.getCurrentAccount()
             g2.color = colorGold
-            val modeText = "MODO // ${scanner.activeModeName}"
+            val userBadge = "USER // ${acc.username.uppercase()} [${acc.role}]"
             val fm = g2.fontMetrics
-            g2.drawString(modeText, (cx - fm.stringWidth(modeText) / 2).toInt(), 76)
+            g2.drawString(userBadge, (cx - fm.stringWidth(userBadge) / 2).toInt(), 92)
 
             g2.color = colorSpotifyGreen
             val spText = "♫ SPOTIFY: ${scanner.currentSpotifyTrack}"
@@ -2253,16 +2766,33 @@ class StarkHologramHUD(
     }
 }
 
+// ============================================================================
+// 5. ENDPOINTS REST PARA SINCRONIZAR DISPOSITIVOS Y BÓVEDA EN LA NUBE
+// ============================================================================
 @RestController
 @RequestMapping("/api/daemon")
 @CrossOrigin(origins = ["*"])
 class DaemonController(
-    private val brain: DaemonBrain
+    private val brain: DaemonBrain,
+    private val cloudVault: CloudVaultService
 ) {
     @PostMapping("/chat")
     fun chat(@RequestBody request: ChatRequest): String {
+        if (request.username.isNotBlank() && request.password.isNotBlank()) {
+            cloudVault.loginOrSwitchUser(request.username, request.password)
+        }
         val reply = brain.processThought(request.prompt)
         brain.speakAndDisplay(request.prompt, reply)
         return reply
+    }
+
+    // Si alojas Daemon en un servidor (o conectas tu Mac a tu PC), este endpoint sirve de Bóveda Cloud maestra
+    @GetMapping("/cloud-vault")
+    fun getVault(): CloudVaultState = cloudVault.vault
+
+    @PutMapping("/cloud-vault")
+    fun updateVault(@RequestBody incomingVault: CloudVaultState): CloudVaultState {
+        cloudVault.mergeCloudVault(incomingVault)
+        return cloudVault.vault
     }
 }
