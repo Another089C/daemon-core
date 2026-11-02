@@ -1,33 +1,41 @@
 [ {
   "id" : "TRABAJO",
-  "name" : "PROTOCOLO DE TRABAJO",
-  "triggers" : [ "vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar", "modo programacion", "inicia modo trabajo", "activa modo trabajo" ],
-  "appsToOpen" : [ "vscode", "notion", "opera gx", "spotify" ],
+  "name" : "PROTOCOLO TRABAJO",
+  "triggers" : [ "vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar", "modo programacion", "activa modo trabajo" ],
+  "appsToOpen" : [ "vscode", "notion", "opera gx" ],
   "appsToClose" : [ ],
-  "spotifyPlaylist" : "programar",
-  "greeting" : "Activando Protocolo de Trabajo, Cristian. Desplegando Visual Studio Code, Notion, Opera GX y sincronizando tu música en Spotify."
+  "spotifyPlaylist" : "mis me gusta",
+  "greeting" : "Activando Modo Trabajo, Cristian. Abriendo Visual Studio Code, Notion, Opera GX y reproduciendo tus canciones de Mis Me Gusta en Spotify."
+}, {
+  "id" : "TAREA",
+  "name" : "PROTOCOLO TAREA",
+  "triggers" : [ "vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea", "activa modo tarea" ],
+  "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+  "appsToClose" : [ "discord", "steam" ],
+  "spotifyPlaylist" : "mis me gusta",
+  "greeting" : "Activando Modo Tarea, Cristian. Preparando Visual Studio Code, Notion, Opera GX y reproduciendo automáticamente tu lista Mis Me Gusta en Spotify."
 }, {
   "id" : "ESTUDIO",
-  "name" : "PROTOCOLO POLITÉCNICO / ESTUDIO",
-  "triggers" : [ "vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom", "hora de estudiar" ],
+  "name" : "PROTOCOLO ESTUDIO",
+  "triggers" : [ "vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom", "hora de estudiar", "activa modo estudio" ],
   "appsToOpen" : [ "notion", "opera gx", "vscode" ],
   "appsToClose" : [ "discord", "steam" ],
-  "spotifyPlaylist" : "programar",
-  "greeting" : "Protocolo de Estudio activado, Cristian. Cerrando distracciones y abriendo Notion, Opera GX y tu entorno de código."
+  "spotifyPlaylist" : "mis me gusta",
+  "greeting" : "Activando Modo Estudio, Cristian. Abriendo Notion, Opera GX, Visual Studio Code y reproduciendo automáticamente tus canciones de Mis Me Gusta."
 }, {
   "id" : "GAMING",
   "name" : "PROTOCOLO GAMING",
   "triggers" : [ "vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar", "activa modo gaming" ],
-  "appsToOpen" : [ "discord", "spotify" ],
-  "appsToClose" : [ "vscode", "notion" ],
-  "spotifyPlaylist" : "reggaeton",
-  "greeting" : "Protocolo Gaming en línea, Cristian. Liberando memoria RAM de aplicaciones de trabajo e iniciando Discord y Spotify."
-}, {
-  "id" : "DESCANSO",
-  "name" : "PROTOCOLO DESCANSO / RELAX",
-  "triggers" : [ "vamos a descansar", "modo descanso", "modo relax", "protocolo descanso", "modo cine", "terminamos de trabajar" ],
-  "appsToOpen" : [ "opera gx", "spotify" ],
+  "appsToOpen" : [ "discord" ],
   "appsToClose" : [ "vscode", "notion" ],
   "spotifyPlaylist" : "mis me gusta",
-  "greeting" : "Cerrando entorno de trabajo y activando Modo Descanso, Cristian. Relájate."
+  "greeting" : "Modo Gaming activo, Cristian. Cerrando aplicaciones de trabajo, abriendo Discord y reproduciendo tu música."
+}, {
+  "id" : "DESCANSO",
+  "name" : "PROTOCOLO DESCANSO",
+  "triggers" : [ "vamos a descansar", "modo descanso", "modo relax", "protocolo descanso", "terminamos de trabajar" ],
+  "appsToOpen" : [ "opera gx" ],
+  "appsToClose" : [ "vscode", "notion" ],
+  "spotifyPlaylist" : "mis me gusta",
+  "greeting" : "Cerrando entorno de trabajo y activando Modo Descanso, Cristian."
 } ]
