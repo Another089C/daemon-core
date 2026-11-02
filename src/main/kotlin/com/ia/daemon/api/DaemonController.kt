@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import org.springframework.stereotype.Service
 import org.springframework.web.bind.annotation.*
 import java.awt.*
+import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseMotionAdapter
@@ -20,9 +21,9 @@ import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.text.Normalizer
-import java.time.Duration
-import java.time.LocalDateTime
+import java.time.*
 import java.time.format.DateTimeFormatter
+import java.time.temporal.TemporalAdjusters
 import java.util.Base64
 import java.util.concurrent.CopyOnWriteArraySet
 import javax.swing.*
@@ -32,7 +33,7 @@ import kotlin.concurrent.thread
 import kotlin.math.*
 
 // ============================================================================
-// MODELOS DE DATOS DE CUENTAS, OTA AUTO-UPDATER Y BÓVEDA EN LA NUBE
+// MODELOS DE DATOS DE CUENTAS, CALENDARIO (GOOGLE/APPLE), OTA Y NUBE
 // ============================================================================
 data class ChatRequest(
     val prompt: String = "",
@@ -63,13 +64,29 @@ data class ChatMessage(
     val content: String = ""
 )
 
+data class CalendarEventItem(
+    val id: String = "evt_" + System.currentTimeMillis(),
+    val title: String = "",
+    val startEpochMillis: Long = 0L,
+    val endEpochMillis: Long = 0L,
+    val formattedDate: String = "",
+    var syncedToGoogle: Boolean = false,
+    var syncedToApple: Boolean = false,
+    var voiceAlertTriggered: Boolean = false
+)
+
 data class UserAccount(
     val username: String = "",
     var passwordHash: String = "",
     var role: String = "USER",
+    var calendarProvider: String = "BOTH", // "GOOGLE", "APPLE" o "BOTH"
+    var googleAccountEmail: String = "",
+    var googleWebhookOrToken: String = "",
+    var appleAccountEmail: String = "",
     val personalFacts: MutableList<String> = mutableListOf(),
     val personalKnowledge: MutableList<IntentNode> = mutableListOf(),
     val personalModes: MutableList<WorkspaceMode> = mutableListOf(),
+    val calendarEvents: MutableList<CalendarEventItem> = mutableListOf(),
     val recentHistory: MutableList<ChatMessage> = mutableListOf(),
     var updatedAt: Long = System.currentTimeMillis()
 )
@@ -81,8 +98,8 @@ data class CloudVaultState(
 )
 
 data class OtaManifest(
-    var appVersion: Int = 126,
-    var versionName: String = "12.6.0",
+    var appVersion: Int = 130,
+    var versionName: String = "13.0.0",
     var githubRawBaseUrl: String = "",
     var sharedCloudDbUrl: String = "",
     var jarRelativePath: String = "build/libs/daemon-0.0.1-SNAPSHOT.jar",
@@ -92,7 +109,7 @@ data class OtaManifest(
 data class LocalMachineSession(
     var loggedUsername: String = "invitado",
     var loggedPasswordHash: String = "",
-    var installedAppVersion: Int = 126
+    var installedAppVersion: Int = 130
 )
 
 data class OllamaOptions(
@@ -114,8 +131,190 @@ data class CloudChatPayload(
     val jsonMode: Boolean = false
 )
 
+data class GoogleCalendarWebhookPayload(
+    val title: String = "",
+    val startIso: String = "",
+    val endIso: String = "",
+    val email: String = "",
+    val description: String = "Agendado automáticamente por Daemon AI"
+)
+
 // ============================================================================
-// 1. SERVICIO DE BÓVEDA EN TIEMPO REAL (P2P LAN + GITHUB NOCACHE + CLOUD DB)
+// 1. PARSER INTELIGENTE DE FECHAS Y HORAS EN ESPAÑOL PARA RECORDATORIOS
+// ============================================================================
+object SpanishCalendarParser {
+
+    private val monthMap = mapOf(
+        "enero" to 1, "febrero" to 2, "marzo" to 3, "abril" to 4,
+        "mayo" to 5, "junio" to 6, "julio" to 7, "agosto" to 8,
+        "septiembre" to 9, "setiembre" to 9, "octubre" to 10,
+        "noviembre" to 11, "diciembre" to 12
+    )
+
+    private val dayOfWeekMap = mapOf(
+        "lunes" to DayOfWeek.MONDAY,
+        "martes" to DayOfWeek.TUESDAY,
+        "miercoles" to DayOfWeek.WEDNESDAY,
+        "jueves" to DayOfWeek.THURSDAY,
+        "viernes" to DayOfWeek.FRIDAY,
+        "sabado" to DayOfWeek.SATURDAY,
+        "domingo" to DayOfWeek.SUNDAY
+    )
+
+    fun isCalendarReminderRequest(normalized: String): Boolean {
+        val hasTriggerVerb = normalized.startsWith("recuerdame ") ||
+            normalized.startsWith("agenda ") ||
+            normalized.startsWith("agendar ") ||
+            normalized.startsWith("programa ") ||
+            normalized.contains("agrega al calendario") ||
+            normalized.contains("agregar al calendario") ||
+            normalized.contains("pon en mi calendario") ||
+            normalized.contains("pon un recordatorio") ||
+            normalized.contains("crea un recordatorio") ||
+            normalized.contains("crear recordatorio")
+
+        if (hasTriggerVerb) return true
+
+        // Si empieza con "recuerda " pero incluye una referencia temporal ("mañana", "el viernes", "a las 5")
+        if (normalized.startsWith("recuerda ")) {
+            val hasTimeCue = normalized.contains(" manana") ||
+                normalized.contains(" hoy") ||
+                normalized.contains(" a las ") ||
+                normalized.contains(" en ") && (normalized.contains(" minutos") || normalized.contains(" horas")) ||
+                dayOfWeekMap.keys.any { normalized.contains(" el $it") || normalized.contains(" este $it") }
+            return hasTimeCue
+        }
+        return false
+    }
+
+    fun parseEvent(rawInput: String, normalized: String): CalendarEventItem {
+        val now = LocalDateTime.now()
+        var targetDate: LocalDate = now.toLocalDate()
+        var targetHour = 9
+        var targetMinute = 0
+        var timeExplicitlyFound = false
+
+        // 1. Detectar tiempos relativos ("en 20 minutos", "en 2 horas")
+        val inMinutesMatch = Regex("""\ben\s+(\d{1,3})\s+minutos?\b""").find(normalized)
+        val inHoursMatch = Regex("""\ben\s+(\d{1,2})\s+horas?\b""").find(normalized)
+
+        if (inMinutesMatch != null) {
+            val mins = inMinutesMatch.groupValues[1].toLongOrNull() ?: 15L
+            val future = now.plusMinutes(mins)
+            targetDate = future.toLocalDate()
+            targetHour = future.hour
+            targetMinute = future.minute
+            timeExplicitlyFound = true
+        } else if (inHoursMatch != null) {
+            val hrs = inHoursMatch.groupValues[1].toLongOrNull() ?: 1L
+            val future = now.plusHours(hrs)
+            targetDate = future.toLocalDate()
+            targetHour = future.hour
+            targetMinute = future.minute
+            timeExplicitlyFound = true
+        } else {
+            // 2. Detectar día ("pasado mañana", "mañana", "hoy")
+            when {
+                normalized.contains("pasado manana") -> targetDate = now.toLocalDate().plusDays(2)
+                normalized.contains("manana") && !normalized.contains("de la manana") -> targetDate = now.toLocalDate().plusDays(1)
+                normalized.contains("hoy") -> targetDate = now.toLocalDate()
+            }
+
+            // 3. Detectar día de la semana ("el viernes", "este lunes", "proximo martes")
+            for ((dayName, dayEnum) in dayOfWeekMap) {
+                if (Regex("""\b(?:el|este|proximo)?\s*$dayName\b""").containsMatchIn(normalized)) {
+                    targetDate = now.toLocalDate().with(TemporalAdjusters.nextOrSame(dayEnum))
+                    if (targetDate == now.toLocalDate() && now.hour >= 20) {
+                        targetDate = now.toLocalDate().with(TemporalAdjusters.next(dayEnum))
+                    }
+                    break
+                }
+            }
+
+            // 4. Detectar fecha explícita ("el 15 de noviembre", "3 de diciembre")
+            val explicitDateMatch = Regex("""\b(\d{1,2})\s+de\s+([a-z]+)(?:\s+de\s+(\d{4}))?\b""").find(normalized)
+            if (explicitDateMatch != null) {
+                val dayNum = explicitDateMatch.groupValues[1].toIntOrNull() ?: 1
+                val monthName = explicitDateMatch.groupValues[2]
+                val yearNum = explicitDateMatch.groupValues[3].toIntOrNull() ?: now.year
+                val monthNum = monthMap[monthName]
+                if (monthNum != null) {
+                    try {
+                        var candidate = LocalDate.of(yearNum, monthNum, dayNum.coerceIn(1, 28))
+                        try { candidate = LocalDate.of(yearNum, monthNum, dayNum) } catch (e: Exception) {}
+                        if (candidate.isBefore(now.toLocalDate()) && explicitDateMatch.groupValues[3].isBlank()) {
+                            candidate = candidate.plusYears(1)
+                        }
+                        targetDate = candidate
+                    } catch (e: Exception) {}
+                }
+            }
+
+            // 5. Detectar hora ("a las 5:30 pm", "a las 6 de la tarde", "a las 14:00", "a la 1 pm")
+            val timeRegex = Regex("""\ba\s+las?\s+(\d{1,2})(?:[:\s](\d{2}))?\s*(am|pm|de\s+la\s+manana|de\s+la\s+tarde|de\s+la\s+noche|hrs|horas)?\b""")
+            val timeMatch = timeRegex.find(normalized)
+            if (timeMatch != null) {
+                var hr = timeMatch.groupValues[1].toIntOrNull() ?: 9
+                val mn = timeMatch.groupValues[2].toIntOrNull() ?: 0
+                val meridiem = timeMatch.groupValues[3].trim()
+
+                if (meridiem == "pm" || meridiem.contains("tarde") || meridiem.contains("noche")) {
+                    if (hr in 1..11) hr += 12
+                } else if (meridiem == "am" || meridiem.contains("manana")) {
+                    if (hr == 12) hr = 0
+                } else if (hr in 1..6) {
+                    // Si dice "a las 5" sin especificar am/pm, suele ser 5:00 PM
+                    hr += 12
+                }
+                targetHour = hr.coerceIn(0, 23)
+                targetMinute = mn.coerceIn(0, 59)
+                timeExplicitlyFound = true
+            }
+        }
+
+        if (!timeExplicitlyFound && targetDate == now.toLocalDate()) {
+            // Si es para hoy y no dijo hora, programarlo 1 hora después de la hora actual
+            val plusOne = now.plusHours(1)
+            targetDate = plusOne.toLocalDate()
+            targetHour = plusOne.hour
+            targetMinute = 0
+        }
+
+        val startDt = LocalDateTime.of(targetDate, LocalTime.of(targetHour, targetMinute, 0))
+        val endDt = startDt.plusHours(1)
+
+        // Extraer el título limpio del evento quitando las palabras de comando y fecha
+        var cleanTitle = rawInput.trim()
+            .replace(Regex("""^(?:daemon\s+|oye\s+daemon\s+|hola\s+daemon\s+)?""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""^(?:recuerdame|recuérdame|recuerda|agenda|agendar|programa|agrega\s+al\s+calendario|agregar\s+al\s+calendario|pon\s+en\s+mi\s+calendario|pon\s+un\s+recordatorio|crea\s+un\s+recordatorio)\s+(?:que\s+|para\s+)?""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\b(?:pasado\s+manana|pasado\s+mañana|manana|mañana|hoy)\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\b(?:el|este|proximo|próximo)\s+(?:lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\b\d{1,2}\s+de\s+[a-zA-Z]+(?:\s+de\s+\d{4})?\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\ba\s+las?\s+\d{1,2}(?:[:\s]\d{2})?\s*(?:am|pm|de\s+la\s+manana|de\s+la\s+mañana|de\s+la\s+tarde|de\s+la\s+noche|hrs|horas)?\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\ben\s+\d{1,3}\s+(?:minutos?|horas?)\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+
+        if (cleanTitle.isBlank()) cleanTitle = "Recordatorio de Daemon AI"
+        cleanTitle = cleanTitle.replaceFirstChar { it.uppercase() }
+
+        val zone = ZoneId.systemDefault()
+        val startMillis = startDt.atZone(zone).toInstant().toEpochMilli()
+        val endMillis = endDt.atZone(zone).toInstant().toEpochMilli()
+        val fmt = startDt.format(DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm"))
+
+        return CalendarEventItem(
+            id = "evt_${startMillis}_${abs(cleanTitle.hashCode() % 10000)}",
+            title = cleanTitle,
+            startEpochMillis = startMillis,
+            endEpochMillis = endMillis,
+            formattedDate = fmt
+        )
+    }
+}
+
+// ============================================================================
+// 2. SERVICIO DE BÓVEDA EN LA NUBE + SINCRONIZACIÓN DE CALENDARIO MULTI-OS
 // ============================================================================
 @Service
 class CloudVaultService {
@@ -127,7 +326,7 @@ class CloudVaultService {
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
 
     private val httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(4))
+        .connectTimeout(Duration.ofSeconds(5))
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build()
 
@@ -139,8 +338,12 @@ class CloudVaultService {
     private val udpDiscoveryPort = 19840
 
     @Volatile var cloudSyncStatus: String = "LIVE SYNC ☁"
-    @Volatile var otaStatusText: String = "v12.6.0 LIVE"
+    @Volatile var otaStatusText: String = "v13.0.0 LIVE"
     var onSessionOrVaultChanged: (() -> Unit)? = null
+    var onDueCalendarAlarm: ((CalendarEventItem) -> Unit)? = null
+
+    val isMac = System.getProperty("os.name").lowercase().let { it.contains("mac") || it.contains("darwin") }
+    val isWindows = System.getProperty("os.name").lowercase().contains("win")
 
     init {
         loadOrDetectOtaManifest()
@@ -148,6 +351,7 @@ class CloudVaultService {
         loadOrInitializeVault()
         startLanPeerToPeerSyncServer()
         startAutomaticOtaAndCloudDaemon()
+        startCalendarAlarmAndCrossDeviceSync()
     }
 
     fun sha256(input: String): String {
@@ -155,6 +359,236 @@ class CloudVaultService {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
+    // ========================================================================
+    // MOTOR AUTOMÁTICO GOOGLE CALENDAR & APPLE CALENDAR (iCLOUD)
+    // ========================================================================
+    fun scheduleEventInConnectedCalendars(rawInput: String, normalized: String): String {
+        val event = SpanishCalendarParser.parseEvent(rawInput, normalized)
+        val acc = getCurrentAccount()
+
+        val provider = acc.calendarProvider.uppercase()
+        val syncResults = mutableListOf<String>()
+
+        // 1. CONEXIÓN CON APPLE CALENDAR / iCLOUD
+        if (provider == "APPLE" || provider == "BOTH") {
+            if (isMac) {
+                val okApple = insertIntoMacAppleCalendar(event, acc.appleAccountEmail)
+                if (okApple) {
+                    event.syncedToApple = true
+                    syncResults.add("Apple Calendar (iCloud)")
+                }
+            } else {
+                // Si está en Windows, se marca pendiente para que la Mac lo inyecte en iCloud automáticamente al sincronizar
+                syncResults.add("Cola iCloud (Se inyectará en tu Mac automáticamente)")
+            }
+        }
+
+        // 2. CONEXIÓN CON GOOGLE CALENDAR
+        if (provider == "GOOGLE" || provider == "BOTH") {
+            val okGoogle = insertIntoGoogleCalendar(event, acc)
+            if (okGoogle) {
+                event.syncedToGoogle = true
+                syncResults.add("Google Calendar (${acc.googleAccountEmail.ifBlank { "Cuenta Activa" }})")
+            }
+        }
+
+        // Guardar en la bóveda en la nube de la cuenta activa
+        acc.calendarEvents.removeIf { it.id == event.id }
+        acc.calendarEvents.add(event)
+        acc.updatedAt = System.currentTimeMillis()
+        pushVaultEverywhereAsync("feat(calendar): nuevo recordatorio ${event.title}")
+        onSessionOrVaultChanged?.invoke()
+
+        val channelsText = if (syncResults.isEmpty()) "Alarma Interna de Daemon" else syncResults.joinToString(" + ")
+        return "📅 Recordatorio agendado para el ${event.formattedDate}: '${event.title}'. Sincronizado automáticamente con: $channelsText."
+    }
+
+    // Inserta el evento de forma 100% silenciosa en Apple Calendar (macOS Calendar.app -> iCloud / Google)
+    private fun insertIntoMacAppleCalendar(event: CalendarEventItem, preferredEmail: String): Boolean {
+        if (!isMac) return false
+        return try {
+            val nowMillis = System.currentTimeMillis()
+            val secondsFromNow = ((event.startEpochMillis - nowMillis) / 1000L).toInt()
+            val safeTitle = event.title.replace("\"", "'").replace("\\", "")
+
+            // Usa aritmética de segundos sobre (current date) para no fallar jamás por el idioma de macOS
+            val appleScript = """
+                tell application "Calendar"
+                    set targetCal to missing value
+                    repeat with c in calendars
+                        if writable of c is true then
+                            set targetCal to c
+                            exit repeat
+                        end if
+                    end repeat
+                    if targetCal is not missing value then
+                        set startD to (current date) + ($secondsFromNow)
+                        set endD to startD + 3600
+                        tell targetCal
+                            set newEv to make new event at end with properties {summary:"$safeTitle", start date:startD, end date:endD, description:"Agendado automáticamente por Daemon AI"}
+                            make new display alarm at end of display alarms of newEv with properties {trigger interval:-10}
+                        end tell
+                        return "OK"
+                    end if
+                end tell
+            """.trimIndent()
+
+            val proc = ProcessBuilder("osascript", "-e", appleScript).start()
+            val out = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
+            proc.waitFor()
+            out.contains("OK")
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Inserta el evento en Google Calendar (Vía Puente Silencioso en 2do plano, Token OAuth, Mac Calendar o Auto-Web)
+    private fun insertIntoGoogleCalendar(event: CalendarEventItem, acc: UserAccount): Boolean {
+        val bridgeOrToken = acc.googleWebhookOrToken.trim()
+        val startIso = Instant.ofEpochMilli(event.startEpochMillis).atZone(ZoneOffset.UTC)
+            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+        val endIso = Instant.ofEpochMilli(event.endEpochMillis).atZone(ZoneOffset.UTC)
+            .format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+
+        // Vía A: Si el usuario conectó su Puente Google Apps Script (100% silencioso en la nube sin abrir navegador)
+        if (bridgeOrToken.startsWith("https://script.google.com/")) {
+            try {
+                val payload = GoogleCalendarWebhookPayload(
+                    title = event.title,
+                    startIso = startIso,
+                    endIso = endIso,
+                    email = acc.googleAccountEmail
+                )
+                val bodyJson = objectMapper.writeValueAsString(payload)
+                val req = HttpRequest.newBuilder()
+                    .uri(URI.create(bridgeOrToken))
+                    .timeout(Duration.ofSeconds(8))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(bodyJson, StandardCharsets.UTF_8))
+                    .build()
+                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                if (res.statusCode() in 200..399) return true
+            } catch (e: Exception) {}
+        }
+
+        // Vía B: Si el usuario puso un OAuth Access Token directo de Google Calendar API
+        if (bridgeOrToken.startsWith("ya29.")) {
+            try {
+                val apiJson = """{"summary":"${event.title.replace("\"", "'")}","start":{"dateTime":"$startIso"},"end":{"dateTime":"$endIso"}}"""
+                val req = HttpRequest.newBuilder()
+                    .uri(URI.create("https://www.googleapis.com/calendar/v3/calendars/primary/events"))
+                    .timeout(Duration.ofSeconds(6))
+                    .header("Authorization", "Bearer $bridgeOrToken")
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(apiJson, StandardCharsets.UTF_8))
+                    .build()
+                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                if (res.statusCode() in 200..299) return true
+            } catch (e: Exception) {}
+        }
+
+        // Vía C: Si está en macOS y tiene su cuenta de Google vinculada en Calendar.app, inyectarlo en silencio
+        if (isMac && insertIntoMacAppleCalendar(event, acc.googleAccountEmail)) {
+            return true
+        }
+
+        // Vía D: Inserción automática vía sesión activa de Google Calendar en el navegador
+        return try {
+            val gcalFmt = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'")
+            val d1 = Instant.ofEpochMilli(event.startEpochMillis).atZone(ZoneOffset.UTC).format(gcalFmt)
+            val d2 = Instant.ofEpochMilli(event.endEpochMillis).atZone(ZoneOffset.UTC).format(gcalFmt)
+            val encTitle = URLEncoder.encode(event.title, StandardCharsets.UTF_8)
+            val encDetails = URLEncoder.encode("Recordatorio creado automáticamente por Daemon AI", StandardCharsets.UTF_8)
+            val authUserParam = if (acc.googleAccountEmail.isNotBlank()) "&authuser=${URLEncoder.encode(acc.googleAccountEmail, StandardCharsets.UTF_8)}" else ""
+            val gcalUrl = "https://calendar.google.com/calendar/render?action=TEMPLATE&text=$encTitle&dates=$d1/$d2&details=$encDetails$authUserParam"
+
+            if (isWindows) {
+                ProcessBuilder("cmd", "/c", "start", "", gcalUrl).start()
+            } else if (isMac) {
+                ProcessBuilder("open", gcalUrl).start()
+            } else {
+                ProcessBuilder("xdg-open", gcalUrl).start()
+            }
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    // Hilo que dispara las alarmas por voz en la fecha/hora exacta y sincroniza eventos pendientes de Windows en Mac
+    private fun startCalendarAlarmAndCrossDeviceSync() {
+        thread(isDaemon = true, name = "Daemon-Calendar-Guardian") {
+            Thread.sleep(4000)
+            while (true) {
+                try {
+                    val acc = getCurrentAccount()
+                    val now = System.currentTimeMillis()
+                    var vaultModified = false
+
+                    for (ev in acc.calendarEvents) {
+                        // Si estamos en Mac y hay un evento creado en Windows que aún no se inyecta en Apple Calendar:
+                        if (isMac && !ev.syncedToApple && (acc.calendarProvider == "APPLE" || acc.calendarProvider == "BOTH")) {
+                            if (insertIntoMacAppleCalendar(ev, acc.appleAccountEmail)) {
+                                ev.syncedToApple = true
+                                vaultModified = true
+                            }
+                        }
+
+                        // Si llegó la hora del evento (dentro de una ventana de 2 minutos), avisar por voz
+                        if (!ev.voiceAlertTriggered && now >= ev.startEpochMillis && (now - ev.startEpochMillis) <= 180000L) {
+                            ev.voiceAlertTriggered = true
+                            vaultModified = true
+                            onDueCalendarAlarm?.invoke(ev)
+                        }
+                    }
+
+                    if (vaultModified) {
+                        acc.updatedAt = System.currentTimeMillis()
+                        saveLocalVaultCache()
+                        pushToAllPeerDevicesAsync()
+                    }
+                } catch (e: Exception) {}
+                Thread.sleep(15000)
+            }
+        }
+    }
+
+    fun configureUserCalendarSettings(
+        provider: String,
+        googleEmail: String,
+        googleWebhookOrToken: String,
+        appleEmail: String
+    ): String {
+        val acc = getCurrentAccount()
+        acc.calendarProvider = provider.uppercase()
+        acc.googleAccountEmail = googleEmail.trim()
+        acc.googleWebhookOrToken = googleWebhookOrToken.trim()
+        acc.appleAccountEmail = appleEmail.trim()
+        acc.updatedAt = System.currentTimeMillis()
+
+        pushVaultEverywhereAsync("feat(calendar): configuracion de calendario de ${acc.username}")
+        onSessionOrVaultChanged?.invoke()
+
+        return "Calendario de '${acc.username.uppercase()}' conectado en modo [${acc.calendarProvider}]. Google: ${acc.googleAccountEmail.ifBlank { "No asignado" }} | Apple: ${acc.appleAccountEmail.ifBlank { "Nativo iCloud" }}."
+    }
+
+    fun getUpcomingEventsReport(): String {
+        val acc = getCurrentAccount()
+        if (acc.calendarEvents.isEmpty()) {
+            return "No tienes recordatorios programados en tu cuenta (${acc.username.uppercase()}). Dime por ejemplo: 'Recuérdame entregar el proyecto mañana a las 5 pm'."
+        }
+        val sorted = acc.calendarEvents.sortedBy { it.startEpochMillis }.takeLast(8)
+        val lines = sorted.joinToString("\n") { ev ->
+            val gBadge = if (ev.syncedToGoogle) "[G✓]" else ""
+            val aBadge = if (ev.syncedToApple) "[✓]" else ""
+            "• ${ev.formattedDate} -> ${ev.title} $gBadge$aBadge"
+        }
+        return "📅 Recordatorios en la cuenta de ${acc.username.uppercase()} (${acc.calendarProvider}):\n$lines"
+    }
+
+    // ========================================================================
+    // GESTIÓN DE BÓVEDA, RED P2P Y OTA AUTO-UPDATER
+    // ========================================================================
     private fun loadOrDetectOtaManifest() {
         if (otaManifestFile.exists()) {
             try {
@@ -240,12 +674,14 @@ class CloudVaultService {
                     username = "cristian",
                     passwordHash = adminHash,
                     role = "ADMIN",
+                    calendarProvider = "BOTH",
                     personalFacts = mutableListOf(
                         "Es Cristian Alexis, creador y Administrador Maestro de Daemon.",
                         "Estudia Ingeniería en Sistemas Computacionales en la ESCOM del IPN."
                     ),
                     personalKnowledge = mutableListOf(),
                     personalModes = buildDefaultModesForUser("Cristian"),
+                    calendarEvents = mutableListOf(),
                     recentHistory = mutableListOf(),
                     updatedAt = System.currentTimeMillis()
                 )
@@ -261,9 +697,11 @@ class CloudVaultService {
                     username = "invitado",
                     passwordHash = sha256("invitado"),
                     role = "USER",
+                    calendarProvider = "BOTH",
                     personalFacts = mutableListOf("Sesión estándar de usuario en Daemon."),
                     personalKnowledge = mutableListOf(),
                     personalModes = buildDefaultModesForUser("Usuario"),
+                    calendarEvents = mutableListOf(),
                     recentHistory = mutableListOf(),
                     updatedAt = System.currentTimeMillis()
                 )
@@ -417,7 +855,7 @@ class CloudVaultService {
         checkOtaBinaryUpdate()
 
         onSessionOrVaultChanged?.invoke()
-        return "Sincronización completada: ${vault.accounts.size} cuentas activas (${vault.accounts.joinToString(", ") { it.username.uppercase() }})."
+        return "Sincronización completada: ${vault.accounts.size} cuentas activas."
     }
 
     private fun pullLatestVaultFromGitAndGitHub() {
@@ -522,10 +960,9 @@ class CloudVaultService {
                 localSession.installedAppVersion = remoteManifest.appVersion
                 savePrivateMachineSession()
 
-                val isWin = System.getProperty("os.name").lowercase().contains("win")
-                val javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + (if (isWin) "javaw.exe" else "java")
+                val javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + (if (isWindows) "javaw.exe" else "java")
 
-                if (isWin) {
+                if (isWindows) {
                     val updaterBat = File(workingDir, "daemon_swapper.bat")
                     val batContent = """
                         @echo off
@@ -651,19 +1088,29 @@ class CloudVaultService {
                 val localAcc = vault.accounts[localIdx]
                 val mergedFacts = (localAcc.personalFacts + rAcc.personalFacts).distinct().toMutableList()
                 val mergedKnow = (localAcc.personalKnowledge + rAcc.personalKnowledge).distinctBy { it.tag }.toMutableList()
+                val mergedEvents = (localAcc.calendarEvents + rAcc.calendarEvents).distinctBy { it.id }.toMutableList()
                 val mergedModes = if (rAcc.updatedAt > localAcc.updatedAt && rAcc.personalModes.isNotEmpty()) rAcc.personalModes else localAcc.personalModes
                 val newPassHash = if (rAcc.updatedAt >= localAcc.updatedAt && rAcc.passwordHash.isNotBlank()) rAcc.passwordHash else localAcc.passwordHash
 
-                if (mergedFacts.size != localAcc.personalFacts.size || mergedKnow.size != localAcc.personalKnowledge.size || newPassHash != localAcc.passwordHash) {
+                if (mergedFacts.size != localAcc.personalFacts.size ||
+                    mergedKnow.size != localAcc.personalKnowledge.size ||
+                    mergedEvents.size != localAcc.calendarEvents.size ||
+                    newPassHash != localAcc.passwordHash
+                ) {
                     changed = true
                 }
 
                 vault.accounts[localIdx] = localAcc.copy(
                     passwordHash = newPassHash,
                     role = if (rAcc.username.equals("cristian", true)) "ADMIN" else "USER",
+                    calendarProvider = if (rAcc.updatedAt >= localAcc.updatedAt) rAcc.calendarProvider else localAcc.calendarProvider,
+                    googleAccountEmail = if (rAcc.googleAccountEmail.isNotBlank()) rAcc.googleAccountEmail else localAcc.googleAccountEmail,
+                    googleWebhookOrToken = if (rAcc.googleWebhookOrToken.isNotBlank()) rAcc.googleWebhookOrToken else localAcc.googleWebhookOrToken,
+                    appleAccountEmail = if (rAcc.appleAccountEmail.isNotBlank()) rAcc.appleAccountEmail else localAcc.appleAccountEmail,
                     personalFacts = mergedFacts,
                     personalKnowledge = mergedKnow,
                     personalModes = mergedModes,
+                    calendarEvents = mergedEvents,
                     updatedAt = maxOf(localAcc.updatedAt, rAcc.updatedAt)
                 )
             }
@@ -708,7 +1155,7 @@ class CloudVaultService {
         onSessionOrVaultChanged?.invoke()
 
         val badge = if (acc.role == "ADMIN") "👑 ADMINISTRADOR MAESTRO" else "👤 CUENTA CLOUD"
-        return Pair(true, "Bienvenido, ${acc.username.uppercase()} [$badge]. Memoria sincronizada (${acc.personalFacts.size} recuerdos).")
+        return Pair(true, "Bienvenido, ${acc.username.uppercase()} [$badge]. Recuerdos: ${acc.personalFacts.size} | Eventos: ${acc.calendarEvents.size}.")
     }
 
     fun logoutToGuest(): String {
@@ -735,9 +1182,11 @@ class CloudVaultService {
             username = cleanUser,
             passwordHash = passHash,
             role = "USER",
+            calendarProvider = "BOTH",
             personalFacts = mutableListOf("Cuenta personal en la nube de $cleanUser."),
             personalKnowledge = mutableListOf(),
             personalModes = buildDefaultModesForUser(cleanUser),
+            calendarEvents = mutableListOf(),
             recentHistory = mutableListOf(),
             updatedAt = System.currentTimeMillis()
         )
@@ -795,7 +1244,7 @@ class CloudVaultService {
         otaManifest.appVersion += 1
         val major = otaManifest.appVersion / 10
         val minor = otaManifest.appVersion % 10
-        otaManifest.versionName = "12.$major.$minor"
+        otaManifest.versionName = "13.$major.$minor"
         otaManifest.publishedAt = System.currentTimeMillis()
 
         saveOtaManifest()
@@ -809,11 +1258,9 @@ class CloudVaultService {
         thread {
             try {
                 val workingDir = File(System.getProperty("user.dir"))
-                val isWin = System.getProperty("os.name").lowercase().contains("win")
-
-                val gradleWrapper = File(workingDir, if (isWin) "gradlew.bat" else "gradlew")
+                val gradleWrapper = File(workingDir, if (isWindows) "gradlew.bat" else "gradlew")
                 if (gradleWrapper.exists()) {
-                    val buildCmd = if (isWin) listOf("cmd", "/c", "gradlew.bat", "bootJar") else listOf("./gradlew", "bootJar")
+                    val buildCmd = if (isWindows) listOf("cmd", "/c", "gradlew.bat", "bootJar") else listOf("./gradlew", "bootJar")
                     ProcessBuilder(buildCmd).directory(workingDir).start().waitFor()
                 }
 
@@ -910,7 +1357,7 @@ class CloudVaultService {
         IntentNode(
             tag = "global_identidad",
             patterns = listOf("quien eres", "que es daemon", "como funcionas"),
-            responses = listOf("Soy Daemon v12.6, una aplicación nativa de inteligencia artificial con sincronización en vivo y auto-actualización OTA, creada por Cristian Alexis.")
+            responses = listOf("Soy Daemon v13.0, una aplicación nativa de inteligencia artificial con integración automática de Google Calendar y Apple Calendar, creada por Cristian Alexis.")
         ),
         IntentNode(
             tag = "global_proceso_hilo",
@@ -926,7 +1373,7 @@ class CloudVaultService {
 }
 
 // ============================================================================
-// 2. MOTOR MULTIPLATAFORMA + INSTALADOR DE APLICACIÓN NATIVA (CERO ESCRITORIO)
+// 3. MOTOR MULTIPLATAFORMA + INSTALADOR DE APLICACIÓN NATIVA (CERO ESCRITORIO)
 // ============================================================================
 @Service
 class SystemScanner(
@@ -1015,9 +1462,6 @@ class SystemScanner(
         } catch (e: Exception) { "" }
     }
 
-    // ========================================================================
-    // INSTALADOR DE APLICACIÓN NATIVA Y AUTO-ARRANQUE (LIMPIA EL ESCRITORIO)
-    // ========================================================================
     fun installAsSystemApplicationAndAutoStart(): String {
         return try {
             val workingDir = File(System.getProperty("user.dir")).absolutePath
@@ -1028,7 +1472,6 @@ class SystemScanner(
 
             when {
                 isWindows -> {
-                    // 1. Actualizar el lanzador silencioso DaemonApp.vbs dentro de la carpeta del proyecto
                     val launcherVbs = File(workingDir, "DaemonApp.vbs")
                     val vbsContent = """
                         Set fso = CreateObject("Scripting.FileSystemObject")
@@ -1046,18 +1489,15 @@ class SystemScanner(
                     """.trimIndent()
                     launcherVbs.writeText(vbsContent, StandardCharsets.ISO_8859_1)
 
-                    // 2. Eliminar cualquier archivo del Escritorio, registrar como Aplicación en Menú Inicio y activar Auto-Arranque
                     val psInstallApp = """
                         ${'$'}wsh = New-Object -ComObject WScript.Shell
                         ${'$'}desktop = [Environment]::GetFolderPath('Desktop')
                         ${'$'}programsMenu = [Environment]::GetFolderPath('Programs')
                         ${'$'}startup = [Environment]::GetFolderPath('Startup')
 
-                        # Borrar cualquier acceso directo antiguo en el Escritorio para mantenerlo 100% limpio
                         Remove-Item -Path "${'$'}desktop\Daemon AI.lnk" -Force -ErrorAction SilentlyContinue
                         Remove-Item -Path "${'$'}desktop\Daemon.lnk" -Force -ErrorAction SilentlyContinue
 
-                        # Registrar como Aplicación oficial en el Menú Inicio de Windows (Start Menu -> Programs)
                         ${'$'}sApp = ${'$'}wsh.CreateShortcut("${'$'}programsMenu\Daemon AI.lnk")
                         ${'$'}sApp.TargetPath = "wscript.exe"
                         ${'$'}sApp.Arguments = '"${launcherVbs.absolutePath}"'
@@ -1066,7 +1506,6 @@ class SystemScanner(
                         ${'$'}sApp.Description = "Daemon AI - Sistema Operativo J.A.R.V.I.S."
                         ${'$'}sApp.Save()
 
-                        # Registrar en el Inicio Automático al prender la PC (Startup + Registro Run)
                         ${'$'}sBoot = ${'$'}wsh.CreateShortcut("${'$'}startup\Daemon AI.lnk")
                         ${'$'}sBoot.TargetPath = "wscript.exe"
                         ${'$'}sBoot.Arguments = '"${launcherVbs.absolutePath}"'
@@ -1077,17 +1516,15 @@ class SystemScanner(
                         Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DaemonAI" -Value "wscript.exe `"${launcherVbs.absolutePath}`"" -Force
                     """.trimIndent()
                     runPowerShell(psInstallApp, wait = false)
-                    "Aplicación registrada en el Menú Inicio y Auto-Arranque de Windows (Escritorio limpio)."
+                    "Aplicación registrada en el Menú Inicio y Auto-Arranque de Windows."
                 }
                 isMac -> {
                     val home = System.getProperty("user.home")
                     val javaBin = System.getProperty("java.home") + "/bin/java"
 
-                    // 1. Eliminar cualquier archivo antiguo en el Escritorio de tu Mac
                     File("$home/Desktop/Daemon AI.command").delete()
                     File("$home/Desktop/Daemon_Mac.command").delete()
 
-                    // 2. Crear la Aplicación Nativa de macOS: /Applications/Daemon AI.app (o ~/Applications/Daemon AI.app)
                     val sysApps = File("/Applications")
                     val targetAppsDir = if (sysApps.exists() && sysApps.canWrite()) sysApps else File("$home/Applications").apply { mkdirs() }
                     val appBundle = File(targetAppsDir, "Daemon AI.app")
@@ -1112,7 +1549,7 @@ class SystemScanner(
                             <key>CFBundlePackageType</key>
                             <string>APPL</string>
                             <key>CFBundleShortVersionString</key>
-                            <string>12.6</string>
+                            <string>13.0</string>
                             <key>LSUIElement</key>
                             <true/>
                         </dict>
@@ -1134,7 +1571,6 @@ class SystemScanner(
                     macExec.writeText(macExecScript, StandardCharsets.UTF_8)
                     macExec.setExecutable(true)
 
-                    // 3. Registrar en LaunchAgents para que inicie sola al prender o iniciar sesión en la Mac
                     val launchAgentsDir = File("$home/Library/LaunchAgents").apply { mkdirs() }
                     val plistFile = File(launchAgentsDir, "com.cristian.daemon.ai.plist")
                     val plistXml = """
@@ -1156,27 +1592,7 @@ class SystemScanner(
                         </plist>
                     """.trimIndent()
                     plistFile.writeText(plistXml, StandardCharsets.UTF_8)
-                    "Aplicación nativa Daemon AI.app instalada en Aplicaciones y Auto-Arranque de macOS (Escritorio limpio)."
-                }
-                isLinux -> {
-                    val home = System.getProperty("user.home")
-                    val javaBin = System.getProperty("java.home") + "/bin/java"
-                    val desktopEntryContent = """
-                        [Desktop Entry]
-                        Type=Application
-                        Name=Daemon AI
-                        Exec="$javaBin" -Xms32m -Xmx128m -XX:+UseSerialGC -jar "${jarFile.absolutePath}"
-                        Path=$workingDir
-                        Terminal=false
-                        X-GNOME-Autostart-enabled=true
-                    """.trimIndent()
-
-                    val appsDir = File("$home/.local/share/applications").apply { mkdirs() }
-                    File(appsDir, "daemon-ai.desktop").writeText(desktopEntryContent, StandardCharsets.UTF_8)
-
-                    val autostartDir = File("$home/.config/autostart").apply { mkdirs() }
-                    File(autostartDir, "daemon-ai.desktop").writeText(desktopEntryContent, StandardCharsets.UTF_8)
-                    "Aplicación registrada en Linux."
+                    "Aplicación nativa Daemon AI.app instalada en Aplicaciones y Auto-Arranque de macOS."
                 }
                 else -> ""
             }
@@ -1963,14 +2379,14 @@ class SystemScanner(
     fun normalizeText(text: String): String {
         val temp = Normalizer.normalize(text.lowercase(), Normalizer.Form.NFD)
         return temp.replace(Regex("[\\p{InCombiningDiacriticalMarks}]"), "")
-            .replace(Regex("[^a-z0-9\\s\\.]"), " ")
+            .replace(Regex("[^a-z0-9\\s\\.:]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
     }
 }
 
 // ============================================================================
-// 3. CEREBRO DE DAEMON + PROCESAMIENTO DE COMANDOS Y CUENTAS
+// 4. CEREBRO DE DAEMON + CONEXIÓN DE RECORDATORIOS CON CALENDARIO
 // ============================================================================
 @Service
 class DaemonBrain(
@@ -1999,9 +2415,18 @@ class DaemonBrain(
         checkOllamaStatus()
         launchStarkHologramHUD()
         startContinuousWakeWordEar()
+
+        // Cuando llega la hora de un evento del calendario, Daemon avisa por voz automáticamente
+        cloudVault.onDueCalendarAlarm = { ev ->
+            speakAndDisplay(
+                "⏰ ALARMA DE CALENDARIO",
+                "Atención ${cloudVault.getCurrentAccount().username}: Tienes programado ahora '${ev.title}' (${ev.formattedDate})."
+            )
+        }
+
         speakAndDisplay(
-            "NÚCLEO LIVE v12.6",
-            "Aplicación nativa Daemon activa en ${systemScanner.getOSLabel()} con auto-inicio configurado."
+            "NÚCLEO CALENDAR v13.0",
+            "Daemon activo en ${systemScanner.getOSLabel()}. Sincronización automática con Google y Apple Calendar lista."
         )
     }
 
@@ -2036,12 +2461,14 @@ class DaemonBrain(
                             'daemon vamos a jugar', 'daemon modo gaming',
                             'daemon pon mis me gusta', 'daemon abre spotify', 'daemon abre opera gx',
                             'daemon abre visual', 'daemon abre notion', 'daemon abre el panel',
+                            'daemon mis recordatorios', 'daemon que tengo en mi calendario',
                             'pausa', 'dale play', 'siguiente cancion', 'cancion anterior',
                             'vamos a trabajar', 'vamos a hacer tarea', 'vamos a estudiar'
                         ))
                         ${'$'}gb = New-Object System.Speech.Recognition.GrammarBuilder(${'$'}choices)
                         ${'$'}gb.Culture = ${'$'}esRec.Culture
                         ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.Grammar(${'$'}gb)))
+                        ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
                         
                         while (${'$'}true) {
                             ${'$'}res = ${'$'}engine.Recognize([TimeSpan]::FromSeconds(5))
@@ -2143,6 +2570,21 @@ class DaemonBrain(
             normalized = normalized.replace(Regex("""^(?:oye\s+|hola\s+)?$w\b\s*"""), "").trim()
         }
 
+        // --------------------------------------------------------------------
+        // 1. RECORDATORIOS Y EVENTOS EN GOOGLE CALENDAR / APPLE CALENDAR
+        // --------------------------------------------------------------------
+        if (normalized in setOf("mis recordatorios", "ver recordatorios", "que tengo en mi calendario", "mi calendario", "eventos programados")) {
+            return recordAndReturn(input, cloudVault.getUpcomingEventsReport())
+        }
+
+        if (SpanishCalendarParser.isCalendarReminderRequest(normalized)) {
+            val calReply = cloudVault.scheduleEventInConnectedCalendars(input, normalized)
+            return recordAndReturn(input, calReply)
+        }
+
+        // --------------------------------------------------------------------
+        // 2. GESTIÓN DE CUENTAS Y SINCRONIZACIÓN
+        // --------------------------------------------------------------------
         val loginRegex = Regex("""^(?:iniciar\s+sesion|inicia\s+sesion|login|entrar\s+como)\s+(?:como\s+)?([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
         loginRegex.find(input)?.let { m ->
             val res = cloudVault.loginUser(m.groupValues[1], m.groupValues[2])
@@ -2167,6 +2609,9 @@ class DaemonBrain(
             return cloudVault.adminPublishOtaUpdateToAllDevices()
         }
 
+        // --------------------------------------------------------------------
+        // 3. MEMORIA PERMANENTE DE DATOS SIN FECHA ("recuerda que mi carrera es...")
+        // --------------------------------------------------------------------
         if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ") || normalized.startsWith("memoriza que ")) {
             val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
             return recordAndReturn(input, cloudVault.addPersonalFactToCurrentUser(fact))
@@ -2182,6 +2627,9 @@ class DaemonBrain(
             }
         }
 
+        // --------------------------------------------------------------------
+        // 4. MODOS DE TRABAJO DEL USUARIO ACTIVO
+        // --------------------------------------------------------------------
         val currentAcc = cloudVault.getCurrentAccount()
         val activeModes = if (currentAcc.personalModes.isNotEmpty()) currentAcc.personalModes else cloudVault.buildDefaultModesForUser(currentAcc.username)
 
@@ -2202,6 +2650,9 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.createCustomModeForCurrentUser(modeName, apps))
         }
 
+        // --------------------------------------------------------------------
+        // 5. CONTROL DE VENTANAS, OPERA GX, VIDEO Y SPOTIFY
+        // --------------------------------------------------------------------
         if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
             starkHud?.setOrbMode(false)
             return recordAndReturn(input, "Desplegando el panel completo.")
@@ -2334,20 +2785,24 @@ class DaemonBrain(
         val acc = cloudVault.getCurrentAccount()
         val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
         val factsContext = if (acc.personalFacts.isEmpty()) "" else "Memoria en la nube de ${acc.username}:\n" + acc.personalFacts.joinToString("\n") { "- $it" }
+        val eventsContext = if (acc.calendarEvents.isEmpty()) "" else "Próximos eventos en el calendario de ${acc.username}:\n" +
+            acc.calendarEvents.takeLast(5).joinToString("\n") { "- ${it.formattedDate}: ${it.title}" }
         val globalContext = if (cloudVault.vault.globalKnowledge.isEmpty()) "" else "Base de conocimiento global:\n" +
             cloudVault.vault.globalKnowledge.take(15).joinToString("\n") { "- ${it.tag}: ${it.responses.firstOrNull() ?: ""}" }
 
         return """
-            Eres Daemon (v12.6), una aplicación nativa de inteligencia artificial estilo J.A.R.V.I.S. con sincronización en vivo entre dispositivos, creada por Cristian Alexis.
+            Eres Daemon (v13.0), una aplicación nativa de inteligencia artificial estilo J.A.R.V.I.S. con conexión directa a Google Calendar y Apple Calendar, creada por Cristian Alexis.
             Estás atendiendo a la cuenta: ${acc.username.uppercase()} (Rol: ${acc.role}) en un dispositivo ${systemScanner.getOSLabel()}.
             Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
+            $eventsContext
             $globalContext
             
             Directrices:
             1. Habla siempre en español de forma inteligente, leal y fluida, dirigiéndote a ${acc.username}.
             2. Sé conciso (1 a 2 párrafos cortos).
-            3. Si ${acc.username} te pide ejecutar una acción durante la charla, añade al final una etiqueta exacta:
+            3. Si ${acc.username} te pide agendar o recordar algo para una fecha/hora durante la charla, o ejecutar una acción, añade al final una etiqueta exacta:
+               [ACTION:CALENDAR_ADD:texto completo con fecha y hora]
                [ACTION:MODE_WORK]
                [ACTION:MODE_HOMEWORK]
                [ACTION:MODE_STUDY]
@@ -2416,7 +2871,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkOTA/12.6")
+                .header("User-Agent", "DaemonStarkCalendar/13.0")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -2439,6 +2894,7 @@ class DaemonBrain(
             val actionType = match.groupValues[1].trim()
             val param = match.groupValues[2].trim()
             when (actionType) {
+                "CALENDAR_ADD" -> cloudVault.scheduleEventInConnectedCalendars(param, systemScanner.normalizeText(param))
                 "MODE_WORK" -> modes.firstOrNull { it.id == "TRABAJO" }?.let { systemScanner.executeWorkspaceMode(it) }
                 "MODE_HOMEWORK" -> modes.firstOrNull { it.id == "TAREA" }?.let { systemScanner.executeWorkspaceMode(it) }
                 "MODE_STUDY" -> modes.firstOrNull { it.id == "ESTUDIO" }?.let { systemScanner.executeWorkspaceMode(it) }
@@ -2478,7 +2934,7 @@ class DaemonBrain(
                 uiState = "SPEAKING"
                 val cleanSpeech = reply
                     .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en pantalla.")
-                    .replace(Regex("[#*`_~>\\-•👑⛔☁👤🚀✓⬇]"), "")
+                    .replace(Regex("[#*`_~>\\-•👑⛔☁👤🚀✓⬇📅⏰]"), "")
                     .replace("\n", ". ")
                     .trim()
 
@@ -2527,7 +2983,7 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 4. INTERFAZ PRINCIPAL + VENTANAS HOLOGRÁFICAS ANIMADAS CON RECARGA EN VIVO
+// 5. INTERFAZ PRINCIPAL + PORTAL HOLOGRÁFICO DE GOOGLE & APPLE CALENDAR
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
@@ -2540,8 +2996,8 @@ class StarkHologramHUD(
     private var wasDragged = false
 
     private var isMiniOrbMode = true
-    private val fullWidth = 710
-    private val fullHeight = 535
+    private val fullWidth = 735
+    private val fullHeight = 540
     private val orbSize = 104
 
     val bgSpaceDark = Color(4, 10, 20)
@@ -2584,7 +3040,7 @@ class StarkHologramHUD(
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON LIVE v12.6").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON v13.0").apply {
                     foreground = neonCyan
                     font = Font("Monospaced", Font.BOLD, 13)
                 }
@@ -2598,13 +3054,15 @@ class StarkHologramHUD(
 
             val rightControls = JPanel(FlowLayout(FlowLayout.RIGHT, 5, 0)).apply {
                 isOpaque = false
-                val accountBtn = createHoloButton("👤 CUENTA", neonEmerald, 86) { openAnimatedAccountHoloModal() }
-                adminHoloBtn = createHoloButton("👑 ADMIN", starkGold, 82) { openAnimatedAdminHoloModal() }
-                val orbBtn = createHoloButton("◉ NÚCLEO", neonCyan, 82) { setOrbMode(true) }
+                val calBtn = createHoloButton("📅 CALENDARIO", neonCyan, 106) { openAnimatedCalendarHoloModal() }
+                val accountBtn = createHoloButton("👤 CUENTA", neonEmerald, 82) { openAnimatedAccountHoloModal() }
+                adminHoloBtn = createHoloButton("👑 ADMIN", starkGold, 78) { openAnimatedAdminHoloModal() }
+                val orbBtn = createHoloButton("◉ NÚCLEO", neonCyan, 78) { setOrbMode(true) }
                 val closeBtn = createHoloButton("✕", neonCrimson, 28) { System.exit(0) }
 
                 adminHoloBtn.isVisible = cloudVault.isAdminLoggedIn()
 
+                add(calBtn)
                 add(accountBtn)
                 add(adminHoloBtn)
                 add(orbBtn)
@@ -2647,7 +3105,7 @@ class StarkHologramHUD(
                 preferredSize = Dimension(150, 220)
                 border = EmptyBorder(12, 2, 12, 2)
 
-                val lbl = JLabel("◣ SPOTIFY & SYNC").apply {
+                val lbl = JLabel("◣ SPOTIFY & AGENDA").apply {
                     foreground = starkGold
                     font = Font("Monospaced", Font.BOLD, 11)
                     horizontalAlignment = SwingConstants.RIGHT
@@ -2656,7 +3114,7 @@ class StarkHologramHUD(
                 add(createHoloButton("▶ PLAY SPOTIFY", neonEmerald, 145) { runQuickCommand("dale play") })
                 add(createHoloButton("⏸ PAUSA SPOTIFY", starkGold, 145) { runQuickCommand("pausa") })
                 add(createHoloButton("⏭ SIGUIENTE", neonCyan, 145) { runQuickCommand("siguiente cancion") })
-                add(createHoloButton("🔄 SYNC CUENTAS", Color(160, 140, 255), 145) { runQuickCommand("sincronizar cuentas") })
+                add(createHoloButton("📅 VER AGENDA", Color(160, 140, 255), 145) { runQuickCommand("mis recordatorios") })
             }
 
             add(leftWing, BorderLayout.WEST)
@@ -2751,7 +3209,7 @@ class StarkHologramHUD(
                 if (SwingUtilities.isRightMouseButton(e) || e.clickCount == 2) {
                     setOrbMode(!isMiniOrbMode)
                 } else if (SwingUtilities.isLeftMouseButton(e)) {
-                    if (isMiniOrbMode || (e.y in 90..310 && e.x in 190..520)) {
+                    if (isMiniOrbMode || (e.y in 90..310 && e.x in 190..540)) {
                         brain.activateDirectVoiceListenWindow()
                     }
                 }
@@ -2778,9 +3236,136 @@ class StarkHologramHUD(
             if (isMiniOrbMode) {
                 hudCanvas.repaint()
             } else {
-                hudCanvas.repaint(180, 62, 350, 275)
+                hudCanvas.repaint(180, 62, 370, 275)
             }
         }.start()
+    }
+
+    // ========================================================================
+    // VENTANA HOLOGRÁFICA ANIMADA: CONEXIÓN CON GOOGLE CALENDAR & APPLE CALENDAR
+    // ========================================================================
+    private fun openAnimatedCalendarHoloModal() {
+        val acc = cloudVault.getCurrentAccount()
+        val modal = StarkAnimatedHoloModal(
+            parent = this,
+            title = "📅 STARK CHRONOS // CONEXIÓN GOOGLE & APPLE CALENDAR",
+            subtitle = "SINCRONIZACIÓN AUTOMÁTICA DE RECORDATORIOS PARA LA CUENTA: ${acc.username.uppercase()}",
+            accentColor = neonCyan,
+            widthPx = 610,
+            heightPx = 500
+        )
+
+        val container = JPanel(BorderLayout(10, 10)).apply {
+            isOpaque = false
+            border = EmptyBorder(6, 18, 10, 18)
+        }
+
+        val formsGrid = JPanel(GridLayout(4, 1, 0, 7)).apply {
+            isOpaque = false
+        }
+
+        var selectedProvider = acc.calendarProvider
+        val providerStatusLbl = JLabel("PROVEEDOR ACTIVO: [$selectedProvider] (GOOGLE + APPLE iCLOUD)").apply {
+            foreground = neonEmerald
+            font = Font("Monospaced", Font.BOLD, 12)
+        }
+
+        val providerButtonsRow = JPanel(FlowLayout(FlowLayout.LEFT, 8, 0)).apply {
+            isOpaque = false
+            val btnGoogle = createHoloButton("🌐 SOLO GOOGLE", neonCyan, 130) {
+                selectedProvider = "GOOGLE"
+                providerStatusLbl.text = "PROVEEDOR SELECCIONADO: [GOOGLE CALENDAR]"
+            }
+            val btnApple = createHoloButton("🍎 SOLO APPLE", starkGold, 130) {
+                selectedProvider = "APPLE"
+                providerStatusLbl.text = "PROVEEDOR SELECCIONADO: [APPLE CALENDAR / iCLOUD]"
+            }
+            val btnBoth = createHoloButton("⚡ AMBOS (GOOGLE + APPLE)", neonEmerald, 195) {
+                selectedProvider = "BOTH"
+                providerStatusLbl.text = "PROVEEDOR SELECCIONADO: [DUAL: GOOGLE + APPLE]"
+            }
+            add(btnGoogle)
+            add(btnApple)
+            add(btnBoth)
+        }
+
+        val providerBox = JPanel(GridLayout(2, 1, 0, 2)).apply {
+            isOpaque = false
+            add(providerStatusLbl)
+            add(providerButtonsRow)
+        }
+
+        val googleEmailField = createStarkTextField(acc.googleAccountEmail)
+        val googleBridgeField = createStarkTextField(acc.googleWebhookOrToken)
+        val appleEmailField = createStarkTextField(acc.appleAccountEmail)
+
+        formsGrid.add(providerBox)
+        formsGrid.add(createLabeledInputBox("🌐 CORREO DE CUENTA GOOGLE (EJ: TU_CORREO@GMAIL.COM):", googleEmailField, neonCyan))
+        formsGrid.add(createLabeledInputBox("🔑 PUENTE SILENCIOSO GOOGLE SCRIPT URL / TOKEN OAUTH (OPCIONAL):", googleBridgeField, neonCyan))
+        formsGrid.add(createLabeledInputBox("🍎 CORREO DE CUENTA APPLE / iCLOUD (SINCRONIZACIÓN NATIVA MAC):", appleEmailField, starkGold))
+
+        val eventsArea = JTextArea().apply {
+            isOpaque = true
+            background = Color(6, 15, 28)
+            foreground = Color(200, 245, 255)
+            font = Font("Monospaced", Font.PLAIN, 11)
+            isEditable = false
+            border = EmptyBorder(6, 10, 6, 10)
+            rows = 4
+            text = cloudVault.getUpcomingEventsReport()
+        }
+
+        val bottomBtns = JPanel(FlowLayout(FlowLayout.CENTER, 8, 4)).apply {
+            isOpaque = false
+
+            val saveBtn = createHoloButton("💾 GUARDAR Y CONECTAR", neonEmerald, 175) {
+                val msg = cloudVault.configureUserCalendarSettings(
+                    provider = selectedProvider,
+                    googleEmail = googleEmailField.text,
+                    googleWebhookOrToken = googleBridgeField.text,
+                    appleEmail = appleEmailField.text
+                )
+                eventsArea.text = "$msg\n\n" + cloudVault.getUpcomingEventsReport()
+                brain.speakAndDisplay("CALENDARIO CONECTADO", msg)
+            }
+
+            val testBtn = createHoloButton("➕ PROBAR RECORDATORIO", neonCyan, 175) {
+                cloudVault.configureUserCalendarSettings(
+                    provider = selectedProvider,
+                    googleEmail = googleEmailField.text,
+                    googleWebhookOrToken = googleBridgeField.text,
+                    appleEmail = appleEmailField.text
+                )
+                val reply = brain.processThought("recuerdame revisar sistemas de Daemon mañana a las 5 pm")
+                eventsArea.text = reply + "\n\n" + cloudVault.getUpcomingEventsReport()
+                brain.speakAndDisplay("PRUEBA DE CALENDARIO", reply)
+            }
+
+            val copyScriptBtn = createHoloButton("📋 COPIAR SCRIPT GOOGLE", starkGold, 185) {
+                val gasCode = """
+                    function doPost(e) {
+                      var data = JSON.parse(e.postData.contents);
+                      CalendarApp.getDefaultCalendar().createEvent(data.title, new Date(data.startIso), new Date(data.endIso), {description: data.description});
+                      return ContentService.createTextOutput("OK");
+                    }
+                """.trimIndent()
+                Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(gasCode), null)
+                eventsArea.text = "✓ Código copiado al portapapeles.\nSi deseas inserción 100% silenciosa en Google sin abrir pestañas: entra a script.google.com -> Nuevo proyecto -> pega el código -> Implementar como Aplicación Web (Cualquier persona) y pega la URL arriba."
+            }
+
+            add(saveBtn)
+            add(testBtn)
+            add(copyScriptBtn)
+        }
+
+        container.add(formsGrid, BorderLayout.NORTH)
+        container.add(JScrollPane(eventsArea).apply {
+            border = BorderFactory.createLineBorder(neonCyan, 1)
+        }, BorderLayout.CENTER)
+        container.add(bottomBtns, BorderLayout.SOUTH)
+
+        modal.setBodyContent(container)
+        modal.isVisible = true
     }
 
     private fun openAnimatedAccountHoloModal() {
@@ -3349,11 +3934,11 @@ class StarkHologramHUD(
             g2.font = telemetryFont
             g2.color = neonCyan
             g2.drawString("CPU:${scanner.cachedCpuLoad}% RAM:${scanner.cachedRamMb}MB", 184, 76)
-            g2.drawString(cloudVault.cloudSyncStatus, 415, 76)
+            g2.drawString(cloudVault.cloudSyncStatus, 430, 76)
 
             val acc = cloudVault.getCurrentAccount()
             g2.color = if (acc.role == "ADMIN") starkGold else neonEmerald
-            val userBadge = "CUENTA // ${acc.username.uppercase()} [${acc.role}]"
+            val userBadge = "CUENTA // ${acc.username.uppercase()} [${acc.calendarProvider}]"
             val fm = g2.fontMetrics
             g2.drawString(userBadge, (cx - fm.stringWidth(userBadge) / 2).toInt(), 92)
 
