@@ -24,8 +24,6 @@ import java.time.Duration
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Base64
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
 import javax.swing.*
 import javax.swing.border.EmptyBorder
 import javax.swing.plaf.basic.BasicScrollBarUI
@@ -33,10 +31,12 @@ import kotlin.concurrent.thread
 import kotlin.math.*
 import kotlin.random.Random
 
+// ============================================================================
+// ESTRUCTURAS DE DATOS FUERTEMENTE TIPADAS (CERO GENERICS ANIDADOS)
+// ============================================================================
 data class ChatRequest(
     val prompt: String = "",
-    val sessionId: String = "default-session",
-    val accessPin: String = "",
+    val audio: String? = null,
     val fromBrowser: Boolean = true
 )
 
@@ -47,19 +47,47 @@ data class IntentNode(
     val action: String = "NONE"
 )
 
-data class ConversationTurn(
-    val role: String,
-    val content: String
+data class ChatMessage(
+    val role: String = "",
+    val content: String = ""
 )
 
-data class RemoteCommand(
-    val id: Long = System.currentTimeMillis(),
-    val type: String,
-    val payload: String = ""
+data class OllamaOptions(
+    val temperature: Double = 0.7,
+    val num_predict: Int = 280
+)
+
+data class OllamaPayload(
+    val model: String = "",
+    val messages: List<ChatMessage> = emptyList(),
+    val stream: Boolean = false,
+    val options: OllamaOptions = OllamaOptions()
+)
+
+data class CloudChatPayload(
+    val messages: List<ChatMessage> = emptyList(),
+    val model: String = "openai",
+    val seed: Int = 42,
+    val jsonMode: Boolean = false
+)
+
+data class StemSample(
+    val stems: List<String>,
+    val targetIdx: Int
+)
+
+data class SparseSample(
+    val activeInputs: IntArray,
+    val targetIdx: Int
+)
+
+data class PredictionResult(
+    val node: IntentNode?,
+    val confidence: Double
 )
 
 // ============================================================================
-// 1. RED NEURONAL MULTICAPA LOCAL (MLP EN KOTLIN PURO)
+// 1. RED NEURONAL MULTICAPA DE RESPALDO (MLP EN KOTLIN PURO)
 // ============================================================================
 class SynapticNeuralNetwork {
     private var vocabulary = listOf<String>()
@@ -89,16 +117,16 @@ class SynapticNeuralNetwork {
 
     fun train(dataset: List<IntentNode>) {
         intents = dataset
-        val vocabSet = linkedSetOf<String>()
-        val trainingSamples = mutableListOf<Pair<IntArray, Int>>()
+        val vocabSet = linkedSetOf("").apply { clear() }
+        val trainingSamples = mutableListOf(SparseSample(IntArray(0), 0)).apply { clear() }
+        val tempSamples = mutableListOf(StemSample(emptyList(), 0)).apply { clear() }
 
-        val tempSamples = mutableListOf<Pair<List<String>, Int>>()
         intents.forEachIndexed { intentIdx, node ->
             node.patterns.forEach { pattern ->
                 val stems = normalizeAndStem(pattern)
                 if (stems.isNotEmpty()) {
                     vocabSet.addAll(stems)
-                    tempSamples.add(stems to intentIdx)
+                    tempSamples.add(StemSample(stems, intentIdx))
                 }
             }
         }
@@ -109,10 +137,10 @@ class SynapticNeuralNetwork {
         val outputSize = intents.size
         if (inputSize == 0 || outputSize == 0) return
 
-        for ((stems, targetIdx) in tempSamples) {
-            val activeIndices = stems.mapNotNull { vocabIndexMap[it] }.distinct().toIntArray()
+        for (sample in tempSamples) {
+            val activeIndices = sample.stems.mapNotNull { vocabIndexMap[it] }.distinct().toIntArray()
             if (activeIndices.isNotEmpty()) {
-                trainingSamples.add(activeIndices to targetIdx)
+                trainingSamples.add(SparseSample(activeIndices, sample.targetIdx))
             }
         }
 
@@ -132,7 +160,9 @@ class SynapticNeuralNetwork {
 
         for (epoch in 0 until epochs) {
             for (sampleIdx in trainingSamples.indices) {
-                val (activeInputs, target) = trainingSamples[sampleIdx]
+                val sample = trainingSamples[sampleIdx]
+                val activeInputs = sample.activeInputs
+                val target = sample.targetIdx
 
                 for (j in 0 until hiddenSize) {
                     var sum = b1[j]
@@ -187,13 +217,13 @@ class SynapticNeuralNetwork {
         }
     }
 
-    fun predict(rawInput: String): Pair<IntentNode?, Double> {
-        if (vocabulary.isEmpty() || intents.isEmpty()) return null to 0.0
+    fun predict(rawInput: String): PredictionResult {
+        if (vocabulary.isEmpty() || intents.isEmpty()) return PredictionResult(null, 0.0)
         val stems = normalizeAndStem(rawInput)
-        if (stems.isEmpty()) return null to 0.0
+        if (stems.isEmpty()) return PredictionResult(null, 0.0)
 
         val activeInputs = vocabulary.indices.filter { vocabulary[it] in stems }
-        if (activeInputs.isEmpty()) return null to 0.0
+        if (activeInputs.isEmpty()) return PredictionResult(null, 0.0)
 
         val hidden = DoubleArray(hiddenSize)
         for (j in 0 until hiddenSize) {
@@ -227,14 +257,14 @@ class SynapticNeuralNetwork {
                 bestIdx = k
             }
         }
-        return intents[bestIdx] to bestProb
+        return PredictionResult(intents[bestIdx], bestProb)
     }
 
     fun getPatternCount(): Int = intents.sumOf { it.patterns.size }
 }
 
 // ============================================================================
-// 2. ESCÁNER DEL SISTEMA + CONTROL GARANTIZADO DE SPOTIFY (BASE64 + TRIPLE VÍA)
+// 2. ESCÁNER DEL SISTEMA, AUTO-INSTALADOR NATIVO Y CONTROL DE SPOTIFY
 // ============================================================================
 @Service
 class SystemScanner {
@@ -244,13 +274,10 @@ class SystemScanner {
     val isMac = osName.contains("mac")
     val isLinux = osName.contains("nix") || osName.contains("nux") || osName.contains("aix")
 
-    private val installedApps = mutableMapOf<String, String>()
+    private val installedApps = mutableMapOf("init" to "init").apply { clear() }
     private val playlistsFile = File("daemon_playlists.json")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
-    private val savedPlaylists = mutableMapOf<String, String>()
-
-    // Cola de órdenes para sincronizar la Nube con tu PC local
-    val pendingRemoteCommands = ConcurrentLinkedQueue<RemoteCommand>()
+    private val savedPlaylists = mutableMapOf("init" to "init").apply { clear() }
 
     private val httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(4))
@@ -260,17 +287,17 @@ class SystemScanner {
     init {
         scanInstalledApplications()
         loadPlaylists()
-        startCloudSyncAgent()
+        ensureDesktopAndStartupApp()
     }
 
     fun getOSLabel(): String = when {
         isWindows -> "WIN64 // ${System.getProperty("os.name").uppercase()}"
         isMac -> "MACOS // DARWIN"
-        isLinux -> "CLOUD // LINUX KERNEL"
+        isLinux -> "LINUX // KERNEL"
         else -> System.getProperty("os.name")
     }
 
-    // Ejecutor blindado en Base64 (UTF-16LE): Evita que Windows borre comillas o rompa el script
+    // Ejecutor blindado en Base64 UTF-16LE: Nunca rompe comillas ni falla en PowerShell
     fun runPowerShell(script: String, wait: Boolean = false): String {
         if (!isWindows) return ""
         return try {
@@ -287,38 +314,62 @@ class SystemScanner {
                 ""
             }
         } catch (e: Exception) {
-            println("[DAEMON PS ERROR] ${e.message}")
             ""
         }
     }
 
-    // Si tu PC está conectada a una instancia de Daemon en la nube, descarga y ejecuta las órdenes de Spotify/Apps
-    private fun startCloudSyncAgent() {
-        val remoteCloudUrl = System.getenv("DAEMON_CLOUD_URL") ?: return
-        if (!isWindows || remoteCloudUrl.isBlank()) return
-        thread(isDaemon = true, name = "Daemon-Cloud-Bridge") {
-            while (true) {
-                try {
-                    val req = HttpRequest.newBuilder()
-                        .uri(URI.create("${remoteCloudUrl.trimEnd('/')}/api/daemon/poll-commands"))
-                        .timeout(Duration.ofSeconds(5))
-                        .GET().build()
-                    val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-                    if (res.statusCode() == 200 && res.body().startsWith("[")) {
-                        val cmds = objectMapper.readValue(res.body(), Array<RemoteCommand>::class.java)
-                        cmds.forEach { cmd ->
-                            when (cmd.type) {
-                                "MEDIA_KEY" -> sendMediaKey(cmd.payload)
-                                "PLAY_SONG" -> playSongInSpotify(cmd.payload)
-                                "PLAY_PLAYLIST" -> playPlaylist(cmd.payload, normalizeText(cmd.payload))
-                                "OPEN_APP" -> openAppByName(normalizeText(cmd.payload))
-                                "CLOSE_APP" -> closeAppByName(normalizeText(cmd.payload))
-                            }
-                        }
-                    }
-                } catch (e: Exception) {}
-                Thread.sleep(1500)
-            }
+    // Configura automáticamente a Daemon como aplicación nativa en Escritorio y Arranque de Windows
+    fun ensureDesktopAndStartupApp(): String {
+        if (!isWindows) return "Instalación de arranque disponible en Windows."
+        return try {
+            val workingDir = File(System.getProperty("user.dir")).absolutePath
+            val libsDir = File(workingDir, "build\\libs")
+            val jarFile = libsDir.listFiles()?.firstOrNull { it.name.endsWith(".jar") && !it.name.contains("plain") }
+                ?: File(workingDir, "daemon.jar")
+
+            if (!jarFile.exists()) return "Ejecuta bootJar para generar el binario."
+
+            val launcherVbs = File(workingDir, "DaemonApp.vbs")
+            val vbsContent = """
+                Set fso = CreateObject("Scripting.FileSystemObject")
+                Set shell = CreateObject("WScript.Shell")
+                shell.CurrentDirectory = "$workingDir"
+                javawPath = "javaw.exe"
+                If fso.FolderExists("C:\Program Files\Microsoft") Then
+                    For Each folder In fso.GetFolder("C:\Program Files\Microsoft").SubFolders
+                        If InStr(LCase(folder.Name), "jdk") > 0 Then
+                            javawPath = Chr(34) & folder.Path & "\bin\javaw.exe" & Chr(34)
+                        End If
+                    Next
+                End If
+                shell.Run javawPath & " -jar " & Chr(34) & "${jarFile.absolutePath}" & Chr(34), 0, False
+            """.trimIndent()
+            launcherVbs.writeText(vbsContent, StandardCharsets.ISO_8859_1)
+
+            // Crear accesos directos en el Escritorio y en Inicio Automático de Windows (shell:startup)
+            val psShortcut = """
+                ${'$'}wsh = New-Object -ComObject WScript.Shell
+                ${'$'}desktop = [Environment]::GetFolderPath('Desktop')
+                ${'$'}startup = [Environment]::GetFolderPath('Startup')
+                
+                ${'$'}s1 = ${'$'}wsh.CreateShortcut("${'$'}desktop\Daemon AI.lnk")
+                ${'$'}s1.TargetPath = "wscript.exe"
+                ${'$'}s1.Arguments = '"${launcherVbs.absolutePath}"'
+                ${'$'}s1.WorkingDirectory = "$workingDir"
+                ${'$'}s1.IconLocation = "shell32.dll,13"
+                ${'$'}s1.Save()
+
+                ${'$'}s2 = ${'$'}wsh.CreateShortcut("${'$'}startup\Daemon AI.lnk")
+                ${'$'}s2.TargetPath = "wscript.exe"
+                ${'$'}s2.Arguments = '"${launcherVbs.absolutePath}"'
+                ${'$'}s2.WorkingDirectory = "$workingDir"
+                ${'$'}s2.IconLocation = "shell32.dll,13"
+                ${'$'}s2.Save()
+            """.trimIndent()
+            runPowerShell(psShortcut, wait = false)
+            "Daemon registrado como aplicación en tu Escritorio y en el Inicio Automático de Windows, Cristian."
+        } catch (e: Exception) {
+            "Info auto-instalador: ${e.message}"
         }
     }
 
@@ -360,11 +411,9 @@ class SystemScanner {
         return "Playlist '$cleanName' vinculada exitosamente a $uri, Cristian."
     }
 
-    // Control Multimedia Triple Vía: 1) WM_APPCOMMAND a todas las ventanas de Spotify + 2) Hardware Key + 3) WScript.Shell
+    // Control Multimedia Triple Vía para Spotify (WM_APPCOMMAND + Hardware Key + WScript.Shell)
     fun sendMediaKey(action: String) {
-        pendingRemoteCommands.add(RemoteCommand(type = "MEDIA_KEY", payload = action))
         if (!isWindows) return
-
         thread {
             try {
                 val vkCode = when (action) {
@@ -397,8 +446,6 @@ class SystemScanner {
                     using System.Runtime.InteropServices;
                     public class DaemonMediaBridge {
                         [DllImport("user32.dll")]
-                        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
-                        [DllImport("user32.dll")]
                         public static extern IntPtr PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
                     }
 "@
@@ -411,9 +458,7 @@ class SystemScanner {
                 """.trimIndent()
 
                 runPowerShell(psScript, wait = false)
-            } catch (e: Exception) {
-                println("[DAEMON MEDIA KEY ERROR] ${e.message}")
-            }
+            } catch (e: Exception) {}
         }
     }
 
@@ -424,7 +469,7 @@ class SystemScanner {
     }
 
     fun getOpenWindowsReport(): String {
-        if (!isWindows) return "Ejecutando en nodo Cloud. Las ventanas locales se consultan desde el agente de escritorio."
+        if (!isWindows) return "Escaneo de ventanas disponible en Windows."
         val script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -ExpandProperty MainWindowTitle"
         val out = runPowerShell(script, wait = true)
         val titles = out.lines().map { it.trim() }.filter { it.isNotBlank() }
@@ -433,7 +478,7 @@ class SystemScanner {
     }
 
     fun getCurrentlyPlayingSpotify(): String {
-        if (!isWindows) return "Nodo en modo Cloud activo."
+        if (!isWindows) return "Lectura de Spotify disponible en Windows."
         val script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -ExpandProperty MainWindowTitle"
         val title = runPowerShell(script, wait = true)
         return when {
@@ -447,11 +492,7 @@ class SystemScanner {
     fun scanInstalledApplications(): Int {
         installedApps.clear()
         try {
-            when {
-                isWindows -> scanWindowsApps()
-                isMac -> scanMacApps()
-                isLinux -> scanLinuxApps()
-            }
+            if (isWindows) scanWindowsApps()
         } catch (e: Exception) {}
         return installedApps.size
     }
@@ -491,34 +532,7 @@ class SystemScanner {
         }
     }
 
-    private fun scanMacApps() {
-        val home = System.getProperty("user.home") ?: ""
-        listOf(File("/Applications"), File("/System/Applications"), File("$home/Applications"))
-            .filter { it.exists() }.forEach { dir ->
-                dir.listFiles()?.filter { it.name.endsWith(".app") }?.forEach { file ->
-                    installedApps[normalizeText(file.name.removeSuffix(".app"))] = file.name.removeSuffix(".app")
-                }
-            }
-    }
-
-    private fun scanLinuxApps() {
-        val home = System.getProperty("user.home") ?: ""
-        listOf(File("/usr/share/applications"), File("$home/.local/share/applications"))
-            .filter { it.exists() }.forEach { dir ->
-                dir.listFiles()?.filter { it.name.endsWith(".desktop") }?.forEach { file ->
-                    var name: String? = null
-                    var exec: String? = null
-                    file.readLines().forEach { line ->
-                        if (line.startsWith("Name=") && name == null) name = line.removePrefix("Name=").trim()
-                        if (line.startsWith("Exec=") && exec == null) exec = line.removePrefix("Exec=").replace(Regex("%[a-zA-Z]"), "").trim()
-                    }
-                    if (name != null && exec != null) installedApps[normalizeText(name!!)] = exec!!
-                }
-            }
-    }
-
     fun playPlaylist(rawCommand: String, normalized: String): String {
-        pendingRemoteCommands.add(RemoteCommand(type = "PLAY_PLAYLIST", payload = normalized))
         val playlistQuery = normalized
             .replace(Regex("""^.*?(?:playlist|lista\s+de\s+reproduccion|lista|mis\s+canciones\s+de|musica\s+para)\s*(?:de\s+|llamada\s+|para\s+)?"""), "")
             .replace("en spotify", "")
@@ -529,18 +543,16 @@ class SystemScanner {
             playlistQuery.contains(it.key) || it.key.contains(playlistQuery)
         }
 
-        if (isWindows) {
-            thread {
-                try {
-                    val targetUri = savedMatch?.value ?: findSpotifyUri("playlist", playlistQuery)
-                    if (targetUri != null) {
-                        launchSpotifyUriAndPlay(targetUri, isSearch = false)
-                    } else {
-                        val encoded = URLEncoder.encode(playlistQuery, StandardCharsets.UTF_8).replace("+", "%20")
-                        launchSpotifyUriAndPlay("spotify:search:$encoded", isSearch = true)
-                    }
-                } catch (e: Exception) {}
-            }
+        thread {
+            try {
+                val targetUri = savedMatch?.value ?: findSpotifyUri("playlist", playlistQuery)
+                if (targetUri != null) {
+                    launchSpotifyUriAndPlay(targetUri, isSearch = false)
+                } else {
+                    val encoded = URLEncoder.encode(playlistQuery, StandardCharsets.UTF_8).replace("+", "%20")
+                    launchSpotifyUriAndPlay("spotify:search:$encoded", isSearch = true)
+                }
+            } catch (e: Exception) {}
         }
 
         return if (savedMatch != null) {
@@ -557,23 +569,16 @@ class SystemScanner {
             return "Reanudando reproducción en Spotify, Cristian."
         }
 
-        pendingRemoteCommands.add(RemoteCommand(type = "PLAY_SONG", payload = cleanSong))
-        if (isWindows) {
-            thread {
-                try {
-                    val trackUri = findSpotifyUri("track", cleanSong)
-                    if (trackUri != null) {
-                        println("[DAEMON SPOTIFY] Pista exacta localizada: $trackUri")
-                        launchSpotifyUriAndPlay(trackUri, isSearch = false)
-                    } else {
-                        val encoded = URLEncoder.encode(cleanSong, StandardCharsets.UTF_8).replace("+", "%20")
-                        println("[DAEMON SPOTIFY] Ejecutando búsqueda directa: spotify:search:$encoded")
-                        launchSpotifyUriAndPlay("spotify:search:$encoded", isSearch = true)
-                    }
-                } catch (e: Exception) {
-                    println("[DAEMON SPOTIFY ERROR] ${e.message}")
+        thread {
+            try {
+                val trackUri = findSpotifyUri("track", cleanSong)
+                if (trackUri != null) {
+                    launchSpotifyUriAndPlay(trackUri, isSearch = false)
+                } else {
+                    val encoded = URLEncoder.encode(cleanSong, StandardCharsets.UTF_8).replace("+", "%20")
+                    launchSpotifyUriAndPlay("spotify:search:$encoded", isSearch = true)
                 }
-            }
+            } catch (e: Exception) {}
         }
         return "Reproduciendo '$cleanSong' en Spotify, Cristian."
     }
@@ -628,31 +633,21 @@ class SystemScanner {
     }
 
     fun openAppByName(normalizedCommand: String): String {
-        pendingRemoteCommands.add(RemoteCommand(type = "OPEN_APP", payload = normalizedCommand))
         val requestedApp = normalizedCommand
             .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
             .trim()
-
-        if (!isWindows && !isMac) {
-            return "Orden enviada al puente de escritorio para iniciar '${requestedApp.uppercase()}', Cristian."
-        }
 
         val entry = installedApps.entries.firstOrNull { it.key == requestedApp }
             ?: installedApps.entries.firstOrNull { it.key.contains(requestedApp) || requestedApp.contains(it.key) }
 
         if (entry != null) {
-            when {
-                isWindows -> ProcessBuilder("cmd", "/c", "start", "", entry.value).start()
-                isMac -> ProcessBuilder("open", "-a", entry.value).start()
-                isLinux -> ProcessBuilder("sh", "-c", "${entry.value} &").start()
-            }
+            if (isWindows) ProcessBuilder("cmd", "/c", "start", "", entry.value).start()
             return "Iniciando ${entry.key.uppercase()} en tu sistema, Cristian."
         }
         return "No encontré una aplicación llamada '$requestedApp' en el catálogo de tu PC."
     }
 
     fun closeAppByName(normalizedCommand: String): String {
-        pendingRemoteCommands.add(RemoteCommand(type = "CLOSE_APP", payload = normalizedCommand))
         val appName = normalizedCommand
             .replace(Regex("""^.*?(?:cierra|cerrar|termina|mata)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|el\s+|la\s+)?"""), "")
             .trim()
@@ -680,7 +675,7 @@ class SystemScanner {
 }
 
 // ============================================================================
-// 3. CEREBRO EN LA NUBE (MULTI-USUARIO + CÓRTEX CONVERSACIONAL SIN LOCALHOST)
+// 3. CEREBRO HÍBRIDO DE ESCRITORIO (REFLEJOS 1MS + CÓRTEX CONVERSACIONAL)
 // ============================================================================
 @Service
 class DaemonBrain(
@@ -690,14 +685,17 @@ class DaemonBrain(
     private val factsFile = File("daemon_facts.txt")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
     private val neuralNet = SynapticNeuralNetwork()
-    private val intents = mutableListOf<IntentNode>()
+    private val intents = mutableListOf(IntentNode()).apply { clear() }
 
-    // Memoria de conversación separada por cada usuario que entre al link
-    private val userSessions = ConcurrentHashMap<String, MutableList<ConversationTurn>>()
-    private val userFacts = mutableListOf<String>()
+    private val conversationHistory = mutableListOf(ChatMessage("", "")).apply { clear() }
+    private val userFacts = mutableListOf("").apply { clear() }
+
+    private val ollamaUrl = "http://localhost:11434/api/chat"
+    private var ollamaModel = "qwen2.5:1.5b"
+    @Volatile var isOllamaOnline: Boolean = false
 
     private val httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(8))
+        .connectTimeout(Duration.ofSeconds(6))
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build()
 
@@ -708,16 +706,17 @@ class DaemonBrain(
     init {
         loadUserFacts()
         loadAndUpgradeNeuralDatabase()
+        checkOllamaStatus()
         launchNativeDesktopMiniWindow()
         speakAndDisplay(
             "INICIALIZACIÓN",
-            "Daemon Cloud v6.0 en línea, Cristian. Córtex conversacional en la nube activo y control de Spotify reparado."
+            "Aplicación nativa Daemon activa, Cristian. Control de Spotify reparado y córtex conversacional en línea."
         )
     }
 
     private fun loadUserFacts() {
         if (!factsFile.exists()) {
-            userFacts.add("El creador de Daemon es Cristian Alexis, estudiante de Ingeniería en Sistemas Computacionales en la ESCOM del IPN.")
+            userFacts.add("El creador y usuario principal de Daemon es Cristian Alexis, estudiante de Ingeniería en Sistemas Computacionales en la ESCOM del IPN.")
             factsFile.writeText(userFacts.joinToString("\n") + "\n")
         } else {
             userFacts.addAll(factsFile.readLines().filter { it.isNotBlank() })
@@ -729,9 +728,34 @@ class DaemonBrain(
         factsFile.appendText("$fact\n")
     }
 
+    private fun checkOllamaStatus(): Boolean {
+        return try {
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create("http://localhost:11434/api/tags"))
+                .timeout(Duration.ofSeconds(2))
+                .GET().build()
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() == 200) {
+                val root = objectMapper.readTree(res.body()).path("models")
+                if (root.isArray && root.size() > 0) {
+                    val installedModels = root.map { it.path("name").asText() }
+                    ollamaModel = installedModels.firstOrNull { it.contains("qwen") || it.contains("llama") }
+                        ?: installedModels.first()
+                    isOllamaOnline = true
+                    return true
+                }
+            }
+            isOllamaOnline = false
+            false
+        } catch (e: Exception) {
+            isOllamaOnline = false
+            false
+        }
+    }
+
     private fun loadAndUpgradeNeuralDatabase() {
         val masterKnowledge = buildComprehensiveKnowledgeBase()
-        val existingMap = linkedMapOf<String, IntentNode>()
+        val existingMap = linkedMapOf("init" to IntentNode()).apply { clear() }
 
         if (brainFile.exists()) {
             try {
@@ -756,20 +780,19 @@ class DaemonBrain(
         neuralNet.train(intents)
     }
 
-    fun getNodeCount(): Int = intents.size
-    fun getPatternCount(): Int = neuralNet.getPatternCount()
-
-    // ========================================================================
-    // PROCESADOR PRINCIPAL (REFLEJOS DE SPOTIFY/PC + CONVERSACIÓN EN LA NUBE)
-    // ========================================================================
-    fun processThought(rawInput: String, sessionId: String = "local-admin"): String {
+    fun processThought(rawInput: String): String {
         val input = rawInput.trim()
         if (input.isBlank()) return "Sin señal de entrada."
         uiState = "THINKING"
 
         val normalized = systemScanner.normalizeText(input)
 
-        // 1. SIGUIENTE CANCIÓN (Respuesta en 1ms)
+        // 0. COMANDO PARA INSTALAR COMO APLICACIÓN PREDETERMINADA EN EL INICIO DE WINDOWS
+        if (normalized.contains("instalar aplicacion") || normalized.contains("inicio automatico") || normalized.contains("crear acceso directo")) {
+            return recordAndReturn(input, systemScanner.ensureDesktopAndStartupApp())
+        }
+
+        // 1. SIGUIENTE CANCIÓN
         val isNextTrack = normalized in setOf("siguiente", "cambiale", "otra", "otra cancion", "siguiente cancion", "siguiente pista", "siguiente rola", "salta la cancion") ||
             normalized.contains("siguiente cancion") || normalized.contains("cambia de cancion") ||
             normalized.contains("cambia la cancion") || normalized.contains("cambiale a la cancion") ||
@@ -778,7 +801,7 @@ class DaemonBrain(
         if (isNextTrack) {
             lastConfidence = 100
             systemScanner.sendMediaKey("NEXT")
-            return recordAndReturn(sessionId, input, "Pasando a la siguiente canción en Spotify, Cristian.")
+            return recordAndReturn(input, "Pasando a la siguiente canción en Spotify, Cristian.")
         }
 
         // 2. CANCIÓN ANTERIOR
@@ -789,7 +812,7 @@ class DaemonBrain(
         if (isPrevTrack) {
             lastConfidence = 100
             systemScanner.sendMediaKey("PREV")
-            return recordAndReturn(sessionId, input, "Regresando a la canción anterior en Spotify, Cristian.")
+            return recordAndReturn(input, "Regresando a la canción anterior en Spotify, Cristian.")
         }
 
         // 3. PLAY / PAUSA DIRECTO
@@ -803,35 +826,35 @@ class DaemonBrain(
         if (isPlayPause) {
             lastConfidence = 100
             systemScanner.sendMediaKey("PLAY_PAUSE")
-            return recordAndReturn(sessionId, input, "Comando Play/Pausa ejecutado en Spotify, Cristian.")
+            return recordAndReturn(input, "Comando Play/Pausa ejecutado en Spotify, Cristian.")
         }
 
         // 4. VOLUMEN
         if (normalized.contains("sube el volumen") || normalized.contains("subele al volumen") || normalized.contains("subele a la musica") || normalized == "subele" || normalized.contains("mas volumen")) {
             lastConfidence = 100
             systemScanner.sendMediaKey("VOL_UP")
-            return recordAndReturn(sessionId, input, "Subiendo el volumen del sistema, Cristian.")
+            return recordAndReturn(input, "Subiendo el volumen del sistema, Cristian.")
         }
         if (normalized.contains("baja el volumen") || normalized.contains("bajale al volumen") || normalized.contains("bajale a la musica") || normalized == "bajale" || normalized.contains("menos volumen")) {
             lastConfidence = 100
             systemScanner.sendMediaKey("VOL_DOWN")
-            return recordAndReturn(sessionId, input, "Bajando el volumen del sistema, Cristian.")
+            return recordAndReturn(input, "Bajando el volumen del sistema, Cristian.")
         }
         if (normalized.contains("silencia") || normalized.contains("pon mute") || normalized == "mute" || normalized.contains("quita el sonido")) {
             lastConfidence = 100
             systemScanner.sendMediaKey("MUTE")
-            return recordAndReturn(sessionId, input, "Audio del sistema alternado, Cristian.")
+            return recordAndReturn(input, "Audio del sistema alternado, Cristian.")
         }
 
         // 5. PLAYLISTS EN SPOTIFY
         if (normalized.startsWith("vincula playlist ") || normalized.startsWith("guarda playlist ")) {
             val name = input.substringAfter("playlist ").substringBefore(" con ").trim()
             val link = input.substringAfter(" con ").trim()
-            return recordAndReturn(sessionId, input, systemScanner.registerPlaylist(name, link))
+            return recordAndReturn(input, systemScanner.registerPlaylist(name, link))
         }
         if (normalized.contains("playlist") || normalized.contains("lista de reproduccion") || normalized.contains("mis me gusta")) {
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, systemScanner.playPlaylist(input, normalized))
+            return recordAndReturn(input, systemScanner.playPlaylist(input, normalized))
         }
 
         // 6. REPRODUCIR CANCIÓN ESPECÍFICA EN SPOTIFY
@@ -840,32 +863,32 @@ class DaemonBrain(
         if (songMatch != null) {
             val song = songMatch.groupValues[1].replace("en spotify", "").trim()
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, systemScanner.playSongInSpotify(song))
+            return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
         if (normalized.endsWith(" en spotify") && (normalized.startsWith("pon ") || normalized.startsWith("escuchar "))) {
             val song = normalized.removePrefix("pon ").removePrefix("escuchar ").removeSuffix(" en spotify").trim()
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, systemScanner.playSongInSpotify(song))
+            return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
 
         // 7. CONSULTAR QUÉ SUENA O QUÉ VENTANAS HAY ABIERTAS
         if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando") || normalized.contains("como se llama esta cancion")) {
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, systemScanner.getCurrentlyPlayingSpotify())
+            return recordAndReturn(input, systemScanner.getCurrentlyPlayingSpotify())
         }
         if (normalized.contains("que ventanas estan abiertas") || normalized.contains("que programas estan corriendo") || normalized.contains("que aplicaciones tengo abiertas")) {
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, systemScanner.getOpenWindowsReport())
+            return recordAndReturn(input, systemScanner.getOpenWindowsReport())
         }
 
         // 8. ABRIR O CERRAR APLICACIONES
         if (normalized.matches(Regex("""^(?:daemon\s+)?(?:abre|abrir|inicia|ejecuta|lanza)\s+.+$"""))) {
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, systemScanner.openAppByName(normalized))
+            return recordAndReturn(input, systemScanner.openAppByName(normalized))
         }
         if (normalized.matches(Regex("""^(?:daemon\s+)?(?:cierra|cerrar|termina|mata)\s+.+$"""))) {
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, systemScanner.closeAppByName(normalized))
+            return recordAndReturn(input, systemScanner.closeAppByName(normalized))
         }
 
         // 9. MEMORIZAR DATOS PERMANENTES
@@ -873,24 +896,33 @@ class DaemonBrain(
             val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
             saveUserFact(fact)
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, "Guardado en mi memoria en la nube, Cristian: '$fact'.")
+            return recordAndReturn(input, "Guardado en mi memoria permanente, Cristian: '$fact'.")
         }
 
         // 10. CALCULADORA MATEMÁTICA
         evaluateMathExpression(normalized)?.let { mathResult ->
             lastConfidence = 100
-            return recordAndReturn(sessionId, input, mathResult)
+            return recordAndReturn(input, mathResult)
         }
 
-        // 11. CÓRTEX CONVERSACIONAL EN LA NUBE (Sin depender de localhost:11434)
-        val cloudReply = generateCloudConversationalResponse(input, sessionId)
-        if (cloudReply != null) {
-            lastConfidence = 99
-            return recordAndReturn(sessionId, input, cloudReply)
+        // 11. CÓRTEX CONVERSACIONAL (Primero intenta Ollama local; si no está activo, usa Córtex Cloud)
+        if (!isOllamaOnline) checkOllamaStatus()
+        if (isOllamaOnline) {
+            generateOllamaConversationalResponse(input)?.let { reply ->
+                lastConfidence = 99
+                return recordAndReturn(input, reply)
+            }
         }
 
-        // 12. RESPALDO CON TU RED NEURONAL LOCAL (Por si algún día no hay internet)
-        val (matchedIntent, confidence) = neuralNet.predict(input)
+        generateCloudConversationalResponse(input)?.let { reply ->
+            lastConfidence = 98
+            return recordAndReturn(input, reply)
+        }
+
+        // 12. RESPALDO OFFLINE CON RED NEURONAL MLP LOCAL
+        val prediction = neuralNet.predict(input)
+        val matchedIntent = prediction.node
+        val confidence = prediction.confidence
         lastConfidence = (confidence * 100).toInt().coerceIn(0, 100)
 
         if (matchedIntent != null && confidence >= 0.32) {
@@ -900,68 +932,92 @@ class DaemonBrain(
                 "MEDIA_PREV" -> { systemScanner.sendMediaKey("PREV"); matchedIntent.responses.first() }
                 "CHECK_TIME" -> {
                     val now = LocalDateTime.now()
-                    "Son las ${now.format(DateTimeFormatter.ofPattern("HH:mm:ss"))} del ${now.format(DateTimeFormatter.ofPattern("dd/MM/yyyy"))}."
+                    "Son las ${now.format(DateTimeFormatter.ofPattern("HH:mm:ss"))} del ${now.format(DateTimeFormatter.ofPattern("dd/MM/yyyy"))}, Cristian."
                 }
                 "CHECK_WEATHER" -> fetchLiveWeather()
                 else -> matchedIntent.responses.random()
             }
-            return recordAndReturn(sessionId, input, resp)
+            return recordAndReturn(input, resp)
         }
 
-        return recordAndReturn(sessionId, input, "Estoy en línea, Cristian. ¿Me repites la idea para procesarla?")
+        return recordAndReturn(input, "Estoy en línea, Cristian. ¿Me repites la instrucción?")
     }
 
-    // ========================================================================
-    // MOTOR CONVERSACIONAL EN LA NUBE (0 CONFIGURACIÓN LOCAL, SIN LOCALHOST)
-    // ========================================================================
-    private fun generateCloudConversationalResponse(userInput: String, sessionId: String): String? {
-        return try {
-            val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
-            val factsContext = if (userFacts.isEmpty()) "" else "Memoria permanente:\n" + userFacts.joinToString("\n") { "- $it" }
+    private fun buildSystemPrompt(): String {
+        val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
+        val factsContext = if (userFacts.isEmpty()) "" else "Datos permanentes sobre Cristian:\n" + userFacts.joinToString("\n") { "- $it" }
+        return """
+            Eres Daemon, una aplicación de inteligencia artificial autónoma de escritorio estilo J.A.R.V.I.S. creada por Cristian Alexis.
+            Hora actual: $horaActual.
+            $factsContext
+            
+            Reglas de conversación:
+            1. Habla en español de forma natural, inteligente, leal y fluida.
+            2. Sé conciso (1 a 3 párrafos breves) para que tu síntesis de voz suene dinámica.
+            3. Mantén el hilo de la conversación recordando lo que hablaron antes.
+            4. Si Cristian te pide reproducir música en Spotify o abrir una app durante la plática, incluye al final una etiqueta exacta:
+               [ACTION:PLAY_SONG:nombre de la cancion]
+               [ACTION:PLAY_PLAYLIST:nombre de la playlist]
+               [ACTION:MEDIA_NEXT]
+               [ACTION:MEDIA_PREV]
+               [ACTION:MEDIA_PLAY_PAUSE]
+               [ACTION:OPEN_APP:nombre de la app]
+        """.trimIndent()
+    }
 
-            val systemPrompt = """
-                Eres Daemon (v6.0), una inteligencia artificial avanzada estilo J.A.R.V.I.S. creada por Cristian Alexis.
-                Estás alojado en la nube para que Cristian y las personas que él autorice puedan conversar contigo desde cualquier lugar.
-                Hora actual: $horaActual.
-                $factsContext
-                
-                Instrucciones de conversación:
-                1. Responde siempre en español con tono inteligente, fluido, leal y conversacional (no robótico).
-                2. Sé directo y claro (1 a 3 párrafos breves).
-                3. Mantén el hilo de la conversación recordando los mensajes previos del usuario.
-                4. Si el usuario te pide reproducir música en Spotify o abrir una app en la PC de Cristian durante la conversación, agrega al final de tu respuesta una etiqueta exacta:
-                   [ACTION:PLAY_SONG:nombre de la cancion]
-                   [ACTION:PLAY_PLAYLIST:nombre de la playlist]
-                   [ACTION:MEDIA_NEXT]
-                   [ACTION:MEDIA_PREV]
-                   [ACTION:MEDIA_PLAY_PAUSE]
-                   [ACTION:OPEN_APP:nombre de la app]
-            """.trimIndent()
-
-            val history = userSessions.getOrPut(sessionId) { mutableListOf() }
-            val messagesList = mutableListOf>()
-            messagesList.add(mapOf("role" to "system", "content" to systemPrompt))
-
-            synchronized(history) {
-                history.takeLast(14).forEach { turn ->
-                    messagesList.add(mapOf("role" to turn.role, "content" to turn.content))
-                }
+    private fun buildMessageHistory(userInput: String): List<ChatMessage> {
+        val list = mutableListOf(ChatMessage("system", buildSystemPrompt()))
+        synchronized(conversationHistory) {
+            conversationHistory.takeLast(14).forEach { turn ->
+                list.add(ChatMessage(turn.role, turn.content))
             }
-            messagesList.add(mapOf("role" to "user", "content" to userInput))
+        }
+        list.add(ChatMessage("user", userInput))
+        return list
+    }
 
-            val payload = mapOf(
-                "messages" to messagesList,
-                "model" to "openai",
-                "seed" to 42,
-                "jsonMode" to false
+    private fun generateOllamaConversationalResponse(userInput: String): String? {
+        return try {
+            val payload = OllamaPayload(
+                model = ollamaModel,
+                messages = buildMessageHistory(userInput),
+                stream = false,
+                options = OllamaOptions(temperature = 0.7, num_predict = 280)
             )
+            val jsonBody = objectMapper.writeValueAsString(payload)
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create(ollamaUrl))
+                .timeout(Duration.ofSeconds(25))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
+                .build()
 
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() != 200) return null
+
+            val rawReply = objectMapper.readTree(res.body()).path("message").path("content").asText("").trim()
+            if (rawReply.isBlank()) return null
+            executeEmbeddedActions(rawReply)
+        } catch (e: Exception) {
+            isOllamaOnline = false
+            null
+        }
+    }
+
+    private fun generateCloudConversationalResponse(userInput: String): String? {
+        return try {
+            val payload = CloudChatPayload(
+                messages = buildMessageHistory(userInput),
+                model = "openai",
+                seed = 42,
+                jsonMode = false
+            )
             val jsonBody = objectMapper.writeValueAsString(payload)
             val req = HttpRequest.newBuilder()
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonCloud/6.0")
+                .header("User-Agent", "DaemonDesktopApp/6.0")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -970,10 +1026,8 @@ class DaemonBrain(
 
             val rawReply = res.body().trim()
             if (rawReply.isBlank()) return null
-
-            return executeEmbeddedActions(rawReply)
+            executeEmbeddedActions(rawReply)
         } catch (e: Exception) {
-            println("[DAEMON CLOUD CORTEX WARN] ${e.message}")
             null
         }
     }
@@ -995,13 +1049,12 @@ class DaemonBrain(
         return llmReply.replace(actionRegex, "").trim()
     }
 
-    private fun recordAndReturn(sessionId: String, userPrompt: String, daemonReply: String): String {
-        val history = userSessions.getOrPut(sessionId) { mutableListOf() }
-        synchronized(history) {
-            history.add(ConversationTurn("user", userPrompt))
-            history.add(ConversationTurn("assistant", daemonReply))
-            while (history.size > 20) {
-                history.removeAt(0)
+    private fun recordAndReturn(userPrompt: String, daemonReply: String): String {
+        synchronized(conversationHistory) {
+            conversationHistory.add(ChatMessage("user", userPrompt))
+            conversationHistory.add(ChatMessage("assistant", daemonReply))
+            while (conversationHistory.size > 20) {
+                conversationHistory.removeAt(0)
             }
         }
         return daemonReply
@@ -1027,13 +1080,13 @@ class DaemonBrain(
 
     private fun fetchLiveWeather(): String {
         return try {
-            val url = "https://api.open-meteo.com/v1/forecast?latitude=19.60&longitude=-99.05&current_weather=true"
+            val url = "https://api.open-meteo.com/v1/forecast?latitude=19.60&longitude=-99.05¤t_weather=true"
             val req = HttpRequest.newBuilder().uri(URI.create(url)).GET().build()
             val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
             val currentBlock = res.body().substringAfter("\"current_weather\":", "")
             val temp = Regex(""""temperature"\s*:\s*(-?\d+(\.\d+)?)""").find(currentBlock)?.groupValues?.get(1) ?: "--"
             val wind = Regex(""""windspeed"\s*:\s*(\d+(\.\d+)?)""").find(currentBlock)?.groupValues?.get(1) ?: "--"
-            "La temperatura actual es de $temp °C con vientos de $wind km/h."
+            "La temperatura actual es de $temp °C con vientos de $wind km/h, Cristian."
         } catch (e: Exception) {
             "Sensor meteorológico sin enlace en este momento."
         }
@@ -1046,7 +1099,7 @@ class DaemonBrain(
             try {
                 uiState = "SPEAKING"
                 val cleanSpeech = reply
-                    .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en pantalla.")
+                    .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en la ventana.")
                     .replace(Regex("[#*`_~>\\-•]"), "")
                     .replace("\n", ". ")
                     .trim()
@@ -1113,7 +1166,7 @@ class DaemonBrain(
                         miniWindow?.setStatusText("STANDBY // LISTO PARA CONVERSAR")
                     }
                     else -> {
-                        val reply = processThought(output, "local-voice")
+                        val reply = processThought(output)
                         speakAndDisplay(output, reply)
                     }
                 }
@@ -1126,19 +1179,18 @@ class DaemonBrain(
 
     private fun launchNativeDesktopMiniWindow() {
         try {
+            System.setProperty("java.awt.headless", "false")
             if (!GraphicsEnvironment.isHeadless()) {
                 SwingUtilities.invokeLater {
                     miniWindow = DaemonMiniWindow(this, systemScanner)
                     miniWindow?.isVisible = true
                 }
             }
-        } catch (e: Exception) {
-            println("[DAEMON CLOUD MODE] Ejecutando en modo servidor web sin ventana local.")
-        }
+        } catch (e: Exception) {}
     }
 
     private fun kbNode(tag: String, aliases: List<String>, response: String): IntentNode {
-        val patterns = mutableListOf<String>()
+        val patterns = mutableListOf("").apply { clear() }
         for (alias in aliases) {
             patterns.addAll(listOf(alias, "que es $alias", "definicion de $alias", "explicame $alias", "como funciona $alias"))
         }
@@ -1146,8 +1198,8 @@ class DaemonBrain(
     }
 
     private fun buildComprehensiveKnowledgeBase(): List<IntentNode> = listOf(
-        IntentNode("saludo", listOf("hola", "buenos dias", "buenas tardes", "buenas noches", "que tal daemon"), listOf("En línea y operando en modo Cloud, Cristian. ¿De qué platicamos o qué ejecutamos hoy?")),
-        IntentNode("identidad", listOf("quien eres", "como te llamas", "que eres"), listOf("Soy Daemon v6.0, una inteligencia artificial en la nube creada por Cristian con control directo sobre su sistema y córtex conversacional.")),
+        IntentNode("saludo", listOf("hola", "buenos dias", "buenas tardes", "buenas noches", "que tal daemon"), listOf("En línea y operando como aplicación nativa en tu escritorio, Cristian. ¿Qué hacemos hoy?")),
+        IntentNode("identidad", listOf("quien eres", "como te llamas", "que eres"), listOf("Soy Daemon, tu aplicación nativa de inteligencia artificial con control directo sobre tu PC y córtex conversacional.")),
         IntentNode("hora_fecha", listOf("que hora es", "dime la hora", "fecha de hoy"), emptyList(), "CHECK_TIME"),
         IntentNode("clima_actual", listOf("como esta el clima", "que temperatura hace"), emptyList(), "CHECK_WEATHER"),
         kbNode("proceso_hilo", listOf("proceso", "hilo", "thread"), "Un proceso es un programa en ejecución con memoria aislada; un hilo es una unidad de ejecución ligera dentro de ese proceso."),
@@ -1156,15 +1208,15 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 4. MINI-VENTANA HOLOGRÁFICA PARA TU PC (SIN BORDES DE WINDOWS)
+// 4. INTERFAZ NATIVA DE ESCRITORIO (SIN BORDES DE WINDOWS, ESTILO STARK HUD)
 // ============================================================================
 class DaemonMiniWindow(
     private val brain: DaemonBrain,
     private val scanner: SystemScanner
-) : JFrame("DAEMON // STARK CLOUD v6.0") {
+) : JFrame("DAEMON AI") {
 
     private var dragOffset = Point(0, 0)
-    private val statusLabel = JLabel("ONLINE // CLOUD CORTEX & SPOTIFY BRIDGE")
+    private val statusLabel = JLabel("ONLINE // DESKTOP AI ACTIVE")
     private val outputArea = JTextArea()
     private val inputField = JTextField()
     private val corePanel = StarkReactorCanvas()
@@ -1206,7 +1258,7 @@ class DaemonMiniWindow(
 
             val titleBox = JPanel(GridLayout(2, 1, 0, 1)).apply {
                 isOpaque = false
-                val title = JLabel("◈ DAEMON // CLOUD & PC OS v6.0").apply {
+                val title = JLabel("◈ DAEMON // NATIVE DESKTOP AI").apply {
                     foreground = Color(0, 240, 255)
                     font = Font("Consolas", Font.BOLD, 14)
                 }
@@ -1343,9 +1395,9 @@ class DaemonMiniWindow(
         val text = inputField.text.trim()
         if (text.isBlank()) return
         inputField.text = ""
-        setStatusText("CONVERSANDO CON EL CÓRTEX CLOUD...")
+        setStatusText("PROCESANDO CONVERSACIÓN...")
         thread {
-            val reply = brain.processThought(text, "desktop-owner")
+            val reply = brain.processThought(text)
             brain.speakAndDisplay(text, reply)
         }
     }
@@ -1527,8 +1579,8 @@ class DaemonMiniWindow(
             g2.drawString("OS // ${scanner.getOSLabel()}", 8, 16)
             g2.drawString("STATE // ${brain.uiState}", 8, 30)
 
-            val rightText1 = "CORTEX // CLOUD NEURAL"
-            val rightText2 = "SPOTIFY BRIDGE // ACTIVE"
+            val rightText1 = "MODE // NATIVE DESKTOP APP"
+            val rightText2 = "AUTO-START // ENABLED"
             val fm = g2.fontMetrics
             g2.color = Color(16, 235, 160, 220)
             g2.drawString(rightText1, width - fm.stringWidth(rightText1) - 8, 16)
@@ -1541,40 +1593,16 @@ class DaemonMiniWindow(
     }
 }
 
-// ============================================================================
-// 5. ENDPOINTS WEB Y PUENTE DE SINCRONIZACIÓN NUBE -> PC
-// ============================================================================
 @RestController
 @RequestMapping("/api/daemon")
 @CrossOrigin(origins = ["*"])
 class DaemonController(
-    private val brain: DaemonBrain,
-    private val scanner: SystemScanner
+    private val brain: DaemonBrain
 ) {
-    // PIN opcional si quieres restringir quién usa tu link en la nube (vacío = acceso libre con tu link)
-    private val requiredPin: String = System.getenv("DAEMON_PIN") ?: ""
-
     @PostMapping("/chat")
     fun chat(@RequestBody request: ChatRequest): String {
-        if (requiredPin.isNotBlank() && request.accessPin != requiredPin) {
-            return "🔒 Acceso restringido. Ingresa el PIN de autorización de Cristian para usar el núcleo Daemon."
-        }
-        val reply = brain.processThought(request.prompt, request.sessionId)
-        if (!request.fromBrowser) {
-            brain.speakAndDisplay(request.prompt, reply)
-        } else {
-            brain.speakAndDisplay(request.prompt, reply)
-        }
+        val reply = brain.processThought(request.prompt)
+        brain.speakAndDisplay(request.prompt, reply)
         return reply
-    }
-
-    // Endpoint para que tu PC descargue las órdenes enviadas al servidor en la nube
-    @GetMapping("/poll-commands")
-    fun pollCommands(): List<RemoteCommand> {
-        val list = mutableListOf<RemoteCommand>()
-        while (scanner.pendingRemoteCommands.isNotEmpty()) {
-            scanner.pendingRemoteCommands.poll()?.let { list.add(it) }
-        }
-        return list
     }
 }
