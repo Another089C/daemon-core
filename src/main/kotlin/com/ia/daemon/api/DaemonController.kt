@@ -66,7 +66,7 @@ data class ChatMessage(
 data class UserAccount(
     val username: String = "",
     var passwordHash: String = "",
-    var role: String = "USER", // Solo "cristian" tiene "ADMIN"
+    var role: String = "USER",
     val personalFacts: MutableList<String> = mutableListOf(),
     val personalKnowledge: MutableList<IntentNode> = mutableListOf(),
     val personalModes: MutableList<WorkspaceMode> = mutableListOf(),
@@ -81,8 +81,8 @@ data class CloudVaultState(
 )
 
 data class OtaManifest(
-    var appVersion: Int = 125,
-    var versionName: String = "12.5.0",
+    var appVersion: Int = 126,
+    var versionName: String = "12.6.0",
     var githubRawBaseUrl: String = "",
     var sharedCloudDbUrl: String = "",
     var jarRelativePath: String = "build/libs/daemon-0.0.1-SNAPSHOT.jar",
@@ -92,7 +92,7 @@ data class OtaManifest(
 data class LocalMachineSession(
     var loggedUsername: String = "invitado",
     var loggedPasswordHash: String = "",
-    var installedAppVersion: Int = 125
+    var installedAppVersion: Int = 126
 )
 
 data class OllamaOptions(
@@ -135,12 +135,11 @@ class CloudVaultService {
     var localSession = LocalMachineSession()
     var vault = CloudVaultState()
 
-    // Lista de otras PCs/Macs detectadas automáticamente en la misma red para sincronización en 0.2 seg
     private val discoveredPeers = CopyOnWriteArraySet<String>()
     private val udpDiscoveryPort = 19840
 
     @Volatile var cloudSyncStatus: String = "LIVE SYNC ☁"
-    @Volatile var otaStatusText: String = "v12.5.0 LIVE"
+    @Volatile var otaStatusText: String = "v12.6.0 LIVE"
     var onSessionOrVaultChanged: (() -> Unit)? = null
 
     init {
@@ -285,11 +284,7 @@ class CloudVaultService {
         } catch (e: Exception) {}
     }
 
-    // ========================================================================
-    // VÍA 1: RADAR P2P AUTOMÁTICO WINDOWS <-> MAC (SINCRONIZACIÓN EN 0.2 SEG)
-    // ========================================================================
     private fun startLanPeerToPeerSyncServer() {
-        // Escucha señales de otras PCs/Macs con Daemon abierto en la misma red
         thread(isDaemon = true, name = "Daemon-UDP-Peer-Listener") {
             try {
                 val socket = DatagramSocket(null)
@@ -312,7 +307,6 @@ class CloudVaultService {
             } catch (e: Exception) {}
         }
 
-        // Anuncia su presencia cada 6 segundos para mantener Windows y Mac sincronizados en tiempo real
         thread(isDaemon = true, name = "Daemon-UDP-Broadcaster") {
             Thread.sleep(1500)
             while (true) {
@@ -345,7 +339,6 @@ class CloudVaultService {
             DatagramSocket().use { socket ->
                 socket.broadcast = true
                 val data = "DAEMON_SYNC:${vault.lastUpdated}".toByteArray(StandardCharsets.UTF_8)
-                // Broadcast global y subredes locales
                 socket.send(DatagramPacket(data, data.size, InetAddress.getByName("255.255.255.255"), udpDiscoveryPort))
                 val interfaces = NetworkInterface.getNetworkInterfaces()
                 while (interfaces.hasMoreElements()) {
@@ -402,45 +395,32 @@ class CloudVaultService {
         }
     }
 
-    // ========================================================================
-    // VÍA 2 Y 3: SINCRONIZACIÓN CLOUD DB + GITHUB API SIN CACHÉ + GIT SYNC
-    // ========================================================================
     private fun startAutomaticOtaAndCloudDaemon() {
         thread(isDaemon = true, name = "Daemon-OTA-AutoUpdater") {
             Thread.sleep(2000)
             syncAllChannelsNow(silent = true)
             while (true) {
-                Thread.sleep(20000) // Sincroniza cada 20 segundos en caliente
+                Thread.sleep(20000)
                 syncAllChannelsNow(silent = true)
             }
         }
     }
 
-    // Fuerza la sincronización inmediata por TODAS las vías (Disco, Red Local, Firebase y GitHub) sin reiniciar
     fun syncAllChannelsNow(silent: Boolean = false): String {
         reloadVaultFromDiskIfNewer()
-
-        // 1. Sincronizar con otras PCs/Macs en la misma red al instante
         broadcastSyncPingToLan()
         for (peer in discoveredPeers) {
             pullFromPeerDevice(peer)
         }
-
-        // 2. Sincronizar con Firebase / Servidor Cloud en tiempo real (si está configurado)
         pullFromRealtimeCloudDb()
-
-        // 3. Sincronizar con GitHub (vía Git Fetch y API sin caché de 5 minutos)
         pullLatestVaultFromGitAndGitHub()
-
-        // 4. Verificar si hay una nueva versión del ejecutable (.jar)
         checkOtaBinaryUpdate()
 
         onSessionOrVaultChanged?.invoke()
-        return "Sincronización completada: ${vault.accounts.size} cuentas activas en la bóveda (${ vault.accounts.joinToString(", ") { it.username.uppercase() } })."
+        return "Sincronización completada: ${vault.accounts.size} cuentas activas (${vault.accounts.joinToString(", ") { it.username.uppercase() }})."
     }
 
     private fun pullLatestVaultFromGitAndGitHub() {
-        // A) Si tiene repositorio Git local, traer cambios remotos en caliente sin reiniciar
         try {
             val workingDir = File(System.getProperty("user.dir"))
             if (File(workingDir, ".git").exists() || File(workingDir.parentFile, ".git").exists()) {
@@ -457,11 +437,9 @@ class CloudVaultService {
             }
         } catch (e: Exception) {}
 
-        // B) Consultar desde GitHub con encabezados anti-caché
         val rawBase = otaManifest.githubRawBaseUrl.trimEnd('/')
         if (rawBase.isNotBlank()) {
             try {
-                // Convertir raw.githubusercontent.com/{owner}/{repo}/main a la API de GitHub sin caché si es posible
                 val apiOrRawUrl = "$rawBase/daemon_cloud_vault.json?nocache=${System.currentTimeMillis()}"
                 val req = HttpRequest.newBuilder()
                     .uri(URI.create(apiOrRawUrl))
@@ -479,13 +457,11 @@ class CloudVaultService {
         }
     }
 
-    // Sube automáticamente la nueva cuenta o recuerdo a todas las vías (P2P + Cloud DB + Git Push silencioso)
     fun pushVaultEverywhereAsync(commitReason: String = "sync: actualizacion de cuenta en la nube") {
         saveLocalVaultCache()
         pushToAllPeerDevicesAsync()
         pushToRealtimeCloudDbAsync()
 
-        // Subir también a GitHub en segundo plano para que otra PC fuera de casa lo reciba sin intervención manual
         thread(isDaemon = true) {
             try {
                 val workingDir = File(System.getProperty("user.dir"))
@@ -650,7 +626,6 @@ class CloudVaultService {
         }
     }
 
-    // Fusiona cuentas de forma aditiva: cualquier cuenta creada en Windows se agrega en Mac al instante
     @Synchronized
     fun mergeCloudVault(remote: CloudVaultState, saveToDisk: Boolean = true): Boolean {
         var changed = false
@@ -700,9 +675,6 @@ class CloudVaultService {
         return changed
     }
 
-    // ========================================================================
-    // AUTENTICACIÓN CON RECARGA EN CALIENTE (SIN CERRAR EL PROGRAMA)
-    // ========================================================================
     fun getCurrentAccount(): UserAccount {
         reloadVaultFromDiskIfNewer()
         val acc = vault.accounts.firstOrNull { it.username.equals(localSession.loggedUsername, true) }
@@ -718,7 +690,6 @@ class CloudVaultService {
     }
 
     fun loginUser(username: String, plainPassword: String): Pair<Boolean, String> {
-        // Antes de verificar si el usuario existe, sincronizar en caliente con la otra PC / Nube / Git
         syncAllChannelsNow(silent = true)
 
         val cleanUser = username.trim().lowercase()
@@ -775,7 +746,6 @@ class CloudVaultService {
         localSession.loggedPasswordHash = passHash
         savePrivateMachineSession()
 
-        // Propagar inmediatamente la nueva cuenta a tu Mac / Windows / Cloud / GitHub
         pushVaultEverywhereAsync("feat(cloud): nueva cuenta registrada ($cleanUser)")
         onSessionOrVaultChanged?.invoke()
 
@@ -940,7 +910,7 @@ class CloudVaultService {
         IntentNode(
             tag = "global_identidad",
             patterns = listOf("quien eres", "que es daemon", "como funcionas"),
-            responses = listOf("Soy Daemon v12.5, un sistema operativo de inteligencia artificial con sincronización en vivo entre dispositivos y auto-actualización OTA, creado por Cristian Alexis.")
+            responses = listOf("Soy Daemon v12.6, una aplicación nativa de inteligencia artificial con sincronización en vivo y auto-actualización OTA, creada por Cristian Alexis.")
         ),
         IntentNode(
             tag = "global_proceso_hilo",
@@ -956,7 +926,7 @@ class CloudVaultService {
 }
 
 // ============================================================================
-// 2. MOTOR MULTIPLATAFORMA DEL SISTEMA OPERATIVO (WINDOWS / MACOS / LINUX)
+// 2. MOTOR MULTIPLATAFORMA + INSTALADOR DE APLICACIÓN NATIVA (CERO ESCRITORIO)
 // ============================================================================
 @Service
 class SystemScanner(
@@ -988,7 +958,7 @@ class SystemScanner(
     init {
         scanInstalledApplications()
         loadPlaylists()
-        ensureDesktopAndStartupApp()
+        installAsSystemApplicationAndAutoStart()
         startLowPowerTelemetryMonitor()
     }
 
@@ -1041,6 +1011,174 @@ class SystemScanner(
                 output
             } else {
                 ""
+            }
+        } catch (e: Exception) { "" }
+    }
+
+    // ========================================================================
+    // INSTALADOR DE APLICACIÓN NATIVA Y AUTO-ARRANQUE (LIMPIA EL ESCRITORIO)
+    // ========================================================================
+    fun installAsSystemApplicationAndAutoStart(): String {
+        return try {
+            val workingDir = File(System.getProperty("user.dir")).absolutePath
+            val libsDir = File(workingDir, "build/libs")
+            val jarFile = libsDir.listFiles()?.firstOrNull { it.name.endsWith(".jar") && !it.name.contains("plain") }
+                ?: File(workingDir, "daemon.jar")
+            if (!jarFile.exists()) return ""
+
+            when {
+                isWindows -> {
+                    // 1. Actualizar el lanzador silencioso DaemonApp.vbs dentro de la carpeta del proyecto
+                    val launcherVbs = File(workingDir, "DaemonApp.vbs")
+                    val vbsContent = """
+                        Set fso = CreateObject("Scripting.FileSystemObject")
+                        Set shell = CreateObject("WScript.Shell")
+                        shell.CurrentDirectory = "$workingDir"
+                        javawPath = "javaw.exe"
+                        If fso.FolderExists("C:\Program Files\Microsoft") Then
+                            For Each folder In fso.GetFolder("C:\Program Files\Microsoft").SubFolders
+                                If InStr(LCase(folder.Name), "jdk") > 0 Then
+                                    javawPath = Chr(34) & folder.Path & "\bin\javaw.exe" & Chr(34)
+                                End If
+                            Next
+                        End If
+                        shell.Run javawPath & " -Xms32m -Xmx128m -XX:+UseSerialGC -jar " & Chr(34) & "${jarFile.absolutePath}" & Chr(34), 0, False
+                    """.trimIndent()
+                    launcherVbs.writeText(vbsContent, StandardCharsets.ISO_8859_1)
+
+                    // 2. Eliminar cualquier archivo del Escritorio, registrar como Aplicación en Menú Inicio y activar Auto-Arranque
+                    val psInstallApp = """
+                        ${'$'}wsh = New-Object -ComObject WScript.Shell
+                        ${'$'}desktop = [Environment]::GetFolderPath('Desktop')
+                        ${'$'}programsMenu = [Environment]::GetFolderPath('Programs')
+                        ${'$'}startup = [Environment]::GetFolderPath('Startup')
+
+                        # Borrar cualquier acceso directo antiguo en el Escritorio para mantenerlo 100% limpio
+                        Remove-Item -Path "${'$'}desktop\Daemon AI.lnk" -Force -ErrorAction SilentlyContinue
+                        Remove-Item -Path "${'$'}desktop\Daemon.lnk" -Force -ErrorAction SilentlyContinue
+
+                        # Registrar como Aplicación oficial en el Menú Inicio de Windows (Start Menu -> Programs)
+                        ${'$'}sApp = ${'$'}wsh.CreateShortcut("${'$'}programsMenu\Daemon AI.lnk")
+                        ${'$'}sApp.TargetPath = "wscript.exe"
+                        ${'$'}sApp.Arguments = '"${launcherVbs.absolutePath}"'
+                        ${'$'}sApp.WorkingDirectory = "$workingDir"
+                        ${'$'}sApp.IconLocation = "shell32.dll,13"
+                        ${'$'}sApp.Description = "Daemon AI - Sistema Operativo J.A.R.V.I.S."
+                        ${'$'}sApp.Save()
+
+                        # Registrar en el Inicio Automático al prender la PC (Startup + Registro Run)
+                        ${'$'}sBoot = ${'$'}wsh.CreateShortcut("${'$'}startup\Daemon AI.lnk")
+                        ${'$'}sBoot.TargetPath = "wscript.exe"
+                        ${'$'}sBoot.Arguments = '"${launcherVbs.absolutePath}"'
+                        ${'$'}sBoot.WorkingDirectory = "$workingDir"
+                        ${'$'}sBoot.IconLocation = "shell32.dll,13"
+                        ${'$'}sBoot.Save()
+
+                        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DaemonAI" -Value "wscript.exe `"${launcherVbs.absolutePath}`"" -Force
+                    """.trimIndent()
+                    runPowerShell(psInstallApp, wait = false)
+                    "Aplicación registrada en el Menú Inicio y Auto-Arranque de Windows (Escritorio limpio)."
+                }
+                isMac -> {
+                    val home = System.getProperty("user.home")
+                    val javaBin = System.getProperty("java.home") + "/bin/java"
+
+                    // 1. Eliminar cualquier archivo antiguo en el Escritorio de tu Mac
+                    File("$home/Desktop/Daemon AI.command").delete()
+                    File("$home/Desktop/Daemon_Mac.command").delete()
+
+                    // 2. Crear la Aplicación Nativa de macOS: /Applications/Daemon AI.app (o ~/Applications/Daemon AI.app)
+                    val sysApps = File("/Applications")
+                    val targetAppsDir = if (sysApps.exists() && sysApps.canWrite()) sysApps else File("$home/Applications").apply { mkdirs() }
+                    val appBundle = File(targetAppsDir, "Daemon AI.app")
+                    val contentsDir = File(appBundle, "Contents")
+                    val macOsDir = File(contentsDir, "MacOS")
+                    macOsDir.mkdirs()
+
+                    val infoPlist = File(contentsDir, "Info.plist")
+                    val infoPlistXml = """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                        <plist version="1.0">
+                        <dict>
+                            <key>CFBundleExecutable</key>
+                            <string>DaemonAI</string>
+                            <key>CFBundleIdentifier</key>
+                            <string>com.cristian.daemon.ai</string>
+                            <key>CFBundleName</key>
+                            <string>Daemon AI</string>
+                            <key>CFBundleDisplayName</key>
+                            <string>Daemon AI</string>
+                            <key>CFBundlePackageType</key>
+                            <string>APPL</string>
+                            <key>CFBundleShortVersionString</key>
+                            <string>12.6</string>
+                            <key>LSUIElement</key>
+                            <true/>
+                        </dict>
+                        </plist>
+                    """.trimIndent()
+                    infoPlist.writeText(infoPlistXml, StandardCharsets.UTF_8)
+
+                    val macExec = File(macOsDir, "DaemonAI")
+                    val macExecScript = """
+                        #!/bin/bash
+                        cd "$workingDir"
+                        if [ -f "build/libs/daemon-0.0.1-SNAPSHOT.jar" ]; then
+                            JAR_TARGET="$workingDir/build/libs/daemon-0.0.1-SNAPSHOT.jar"
+                        else
+                            JAR_TARGET="$workingDir/daemon.jar"
+                        fi
+                        exec "$javaBin" -Xms32m -Xmx128m -XX:+UseSerialGC -jar "${'$'}JAR_TARGET"
+                    """.trimIndent()
+                    macExec.writeText(macExecScript, StandardCharsets.UTF_8)
+                    macExec.setExecutable(true)
+
+                    // 3. Registrar en LaunchAgents para que inicie sola al prender o iniciar sesión en la Mac
+                    val launchAgentsDir = File("$home/Library/LaunchAgents").apply { mkdirs() }
+                    val plistFile = File(launchAgentsDir, "com.cristian.daemon.ai.plist")
+                    val plistXml = """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                        <plist version="1.0">
+                        <dict>
+                            <key>Label</key>
+                            <string>com.cristian.daemon.ai</string>
+                            <key>ProgramArguments</key>
+                            <array>
+                                <string>${macExec.absolutePath}</string>
+                            </array>
+                            <key>WorkingDirectory</key>
+                            <string>$workingDir</string>
+                            <key>RunAtLoad</key>
+                            <true/>
+                        </dict>
+                        </plist>
+                    """.trimIndent()
+                    plistFile.writeText(plistXml, StandardCharsets.UTF_8)
+                    "Aplicación nativa Daemon AI.app instalada en Aplicaciones y Auto-Arranque de macOS (Escritorio limpio)."
+                }
+                isLinux -> {
+                    val home = System.getProperty("user.home")
+                    val javaBin = System.getProperty("java.home") + "/bin/java"
+                    val desktopEntryContent = """
+                        [Desktop Entry]
+                        Type=Application
+                        Name=Daemon AI
+                        Exec="$javaBin" -Xms32m -Xmx128m -XX:+UseSerialGC -jar "${jarFile.absolutePath}"
+                        Path=$workingDir
+                        Terminal=false
+                        X-GNOME-Autostart-enabled=true
+                    """.trimIndent()
+
+                    val appsDir = File("$home/.local/share/applications").apply { mkdirs() }
+                    File(appsDir, "daemon-ai.desktop").writeText(desktopEntryContent, StandardCharsets.UTF_8)
+
+                    val autostartDir = File("$home/.config/autostart").apply { mkdirs() }
+                    File(autostartDir, "daemon-ai.desktop").writeText(desktopEntryContent, StandardCharsets.UTF_8)
+                    "Aplicación registrada en Linux."
+                }
+                else -> ""
             }
         } catch (e: Exception) { "" }
     }
@@ -1822,96 +1960,6 @@ class SystemScanner(
         return null
     }
 
-    fun ensureDesktopAndStartupApp(): String {
-        return try {
-            val workingDir = File(System.getProperty("user.dir")).absolutePath
-            val libsDir = File(workingDir, "build/libs")
-            val jarFile = libsDir.listFiles()?.firstOrNull { it.name.endsWith(".jar") && !it.name.contains("plain") }
-                ?: File(workingDir, "daemon.jar")
-            if (!jarFile.exists()) return ""
-
-            when {
-                isWindows -> {
-                    val launcherVbs = File(workingDir, "DaemonApp.vbs")
-                    val vbsContent = """
-                        Set fso = CreateObject("Scripting.FileSystemObject")
-                        Set shell = CreateObject("WScript.Shell")
-                        shell.CurrentDirectory = "$workingDir"
-                        javawPath = "javaw.exe"
-                        If fso.FolderExists("C:\Program Files\Microsoft") Then
-                            For Each folder In fso.GetFolder("C:\Program Files\Microsoft").SubFolders
-                                If InStr(LCase(folder.Name), "jdk") > 0 Then
-                                    javawPath = Chr(34) & folder.Path & "\bin\javaw.exe" & Chr(34)
-                                End If
-                            Next
-                        End If
-                        shell.Run javawPath & " -Xms32m -Xmx128m -XX:+UseSerialGC -jar " & Chr(34) & "${jarFile.absolutePath}" & Chr(34), 0, False
-                    """.trimIndent()
-                    launcherVbs.writeText(vbsContent, StandardCharsets.ISO_8859_1)
-
-                    val psStartup = """
-                        ${'$'}wsh = New-Object -ComObject WScript.Shell
-                        ${'$'}desktop = [Environment]::GetFolderPath('Desktop')
-                        ${'$'}startup = [Environment]::GetFolderPath('Startup')
-                        ${'$'}s1 = ${'$'}wsh.CreateShortcut("${'$'}desktop\Daemon AI.lnk")
-                        ${'$'}s1.TargetPath = "wscript.exe"
-                        ${'$'}s1.Arguments = '"${launcherVbs.absolutePath}"'
-                        ${'$'}s1.WorkingDirectory = "$workingDir"
-                        ${'$'}s1.IconLocation = "shell32.dll,13"
-                        ${'$'}s1.Save()
-                        ${'$'}s2 = ${'$'}wsh.CreateShortcut("${'$'}startup\Daemon AI.lnk")
-                        ${'$'}s2.TargetPath = "wscript.exe"
-                        ${'$'}s2.Arguments = '"${launcherVbs.absolutePath}"'
-                        ${'$'}s2.WorkingDirectory = "$workingDir"
-                        ${'$'}s2.IconLocation = "shell32.dll,13"
-                        ${'$'}s2.Save()
-                        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DaemonAI" -Value "wscript.exe `"${launcherVbs.absolutePath}`"" -Force
-                    """.trimIndent()
-                    runPowerShell(psStartup, wait = false)
-                    "Auto-inicio ligero registrado en Windows."
-                }
-                isMac -> {
-                    val home = System.getProperty("user.home")
-                    val javaBin = System.getProperty("java.home") + "/bin/java"
-                    val launchAgentsDir = File("$home/Library/LaunchAgents")
-                    if (!launchAgentsDir.exists()) launchAgentsDir.mkdirs()
-
-                    val plistFile = File(launchAgentsDir, "com.cristian.daemon.ai.plist")
-                    val plistXml = """
-                        <?xml version="1.0" encoding="UTF-8"?>
-                        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                        <plist version="1.0">
-                        <dict>
-                            <key>Label</key>
-                            <string>com.cristian.daemon.ai</string>
-                            <key>ProgramArguments</key>
-                            <array>
-                                <string>$javaBin</string>
-                                <string>-Xms32m</string>
-                                <string>-Xmx128m</string>
-                                <string>-XX:+UseSerialGC</string>
-                                <string>-jar</string>
-                                <string>${jarFile.absolutePath}</string>
-                            </array>
-                            <key>WorkingDirectory</key>
-                            <string>$workingDir</string>
-                            <key>RunAtLoad</key>
-                            <true/>
-                        </dict>
-                        </plist>
-                    """.trimIndent()
-                    plistFile.writeText(plistXml, StandardCharsets.UTF_8)
-
-                    val cmdFile = File("$home/Desktop/Daemon AI.command")
-                    cmdFile.writeText("#!/bin/bash\ncd \"$workingDir\"\n\"$javaBin\" -Xms32m -Xmx128m -XX:+UseSerialGC -jar \"${jarFile.absolutePath}\" &\n", StandardCharsets.UTF_8)
-                    cmdFile.setExecutable(true)
-                    "Auto-inicio ligero registrado en macOS."
-                }
-                else -> ""
-            }
-        } catch (e: Exception) { "" }
-    }
-
     fun normalizeText(text: String): String {
         val temp = Normalizer.normalize(text.lowercase(), Normalizer.Form.NFD)
         return temp.replace(Regex("[\\p{InCombiningDiacriticalMarks}]"), "")
@@ -1951,10 +1999,9 @@ class DaemonBrain(
         checkOllamaStatus()
         launchStarkHologramHUD()
         startContinuousWakeWordEar()
-        val acc = cloudVault.getCurrentAccount()
         speakAndDisplay(
-            "NÚCLEO LIVE v12.5",
-            "Daemon activo sobre ${systemScanner.getOSLabel()}. Sincronización en vivo entre dispositivos activada."
+            "NÚCLEO LIVE v12.6",
+            "Aplicación nativa Daemon activa en ${systemScanner.getOSLabel()} con auto-inicio configurado."
         )
     }
 
@@ -2291,7 +2338,7 @@ class DaemonBrain(
             cloudVault.vault.globalKnowledge.take(15).joinToString("\n") { "- ${it.tag}: ${it.responses.firstOrNull() ?: ""}" }
 
         return """
-            Eres Daemon (v12.5), un asistente de inteligencia artificial estilo J.A.R.V.I.S. con sincronización en vivo entre dispositivos, creado por Cristian Alexis.
+            Eres Daemon (v12.6), una aplicación nativa de inteligencia artificial estilo J.A.R.V.I.S. con sincronización en vivo entre dispositivos, creada por Cristian Alexis.
             Estás atendiendo a la cuenta: ${acc.username.uppercase()} (Rol: ${acc.role}) en un dispositivo ${systemScanner.getOSLabel()}.
             Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
@@ -2369,7 +2416,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkOTA/12.5")
+                .header("User-Agent", "DaemonStarkOTA/12.6")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -2537,7 +2584,7 @@ class StarkHologramHUD(
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON LIVE v12.5").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON LIVE v12.6").apply {
                     foreground = neonCyan
                     font = Font("Monospaced", Font.BOLD, 13)
                 }
@@ -2736,9 +2783,6 @@ class StarkHologramHUD(
         }.start()
     }
 
-    // ========================================================================
-    // PORTAL HOLOGRÁFICO DE CUENTAS CON SINCRONIZACIÓN EN CALIENTE AL ABRIRSE
-    // ========================================================================
     private fun openAnimatedAccountHoloModal() {
         val modal = StarkAnimatedHoloModal(
             parent = this,
@@ -2783,7 +2827,6 @@ class StarkHologramHUD(
             font = Font("Monospaced", Font.BOLD, 11)
         }
 
-        // Sincronizar en caliente en cuanto se abre el modal para detectar cuentas creadas en otra PC sin reiniciar
         thread {
             cloudVault.syncAllChannelsNow(silent = true)
             SwingUtilities.invokeLater {
@@ -2850,9 +2893,6 @@ class StarkHologramHUD(
         modal.isVisible = true
     }
 
-    // ========================================================================
-    // CENTRO DE MANDO HOLOGRÁFICO ADMIN (EXCLUSIVO CRISTIAN)
-    // ========================================================================
     private fun openAnimatedAdminHoloModal() {
         if (!cloudVault.isAdminLoggedIn()) {
             brain.speakAndDisplay("SEGURIDAD", "Acceso restringido. Inicia sesión como Administrador primero.")
