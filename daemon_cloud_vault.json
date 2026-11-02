@@ -1,0 +1,179 @@
+{
+  "lastUpdated" : 1793658624206,
+  "globalKnowledge" : [ {
+    "tag" : "global_identidad",
+    "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
+    "responses" : [ "Soy Daemon v12.0, un sistema operativo de inteligencia artificial con auto-actualización OTA en la nube y memoria por cuenta de usuario, creado por Cristian Alexis." ],
+    "action" : "NONE"
+  }, {
+    "tag" : "global_proceso_hilo",
+    "patterns" : [ "que es un proceso", "diferencia entre proceso e hilo", "que es un thread" ],
+    "responses" : [ "Un proceso es un programa en ejecución con su propio espacio de memoria aislado; un hilo (thread) es una unidad ligera de ejecución dentro de ese proceso." ],
+    "action" : "NONE"
+  }, {
+    "tag" : "global_mutex_semaforo",
+    "patterns" : [ "que es un mutex", "diferencia entre mutex y semaforo" ],
+    "responses" : [ "Un Mutex es un cerrojo binario de exclusión mutua para proteger secciones críticas, mientras que un Semáforo emplea un contador entero para sincronizar múltiples hilos o procesos." ],
+    "action" : "NONE"
+  } ],
+  "accounts" : [ {
+    "username" : "cristian",
+    "passwordHash" : "6051fc84a7a0d74c225fb18a496b09952da5642e60723ecae543298edd7d82d6",
+    "role" : "ADMIN",
+    "personalFacts" : [ "Es Cristian Alexis, creador y Administrador Maestro de Daemon.", "Estudia Ingeniería en Sistemas Computacionales en la ESCOM del IPN." ],
+    "personalKnowledge" : [ ],
+    "personalModes" : [ {
+      "id" : "TRABAJO",
+      "name" : "PROTOCOLO TRABAJO",
+      "triggers" : [ "vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Trabajo activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+    }, {
+      "id" : "TAREA",
+      "name" : "PROTOCOLO TAREA",
+      "triggers" : [ "vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Tarea activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+    }, {
+      "id" : "ESTUDIO",
+      "name" : "PROTOCOLO ESTUDIO",
+      "triggers" : [ "vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom" ],
+      "appsToOpen" : [ "notion", "opera gx", "vscode" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Estudio activo, Cristian. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+    }, {
+      "id" : "GAMING",
+      "name" : "PROTOCOLO GAMING",
+      "triggers" : [ "vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar" ],
+      "appsToOpen" : [ "discord" ],
+      "appsToClose" : [ "vscode", "notion" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Gaming activo, Cristian. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+    } ],
+    "recentHistory" : [ ],
+    "updatedAt" : 1793658424231
+  }, {
+    "username" : "invitado",
+    "passwordHash" : "75cee5b221098c39dc19feca49b7b7cfe46405057d0361b18726990a5f91bf25",
+    "role" : "USER",
+    "personalFacts" : [ "Sesión estándar de usuario en Daemon." ],
+    "personalKnowledge" : [ ],
+    "personalModes" : [ {
+      "id" : "TRABAJO",
+      "name" : "PROTOCOLO TRABAJO",
+      "triggers" : [ "vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Trabajo activo, Usuario. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+    }, {
+      "id" : "TAREA",
+      "name" : "PROTOCOLO TAREA",
+      "triggers" : [ "vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Tarea activo, Usuario. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+    }, {
+      "id" : "ESTUDIO",
+      "name" : "PROTOCOLO ESTUDIO",
+      "triggers" : [ "vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom" ],
+      "appsToOpen" : [ "notion", "opera gx", "vscode" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Estudio activo, Usuario. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+    }, {
+      "id" : "GAMING",
+      "name" : "PROTOCOLO GAMING",
+      "triggers" : [ "vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar" ],
+      "appsToOpen" : [ "discord" ],
+      "appsToClose" : [ "vscode", "notion" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Gaming activo, Usuario. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+    } ],
+    "recentHistory" : [ ],
+    "updatedAt" : 1793658424232
+  }, {
+    "username" : "cristianuser",
+    "passwordHash" : "9162dedf2f66de62e5992c06f8e0109ab94a9a7d4907d58ff0f3f2f0c27790c3",
+    "role" : "USER",
+    "personalFacts" : [ "Cuenta personal en la nube de cristianuser." ],
+    "personalKnowledge" : [ ],
+    "personalModes" : [ {
+      "id" : "TRABAJO",
+      "name" : "PROTOCOLO TRABAJO",
+      "triggers" : [ "vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Trabajo activo, cristianuser. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+    }, {
+      "id" : "TAREA",
+      "name" : "PROTOCOLO TAREA",
+      "triggers" : [ "vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Tarea activo, cristianuser. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+    }, {
+      "id" : "ESTUDIO",
+      "name" : "PROTOCOLO ESTUDIO",
+      "triggers" : [ "vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom" ],
+      "appsToOpen" : [ "notion", "opera gx", "vscode" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Estudio activo, cristianuser. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+    }, {
+      "id" : "GAMING",
+      "name" : "PROTOCOLO GAMING",
+      "triggers" : [ "vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar" ],
+      "appsToOpen" : [ "discord" ],
+      "appsToClose" : [ "vscode", "notion" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Gaming activo, cristianuser. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+    } ],
+    "recentHistory" : [ {
+      "role" : "user",
+      "content" : "dale play"
+    }, {
+      "role" : "assistant",
+      "content" : "Reanudando reproducción en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "dale play"
+    }, {
+      "role" : "assistant",
+      "content" : "Reanudando reproducción en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "siguiente cancion"
+    }, {
+      "role" : "assistant",
+      "content" : "Siguiente canción en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "anterior"
+    }, {
+      "role" : "assistant",
+      "content" : "Canción anterior en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "anterior"
+    }, {
+      "role" : "assistant",
+      "content" : "Canción anterior en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "siguiente"
+    }, {
+      "role" : "assistant",
+      "content" : "Siguiente canción en Spotify."
+    } ],
+    "updatedAt" : 1793657896242
+  } ]
+}

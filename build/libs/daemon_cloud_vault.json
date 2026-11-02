@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793657201728,
+  "lastUpdated" : 1793657896242,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -98,5 +98,82 @@
     } ],
     "recentHistory" : [ ],
     "updatedAt" : 1793657141541
+  }, {
+    "username" : "cristianuser",
+    "passwordHash" : "9162dedf2f66de62e5992c06f8e0109ab94a9a7d4907d58ff0f3f2f0c27790c3",
+    "role" : "USER",
+    "personalFacts" : [ "Cuenta personal en la nube de cristianuser." ],
+    "personalKnowledge" : [ ],
+    "personalModes" : [ {
+      "id" : "TRABAJO",
+      "name" : "PROTOCOLO TRABAJO",
+      "triggers" : [ "vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Trabajo activo, cristianuser. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+    }, {
+      "id" : "TAREA",
+      "name" : "PROTOCOLO TAREA",
+      "triggers" : [ "vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea" ],
+      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Tarea activo, cristianuser. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+    }, {
+      "id" : "ESTUDIO",
+      "name" : "PROTOCOLO ESTUDIO",
+      "triggers" : [ "vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom" ],
+      "appsToOpen" : [ "notion", "opera gx", "vscode" ],
+      "appsToClose" : [ "discord", "steam" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Estudio activo, cristianuser. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+    }, {
+      "id" : "GAMING",
+      "name" : "PROTOCOLO GAMING",
+      "triggers" : [ "vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar" ],
+      "appsToOpen" : [ "discord" ],
+      "appsToClose" : [ "vscode", "notion" ],
+      "spotifyPlaylist" : "mis me gusta",
+      "greeting" : "Modo Gaming activo, cristianuser. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+    } ],
+    "recentHistory" : [ {
+      "role" : "user",
+      "content" : "dale play"
+    }, {
+      "role" : "assistant",
+      "content" : "Reanudando reproducción en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "dale play"
+    }, {
+      "role" : "assistant",
+      "content" : "Reanudando reproducción en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "siguiente cancion"
+    }, {
+      "role" : "assistant",
+      "content" : "Siguiente canción en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "anterior"
+    }, {
+      "role" : "assistant",
+      "content" : "Canción anterior en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "anterior"
+    }, {
+      "role" : "assistant",
+      "content" : "Canción anterior en Spotify."
+    }, {
+      "role" : "user",
+      "content" : "siguiente"
+    }, {
+      "role" : "assistant",
+      "content" : "Siguiente canción en Spotify."
+    } ],
+    "updatedAt" : 1793657896242
   } ]
 }

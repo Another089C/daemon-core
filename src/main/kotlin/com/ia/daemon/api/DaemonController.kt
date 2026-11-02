@@ -13,9 +13,7 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
 import java.lang.management.ManagementFactory
-import java.net.URI
-import java.net.URLDecoder
-import java.net.URLEncoder
+import java.net.*
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
@@ -26,6 +24,7 @@ import java.time.Duration
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Base64
+import java.util.concurrent.CopyOnWriteArraySet
 import javax.swing.*
 import javax.swing.border.EmptyBorder
 import javax.swing.plaf.basic.BasicScrollBarUI
@@ -81,21 +80,19 @@ data class CloudVaultState(
     val accounts: MutableList<UserAccount> = mutableListOf()
 )
 
-// Este archivo viaja en el repositorio para que NINGUNA PC tenga que configurar URLs manualmente
 data class OtaManifest(
-    var appVersion: Int = 120,
-    var versionName: String = "12.0.0",
+    var appVersion: Int = 125,
+    var versionName: String = "12.5.0",
     var githubRawBaseUrl: String = "",
     var sharedCloudDbUrl: String = "",
     var jarRelativePath: String = "build/libs/daemon-0.0.1-SNAPSHOT.jar",
     var publishedAt: Long = System.currentTimeMillis()
 )
 
-// Este archivo vive SOLO en la PC física (C:\Users\Nombre\.daemon_session.json) y NUNCA se sube a GitHub
 data class LocalMachineSession(
     var loggedUsername: String = "invitado",
     var loggedPasswordHash: String = "",
-    var installedAppVersion: Int = 120
+    var installedAppVersion: Int = 125
 )
 
 data class OllamaOptions(
@@ -118,20 +115,19 @@ data class CloudChatPayload(
 )
 
 // ============================================================================
-// 1. SERVICIO DE SEGURIDAD, CUENTAS CLOUD Y AUTO-ACTUALIZADOR OTA (GITHUB + DB)
+// 1. SERVICIO DE BÓVEDA EN TIEMPO REAL (P2P LAN + GITHUB NOCACHE + CLOUD DB)
 // ============================================================================
 @Service
 class CloudVaultService {
 
     private val vaultCacheFile = File("daemon_cloud_vault.json")
     private val otaManifestFile = File("daemon_ota_manifest.json")
-    // Sesión privada guardada en el directorio personal del sistema operativo (fuera del repo)
     private val localSessionFile = File(System.getProperty("user.home"), ".daemon_session.json")
 
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
 
     private val httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(6))
+        .connectTimeout(Duration.ofSeconds(4))
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build()
 
@@ -139,14 +135,19 @@ class CloudVaultService {
     var localSession = LocalMachineSession()
     var vault = CloudVaultState()
 
-    @Volatile var cloudSyncStatus: String = "CLOUD READY"
-    @Volatile var otaStatusText: String = "v12.0.0 ACTUALIZADO"
+    // Lista de otras PCs/Macs detectadas automáticamente en la misma red para sincronización en 0.2 seg
+    private val discoveredPeers = CopyOnWriteArraySet<String>()
+    private val udpDiscoveryPort = 19840
+
+    @Volatile var cloudSyncStatus: String = "LIVE SYNC ☁"
+    @Volatile var otaStatusText: String = "v12.5.0 LIVE"
     var onSessionOrVaultChanged: (() -> Unit)? = null
 
     init {
         loadOrDetectOtaManifest()
         loadPrivateMachineSession()
         loadOrInitializeVault()
+        startLanPeerToPeerSyncServer()
         startAutomaticOtaAndCloudDaemon()
     }
 
@@ -155,14 +156,12 @@ class CloudVaultService {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
-    // Detecta automáticamente tu repositorio de GitHub desde .git/config para que nunca tengas que escribirlo a mano
     private fun loadOrDetectOtaManifest() {
         if (otaManifestFile.exists()) {
             try {
                 otaManifest = objectMapper.readValue(otaManifestFile, OtaManifest::class.java)
             } catch (e: Exception) {}
         }
-
         if (otaManifest.githubRawBaseUrl.isBlank()) {
             val detectedRaw = detectGitHubRawBaseUrl()
             if (detectedRaw != null) {
@@ -174,14 +173,9 @@ class CloudVaultService {
 
     private fun detectGitHubRawBaseUrl(): String? {
         return try {
-            val gitConfig = sequenceOf(
-                File(".git/config"),
-                File("../.git/config")
-            ).firstOrNull { it.exists() } ?: return null
-
+            val gitConfig = sequenceOf(File(".git/config"), File("../.git/config")).firstOrNull { it.exists() } ?: return null
             val content = gitConfig.readText(StandardCharsets.UTF_8)
-            val m = Regex("""github\.com[:/]([^/\s]+)/([^/\s\.]+?)(?:\.git)?\s""").find(content + " ")
-                ?: return null
+            val m = Regex("""github\.com[:/]([^/\s]+)/([^/\s\.]+?)(?:\.git)?\s""").find(content + " ") ?: return null
             val owner = m.groupValues[1].trim()
             val repo = m.groupValues[2].trim()
             "https://raw.githubusercontent.com/$owner/$repo/main"
@@ -202,7 +196,6 @@ class CloudVaultService {
                 localSession = objectMapper.readValue(localSessionFile, LocalMachineSession::class.java)
             } catch (e: Exception) {}
         } else {
-            // Por seguridad, cualquier PC nueva inicia como "invitado" (SIN acceso a Admin)
             localSession = LocalMachineSession(
                 loggedUsername = "invitado",
                 loggedPasswordHash = sha256("invitado"),
@@ -218,6 +211,17 @@ class CloudVaultService {
         } catch (e: Exception) {}
     }
 
+    @Synchronized
+    private fun reloadVaultFromDiskIfNewer() {
+        if (!vaultCacheFile.exists()) return
+        try {
+            val diskVault = objectMapper.readValue(vaultCacheFile, CloudVaultState::class.java)
+            if (diskVault.accounts.size != vault.accounts.size || diskVault.lastUpdated > vault.lastUpdated) {
+                mergeCloudVault(diskVault, saveToDisk = false)
+            }
+        } catch (e: Exception) {}
+    }
+
     private fun loadOrInitializeVault() {
         if (vaultCacheFile.exists()) {
             try {
@@ -229,7 +233,6 @@ class CloudVaultService {
             vault.globalKnowledge.addAll(buildMasterGlobalKnowledge())
         }
 
-        // 1. Asegurar cuenta maestra de Cristian (ÚNICO ADMIN, clave por defecto: admin2026)
         val adminHash = sha256("admin2026")
         val existingAdmin = vault.accounts.firstOrNull { it.username.equals("cristian", true) }
         if (existingAdmin == null) {
@@ -253,7 +256,6 @@ class CloudVaultService {
             if (existingAdmin.passwordHash.isBlank()) existingAdmin.passwordHash = adminHash
         }
 
-        // 2. Asegurar cuenta pública predeterminada ("invitado") para PCs nuevas
         if (vault.accounts.none { it.username.equals("invitado", true) }) {
             vault.accounts.add(
                 UserAccount(
@@ -269,7 +271,6 @@ class CloudVaultService {
             )
         }
 
-        // Ninguna cuenta que no sea "cristian" puede tener rol ADMIN
         vault.accounts.forEach { acc ->
             if (!acc.username.equals("cristian", true)) acc.role = "USER"
         }
@@ -285,101 +286,261 @@ class CloudVaultService {
     }
 
     // ========================================================================
-    // MOTOR AUTOMÁTICO OTA (ACTUALIZA LA BASE DE DATOS Y EL .JAR EN TODAS LAS PCS)
+    // VÍA 1: RADAR P2P AUTOMÁTICO WINDOWS <-> MAC (SINCRONIZACIÓN EN 0.2 SEG)
     // ========================================================================
-    private fun startAutomaticOtaAndCloudDaemon() {
-        thread(isDaemon = true, name = "Daemon-OTA-AutoUpdater") {
-            Thread.sleep(2000)
-            checkForUpdatesAndSyncNow(silent = true)
-            while (true) {
-                Thread.sleep(35000) // Verifica actualizaciones cada 35 segundos en segundo plano
-                checkForUpdatesAndSyncNow(silent = true)
-            }
-        }
-    }
+    private fun startLanPeerToPeerSyncServer() {
+        // Escucha señales de otras PCs/Macs con Daemon abierto en la misma red
+        thread(isDaemon = true, name = "Daemon-UDP-Peer-Listener") {
+            try {
+                val socket = DatagramSocket(null)
+                socket.reuseAddress = true
+                socket.bind(InetSocketAddress(udpDiscoveryPort))
+                val buffer = ByteArray(512)
+                val localIps = getLocalIpAddresses()
 
-    fun checkForUpdatesAndSyncNow(silent: Boolean = false): String {
-        var statusMsg = "Sincronización al día (v${otaManifest.versionName})."
-        try {
-            // 1. Sincronizar desde la Base de Datos en Tiempo Real (si el Admin configuró una URL en el manifiesto)
-            pullFromRealtimeCloudDb()
-
-            // 2. Revisar en GitHub si el Administrador subió una nueva base de datos o nueva versión del programa (.jar)
-            val rawBase = otaManifest.githubRawBaseUrl.trimEnd('/')
-            if (rawBase.isNotBlank()) {
-                val manifestUrl = "$rawBase/daemon_ota_manifest.json?t=${System.currentTimeMillis()}"
-                val req = HttpRequest.newBuilder().uri(URI.create(manifestUrl)).timeout(Duration.ofSeconds(5)).GET().build()
-                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-
-                if (res.statusCode() == 200 && res.body().contains("appVersion")) {
-                    val remoteManifest = objectMapper.readValue(res.body(), OtaManifest::class.java)
-
-                    // Si el Admin actualizó la URL de la base de datos en tiempo real, adoptarla automáticamente
-                    if (remoteManifest.sharedCloudDbUrl.isNotBlank() && remoteManifest.sharedCloudDbUrl != otaManifest.sharedCloudDbUrl) {
-                        otaManifest.sharedCloudDbUrl = remoteManifest.sharedCloudDbUrl
-                        saveOtaManifest()
-                        pullFromRealtimeCloudDb()
-                    }
-
-                    // Descargar siempre la bóveda global actualizada desde el repositorio
-                    pullVaultFromGitHubRaw(rawBase)
-
-                    // ¿Hay una versión más nueva del ejecutable (.jar) subida por Cristian?
-                    if (remoteManifest.appVersion > otaManifest.appVersion) {
-                        otaStatusText = "⬇ DESCARGANDO UPDATE v${remoteManifest.versionName}..."
-                        onSessionOrVaultChanged?.invoke()
-                        val updated = downloadAndApplyNewJarUpdate(rawBase, remoteManifest)
-                        if (updated) {
-                            return "Actualización v${remoteManifest.versionName} descargada. Reiniciando Daemon..."
-                        }
-                    } else {
-                        otaStatusText = "v${otaManifest.versionName} AL DÍA ✓"
+                while (true) {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    socket.receive(packet)
+                    val msg = String(packet.data, 0, packet.length, StandardCharsets.UTF_8).trim()
+                    val senderIp = packet.address.hostAddress
+                    if (msg.startsWith("DAEMON_SYNC") && senderIp !in localIps) {
+                        val peerBaseUrl = "http://$senderIp:8080"
+                        discoveredPeers.add(peerBaseUrl)
+                        pullFromPeerDevice(peerBaseUrl)
                     }
                 }
-            }
-        } catch (e: Exception) {
-            if (!silent) statusMsg = "Modo local activo (sin conexión al servidor OTA)."
+            } catch (e: Exception) {}
         }
-        onSessionOrVaultChanged?.invoke()
-        return statusMsg
+
+        // Anuncia su presencia cada 6 segundos para mantener Windows y Mac sincronizados en tiempo real
+        thread(isDaemon = true, name = "Daemon-UDP-Broadcaster") {
+            Thread.sleep(1500)
+            while (true) {
+                broadcastSyncPingToLan()
+                for (peer in discoveredPeers) {
+                    pullFromPeerDevice(peer)
+                }
+                Thread.sleep(6000)
+            }
+        }
     }
 
-    private fun pullVaultFromGitHubRaw(rawBase: String) {
+    private fun getLocalIpAddresses(): Set<String> {
+        val ips = mutableSetOf("127.0.0.1", "0:0:0:0:0:0:0:1")
         try {
-            val vaultUrl = "$rawBase/daemon_cloud_vault.json?t=${System.currentTimeMillis()}"
-            val req = HttpRequest.newBuilder().uri(URI.create(vaultUrl)).timeout(Duration.ofSeconds(5)).GET().build()
-            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-            if (res.statusCode() == 200 && res.body().contains("globalKnowledge")) {
-                val remoteVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
-                mergeCloudVault(remoteVault)
-                cloudSyncStatus = "CLOUD SYNCED ☁"
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val iface = interfaces.nextElement()
+                val addrs = iface.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    ips.add(addrs.nextElement().hostAddress)
+                }
+            }
+        } catch (e: Exception) {}
+        return ips
+    }
+
+    private fun broadcastSyncPingToLan() {
+        try {
+            DatagramSocket().use { socket ->
+                socket.broadcast = true
+                val data = "DAEMON_SYNC:${vault.lastUpdated}".toByteArray(StandardCharsets.UTF_8)
+                // Broadcast global y subredes locales
+                socket.send(DatagramPacket(data, data.size, InetAddress.getByName("255.255.255.255"), udpDiscoveryPort))
+                val interfaces = NetworkInterface.getNetworkInterfaces()
+                while (interfaces.hasMoreElements()) {
+                    val iface = interfaces.nextElement()
+                    if (iface.isLoopback || !iface.isUp) continue
+                    for (ifaceAddr in iface.interfaceAddresses) {
+                        val broadcast = ifaceAddr.broadcast ?: continue
+                        try {
+                            socket.send(DatagramPacket(data, data.size, broadcast, udpDiscoveryPort))
+                        } catch (e: Exception) {}
+                    }
+                }
             }
         } catch (e: Exception) {}
     }
 
-    // Descarga el nuevo .jar en segundo plano, libera el candado del SO, reemplaza el binario y reinicia Daemon
+    private fun pullFromPeerDevice(peerBaseUrl: String): Boolean {
+        return try {
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create("$peerBaseUrl/api/daemon/cloud-vault"))
+                .timeout(Duration.ofSeconds(2))
+                .GET().build()
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() == 200 && res.body().contains("accounts")) {
+                val peerVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
+                val changed = mergeCloudVault(peerVault)
+                if (changed) {
+                    cloudSyncStatus = "P2P & CLOUD SYNC ☁"
+                    onSessionOrVaultChanged?.invoke()
+                }
+                true
+            } else false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun pushToAllPeerDevicesAsync() {
+        broadcastSyncPingToLan()
+        if (discoveredPeers.isEmpty()) return
+        thread(isDaemon = true) {
+            val json = objectMapper.writeValueAsString(vault)
+            for (peer in discoveredPeers) {
+                try {
+                    val req = HttpRequest.newBuilder()
+                        .uri(URI.create("$peer/api/daemon/cloud-vault"))
+                        .timeout(Duration.ofSeconds(2))
+                        .header("Content-Type", "application/json")
+                        .PUT(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
+                        .build()
+                    httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                } catch (e: Exception) {}
+            }
+        }
+    }
+
+    // ========================================================================
+    // VÍA 2 Y 3: SINCRONIZACIÓN CLOUD DB + GITHUB API SIN CACHÉ + GIT SYNC
+    // ========================================================================
+    private fun startAutomaticOtaAndCloudDaemon() {
+        thread(isDaemon = true, name = "Daemon-OTA-AutoUpdater") {
+            Thread.sleep(2000)
+            syncAllChannelsNow(silent = true)
+            while (true) {
+                Thread.sleep(20000) // Sincroniza cada 20 segundos en caliente
+                syncAllChannelsNow(silent = true)
+            }
+        }
+    }
+
+    // Fuerza la sincronización inmediata por TODAS las vías (Disco, Red Local, Firebase y GitHub) sin reiniciar
+    fun syncAllChannelsNow(silent: Boolean = false): String {
+        reloadVaultFromDiskIfNewer()
+
+        // 1. Sincronizar con otras PCs/Macs en la misma red al instante
+        broadcastSyncPingToLan()
+        for (peer in discoveredPeers) {
+            pullFromPeerDevice(peer)
+        }
+
+        // 2. Sincronizar con Firebase / Servidor Cloud en tiempo real (si está configurado)
+        pullFromRealtimeCloudDb()
+
+        // 3. Sincronizar con GitHub (vía Git Fetch y API sin caché de 5 minutos)
+        pullLatestVaultFromGitAndGitHub()
+
+        // 4. Verificar si hay una nueva versión del ejecutable (.jar)
+        checkOtaBinaryUpdate()
+
+        onSessionOrVaultChanged?.invoke()
+        return "Sincronización completada: ${vault.accounts.size} cuentas activas en la bóveda (${ vault.accounts.joinToString(", ") { it.username.uppercase() } })."
+    }
+
+    private fun pullLatestVaultFromGitAndGitHub() {
+        // A) Si tiene repositorio Git local, traer cambios remotos en caliente sin reiniciar
+        try {
+            val workingDir = File(System.getProperty("user.dir"))
+            if (File(workingDir, ".git").exists() || File(workingDir.parentFile, ".git").exists()) {
+                val fetchProc = ProcessBuilder("git", "fetch", "origin", "main").directory(workingDir).start()
+                fetchProc.waitFor()
+                val showProc = ProcessBuilder("git", "show", "origin/main:daemon_cloud_vault.json").directory(workingDir).start()
+                val gitJson = showProc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
+                showProc.waitFor()
+                if (gitJson.startsWith("{") && gitJson.contains("accounts")) {
+                    val gitVault = objectMapper.readValue(gitJson, CloudVaultState::class.java)
+                    mergeCloudVault(gitVault)
+                    cloudSyncStatus = "GIT CLOUD SYNC ☁"
+                }
+            }
+        } catch (e: Exception) {}
+
+        // B) Consultar desde GitHub con encabezados anti-caché
+        val rawBase = otaManifest.githubRawBaseUrl.trimEnd('/')
+        if (rawBase.isNotBlank()) {
+            try {
+                // Convertir raw.githubusercontent.com/{owner}/{repo}/main a la API de GitHub sin caché si es posible
+                val apiOrRawUrl = "$rawBase/daemon_cloud_vault.json?nocache=${System.currentTimeMillis()}"
+                val req = HttpRequest.newBuilder()
+                    .uri(URI.create(apiOrRawUrl))
+                    .timeout(Duration.ofSeconds(4))
+                    .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    .header("Pragma", "no-cache")
+                    .GET().build()
+                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+                if (res.statusCode() == 200 && res.body().contains("accounts")) {
+                    val remoteVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
+                    mergeCloudVault(remoteVault)
+                    cloudSyncStatus = "CLOUD SYNCED ☁"
+                }
+            } catch (e: Exception) {}
+        }
+    }
+
+    // Sube automáticamente la nueva cuenta o recuerdo a todas las vías (P2P + Cloud DB + Git Push silencioso)
+    fun pushVaultEverywhereAsync(commitReason: String = "sync: actualizacion de cuenta en la nube") {
+        saveLocalVaultCache()
+        pushToAllPeerDevicesAsync()
+        pushToRealtimeCloudDbAsync()
+
+        // Subir también a GitHub en segundo plano para que otra PC fuera de casa lo reciba sin intervención manual
+        thread(isDaemon = true) {
+            try {
+                val workingDir = File(System.getProperty("user.dir"))
+                if (File(workingDir, ".git").exists() || File(workingDir.parentFile, ".git").exists()) {
+                    ProcessBuilder("git", "add", "daemon_cloud_vault.json").directory(workingDir).start().waitFor()
+                    ProcessBuilder("git", "commit", "-m", commitReason).directory(workingDir).start().waitFor()
+                    ProcessBuilder("git", "push", "origin", "main").directory(workingDir).start().waitFor()
+                }
+            } catch (e: Exception) {}
+        }
+    }
+
+    private fun checkOtaBinaryUpdate() {
+        val rawBase = otaManifest.githubRawBaseUrl.trimEnd('/')
+        if (rawBase.isBlank()) return
+        try {
+            val manifestUrl = "$rawBase/daemon_ota_manifest.json?nocache=${System.currentTimeMillis()}"
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create(manifestUrl))
+                .timeout(Duration.ofSeconds(4))
+                .header("Cache-Control", "no-cache")
+                .GET().build()
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() == 200 && res.body().contains("appVersion")) {
+                val remoteManifest = objectMapper.readValue(res.body(), OtaManifest::class.java)
+                if (remoteManifest.sharedCloudDbUrl.isNotBlank() && remoteManifest.sharedCloudDbUrl != otaManifest.sharedCloudDbUrl) {
+                    otaManifest.sharedCloudDbUrl = remoteManifest.sharedCloudDbUrl
+                    saveOtaManifest()
+                    pullFromRealtimeCloudDb()
+                }
+                if (remoteManifest.appVersion > otaManifest.appVersion) {
+                    otaStatusText = "⬇ ACTUALIZANDO A v${remoteManifest.versionName}..."
+                    onSessionOrVaultChanged?.invoke()
+                    downloadAndApplyNewJarUpdate(rawBase, remoteManifest)
+                } else {
+                    otaStatusText = "v${otaManifest.versionName} AL DÍA ✓"
+                }
+            }
+        } catch (e: Exception) {}
+    }
+
     private fun downloadAndApplyNewJarUpdate(rawBase: String, remoteManifest: OtaManifest): Boolean {
         return try {
             val jarUrl = "$rawBase/${remoteManifest.jarRelativePath.trimStart('/')}?t=${System.currentTimeMillis()}"
             val workingDir = File(System.getProperty("user.dir"))
-
-            // Detectar cuál es el archivo .jar que está corriendo actualmente
             val currentJar = File(workingDir, remoteManifest.jarRelativePath).let {
                 if (it.exists()) it else File(workingDir, "daemon.jar")
             }
             val tempJar = File(workingDir, "daemon_update_temp.jar")
 
-            val req = HttpRequest.newBuilder()
-                .uri(URI.create(jarUrl))
-                .timeout(Duration.ofSeconds(60))
-                .GET()
-                .build()
+            val req = HttpRequest.newBuilder().uri(URI.create(jarUrl)).timeout(Duration.ofSeconds(60)).GET().build()
             val res = httpClient.send(req, HttpResponse.BodyHandlers.ofByteArray())
 
-            // Verificar que el archivo descargado sea un ejecutable .jar válido (> 100 KB)
             if (res.statusCode() == 200 && res.body().size > 100000) {
                 tempJar.writeBytes(res.body())
-
                 otaManifest = remoteManifest
                 saveOtaManifest()
                 localSession.installedAppVersion = remoteManifest.appVersion
@@ -389,7 +550,6 @@ class CloudVaultService {
                 val javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + (if (isWin) "javaw.exe" else "java")
 
                 if (isWin) {
-                    // En Windows: Script Swapper que espera a que se cierre el proceso actual, reemplaza el .jar y lo relanza
                     val updaterBat = File(workingDir, "daemon_swapper.bat")
                     val batContent = """
                         @echo off
@@ -400,7 +560,6 @@ class CloudVaultService {
                     """.trimIndent()
                     updaterBat.writeText(batContent, StandardCharsets.ISO_8859_1)
 
-                    // Ejecutar el swapper de forma 100% invisible (sin ventana negra)
                     val vbsSwapper = File(workingDir, "run_swapper.vbs")
                     vbsSwapper.writeText(
                         "CreateObject(\"WScript.Shell\").Run \"\"\"${updaterBat.absolutePath}\"\"\", 0, False",
@@ -408,7 +567,6 @@ class CloudVaultService {
                     )
                     ProcessBuilder("wscript.exe", vbsSwapper.absolutePath).directory(workingDir).start()
                 } else {
-                    // En macOS / Linux: Script Swapper en Bash
                     val updaterSh = File(workingDir, "daemon_swapper.sh")
                     val shContent = """
                         #!/bin/bash
@@ -422,18 +580,15 @@ class CloudVaultService {
                     ProcessBuilder("/bin/bash", updaterSh.absolutePath).directory(workingDir).start()
                 }
 
-                // Cerrar la instancia vieja inmediatamente para que el Swapper reemplace el archivo y abra la nueva
                 Thread.sleep(300)
                 System.exit(0)
                 true
             } else {
                 otaManifest = remoteManifest
                 saveOtaManifest()
-                otaStatusText = "v${otaManifest.versionName} SYNC ✓"
                 false
             }
         } catch (e: Exception) {
-            println("[DAEMON OTA ERROR] ${e.message}")
             false
         }
     }
@@ -453,15 +608,14 @@ class CloudVaultService {
         }
     }
 
-    fun pushToCloudAsync() {
-        saveLocalVaultCache()
+    private fun pushToRealtimeCloudDbAsync() {
         val url = resolveRealtimeCloudUrl() ?: return
         thread(isDaemon = true) {
             try {
                 val json = objectMapper.writeValueAsString(vault)
                 val req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(6))
+                    .timeout(Duration.ofSeconds(5))
                     .header("Content-Type", "application/json")
                     .PUT(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
                     .build()
@@ -476,7 +630,11 @@ class CloudVaultService {
     fun pullFromRealtimeCloudDb(): Boolean {
         val url = resolveRealtimeCloudUrl() ?: return false
         return try {
-            val req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(5)).GET().build()
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create("$url?nocache=${System.currentTimeMillis()}"))
+                .timeout(Duration.ofSeconds(4))
+                .header("Cache-Control", "no-cache")
+                .GET().build()
             val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
             if (res.statusCode() == 200 && res.body().isNotBlank() && res.body().trim() != "null") {
                 val remoteVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
@@ -484,7 +642,7 @@ class CloudVaultService {
                 cloudSyncStatus = "LIVE CLOUD ☁"
                 true
             } else {
-                pushToCloudAsync()
+                pushToRealtimeCloudDbAsync()
                 true
             }
         } catch (e: Exception) {
@@ -492,14 +650,19 @@ class CloudVaultService {
         }
     }
 
+    // Fusiona cuentas de forma aditiva: cualquier cuenta creada en Windows se agrega en Mac al instante
     @Synchronized
-    fun mergeCloudVault(remote: CloudVaultState) {
+    fun mergeCloudVault(remote: CloudVaultState, saveToDisk: Boolean = true): Boolean {
+        var changed = false
+
         for (rNode in remote.globalKnowledge) {
             val idx = vault.globalKnowledge.indexOfFirst { it.tag.equals(rNode.tag, true) }
             if (idx < 0) {
                 vault.globalKnowledge.add(rNode)
-            } else if (remote.lastUpdated >= vault.lastUpdated) {
+                changed = true
+            } else if (remote.lastUpdated > vault.lastUpdated) {
                 vault.globalKnowledge[idx] = rNode
+                changed = true
             }
         }
 
@@ -508,31 +671,44 @@ class CloudVaultService {
             if (localIdx < 0) {
                 rAcc.role = if (rAcc.username.equals("cristian", true)) "ADMIN" else "USER"
                 vault.accounts.add(rAcc)
+                changed = true
             } else {
                 val localAcc = vault.accounts[localIdx]
-                if (rAcc.updatedAt >= localAcc.updatedAt) {
-                    val mergedFacts = (localAcc.personalFacts + rAcc.personalFacts).distinct().toMutableList()
-                    val mergedKnow = (localAcc.personalKnowledge + rAcc.personalKnowledge).distinctBy { it.tag }.toMutableList()
-                    vault.accounts[localIdx] = rAcc.copy(
-                        role = if (rAcc.username.equals("cristian", true)) "ADMIN" else "USER",
-                        personalFacts = mergedFacts,
-                        personalKnowledge = mergedKnow
-                    )
+                val mergedFacts = (localAcc.personalFacts + rAcc.personalFacts).distinct().toMutableList()
+                val mergedKnow = (localAcc.personalKnowledge + rAcc.personalKnowledge).distinctBy { it.tag }.toMutableList()
+                val mergedModes = if (rAcc.updatedAt > localAcc.updatedAt && rAcc.personalModes.isNotEmpty()) rAcc.personalModes else localAcc.personalModes
+                val newPassHash = if (rAcc.updatedAt >= localAcc.updatedAt && rAcc.passwordHash.isNotBlank()) rAcc.passwordHash else localAcc.passwordHash
+
+                if (mergedFacts.size != localAcc.personalFacts.size || mergedKnow.size != localAcc.personalKnowledge.size || newPassHash != localAcc.passwordHash) {
+                    changed = true
                 }
+
+                vault.accounts[localIdx] = localAcc.copy(
+                    passwordHash = newPassHash,
+                    role = if (rAcc.username.equals("cristian", true)) "ADMIN" else "USER",
+                    personalFacts = mergedFacts,
+                    personalKnowledge = mergedKnow,
+                    personalModes = mergedModes,
+                    updatedAt = maxOf(localAcc.updatedAt, rAcc.updatedAt)
+                )
             }
         }
-        objectMapper.writeValue(vaultCacheFile, vault)
+
+        if (changed && saveToDisk) {
+            objectMapper.writeValue(vaultCacheFile, vault)
+        }
+        return changed
     }
 
     // ========================================================================
-    // AUTENTICACIÓN ESTRICTA (SOLO CRISTIAN PUEDE SER ADMIN)
+    // AUTENTICACIÓN CON RECARGA EN CALIENTE (SIN CERRAR EL PROGRAMA)
     // ========================================================================
     fun getCurrentAccount(): UserAccount {
+        reloadVaultFromDiskIfNewer()
         val acc = vault.accounts.firstOrNull { it.username.equals(localSession.loggedUsername, true) }
         if (acc != null && acc.passwordHash == localSession.loggedPasswordHash) {
             return acc
         }
-        // Si la sesión no es válida, regresa a "invitado" (SIN permisos de Admin)
         return vault.accounts.firstOrNull { it.username.equals("invitado", true) } ?: vault.accounts.last()
     }
 
@@ -542,17 +718,18 @@ class CloudVaultService {
     }
 
     fun loginUser(username: String, plainPassword: String): Pair<Boolean, String> {
-        pullFromRealtimeCloudDb()
+        // Antes de verificar si el usuario existe, sincronizar en caliente con la otra PC / Nube / Git
+        syncAllChannelsNow(silent = true)
+
         val cleanUser = username.trim().lowercase()
         val acc = vault.accounts.firstOrNull { it.username.equals(cleanUser, true) }
-            ?: return Pair(false, "La cuenta '$cleanUser' no existe. Usa el botón CREAR CUENTA.")
+            ?: return Pair(false, "No se encontró '$cleanUser'. Cuentas detectadas: ${vault.accounts.joinToString(", ") { it.username }}.")
 
         val inputHash = sha256(plainPassword)
         if (acc.passwordHash != inputHash && acc.passwordHash != plainPassword.trim()) {
             return Pair(false, "Clave de acceso incorrecta para '$cleanUser'.")
         }
 
-        // Actualizar a hash seguro si estaba en texto plano
         acc.passwordHash = inputHash
         localSession.loggedUsername = acc.username
         localSession.loggedPasswordHash = inputHash
@@ -568,16 +745,17 @@ class CloudVaultService {
         localSession.loggedPasswordHash = sha256("invitado")
         savePrivateMachineSession()
         onSessionOrVaultChanged?.invoke()
-        return "Sesión cerrada. Modo Invitado activo (Panel de Administrador bloqueado y oculto)."
+        return "Sesión cerrada. Modo Invitado activo (Panel de Administrador oculto)."
     }
 
     fun registerNewUser(username: String, plainPassword: String): Pair<Boolean, String> {
-        pullFromRealtimeCloudDb()
+        syncAllChannelsNow(silent = true)
+
         val cleanUser = username.trim().lowercase().replace(Regex("[^a-z0-9_]"), "")
         if (cleanUser.length < 3) return Pair(false, "El usuario debe tener mínimo 3 letras o números.")
         if (cleanUser == "cristian") return Pair(false, "El usuario 'cristian' está reservado para el Administrador.")
         if (vault.accounts.any { it.username.equals(cleanUser, true) }) {
-            return Pair(false, "El usuario '$cleanUser' ya existe. Inicia sesión con tu clave.")
+            return Pair(false, "El usuario '$cleanUser' ya existe. Solo inicia sesión con su clave.")
         }
         if (plainPassword.trim().length < 3) return Pair(false, "La clave debe tener al menos 3 caracteres.")
 
@@ -585,7 +763,7 @@ class CloudVaultService {
         val newAcc = UserAccount(
             username = cleanUser,
             passwordHash = passHash,
-            role = "USER", // Los usuarios registrados NUNCA son ADMIN
+            role = "USER",
             personalFacts = mutableListOf("Cuenta personal en la nube de $cleanUser."),
             personalKnowledge = mutableListOf(),
             personalModes = buildDefaultModesForUser(cleanUser),
@@ -596,10 +774,12 @@ class CloudVaultService {
         localSession.loggedUsername = newAcc.username
         localSession.loggedPasswordHash = passHash
         savePrivateMachineSession()
-        pushToCloudAsync()
+
+        // Propagar inmediatamente la nueva cuenta a tu Mac / Windows / Cloud / GitHub
+        pushVaultEverywhereAsync("feat(cloud): nueva cuenta registrada ($cleanUser)")
         onSessionOrVaultChanged?.invoke()
 
-        return Pair(true, "Cuenta '${newAcc.username.uppercase()}' creada y sincronizada en la nube.")
+        return Pair(true, "Cuenta '${newAcc.username.uppercase()}' creada y transmitida en vivo a todos tus dispositivos.")
     }
 
     fun addPersonalFactToCurrentUser(fact: String): String {
@@ -607,9 +787,9 @@ class CloudVaultService {
         if (!acc.personalFacts.contains(fact)) {
             acc.personalFacts.add(fact)
             acc.updatedAt = System.currentTimeMillis()
-            pushToCloudAsync()
+            pushVaultEverywhereAsync("sync: nuevo recuerdo de ${acc.username}")
         }
-        return "Guardado en la nube de '${acc.username.uppercase()}': '$fact'."
+        return "Guardado y sincronizado en la cuenta de '${acc.username.uppercase()}': '$fact'."
     }
 
     fun addPersonalKnowledgeToCurrentUser(tag: String, patterns: List<String>, response: String): String {
@@ -617,19 +797,16 @@ class CloudVaultService {
         acc.personalKnowledge.removeIf { it.tag.equals(tag, true) }
         acc.personalKnowledge.add(IntentNode(tag = tag, patterns = patterns, responses = listOf(response)))
         acc.updatedAt = System.currentTimeMillis()
-        pushToCloudAsync()
-        return "Conocimiento guardado en la cuenta de '${acc.username.uppercase()}'."
+        pushVaultEverywhereAsync("sync: nuevo nodo de conocimiento de ${acc.username}")
+        return "Conocimiento sincronizado en la cuenta de '${acc.username.uppercase()}'."
     }
 
-    // ========================================================================
-    // ACCIONES EXCLUSIVAS DEL ADMINISTRADOR (PUBLICAR UPDATES OTA Y CONOCIMIENTO)
-    // ========================================================================
     fun adminAddGlobalKnowledge(tag: String, patterns: List<String>, response: String): String {
         if (!isAdminLoggedIn()) return "⛔ Acceso denegado. Exclusivo para el Administrador (Cristian)."
         vault.globalKnowledge.removeIf { it.tag.equals(tag, true) }
         vault.globalKnowledge.add(IntentNode(tag = tag, patterns = patterns, responses = listOf(response)))
-        pushToCloudAsync()
-        return "👑 [ADMIN] Conocimiento global '$tag' inyectado. Se distribuirá automáticamente a todos los dispositivos."
+        pushVaultEverywhereAsync("feat(admin): nuevo conocimiento global $tag")
+        return "👑 [ADMIN] Conocimiento global '$tag' inyectado y transmitido en vivo a todos los dispositivos."
     }
 
     fun adminConfigureCloudAndRepo(cloudDbUrl: String, githubRawUrl: String): String {
@@ -637,12 +814,11 @@ class CloudVaultService {
         if (cloudDbUrl.isNotBlank()) otaManifest.sharedCloudDbUrl = cloudDbUrl.trim()
         if (githubRawUrl.isNotBlank()) otaManifest.githubRawBaseUrl = githubRawUrl.trim().trimEnd('/')
         saveOtaManifest()
-        pullFromRealtimeCloudDb()
-        pushToCloudAsync()
-        return "👑 [ADMIN] Enlaces maestros guardados en daemon_ota_manifest.json. Ninguna otra PC tendrá que configurarlos manualmente."
+        syncAllChannelsNow(silent = true)
+        pushVaultEverywhereAsync("admin: actualizacion de enlaces cloud")
+        return "👑 [ADMIN] Configuración sincronizada en todos tus equipos."
     }
 
-    // Compila los cambios de código (.kt -> .jar), incrementa la versión OTA y la publica en GitHub para todas las PCs
     fun adminPublishOtaUpdateToAllDevices(): String {
         if (!isAdminLoggedIn()) return "⛔ Solo Cristian puede publicar actualizaciones globales."
 
@@ -654,7 +830,8 @@ class CloudVaultService {
 
         saveOtaManifest()
         saveLocalVaultCache()
-        pushToCloudAsync()
+        pushToAllPeerDevicesAsync()
+        pushToRealtimeCloudDbAsync()
 
         otaStatusText = "⚙ COMPILANDO UPDATE v${otaManifest.versionName}..."
         onSessionOrVaultChanged?.invoke()
@@ -664,20 +841,17 @@ class CloudVaultService {
                 val workingDir = File(System.getProperty("user.dir"))
                 val isWin = System.getProperty("os.name").lowercase().contains("win")
 
-                // 1. Si estamos en la PC de desarrollo de Cristian (existe gradlew), compilar el nuevo .jar con los cambios de código
                 val gradleWrapper = File(workingDir, if (isWin) "gradlew.bat" else "gradlew")
                 if (gradleWrapper.exists()) {
                     val buildCmd = if (isWin) listOf("cmd", "/c", "gradlew.bat", "bootJar") else listOf("./gradlew", "bootJar")
                     ProcessBuilder(buildCmd).directory(workingDir).start().waitFor()
                 }
 
-                // 2. Copiar también una copia limpia en la raíz como daemon.jar para instalaciones portables
                 val builtJar = File(workingDir, otaManifest.jarRelativePath)
                 if (builtJar.exists()) {
                     builtJar.copyTo(File(workingDir, "daemon.jar"), overwrite = true)
                 }
 
-                // 3. Subir el manifiesto con la nueva versión, la base de datos y el nuevo ejecutable .jar a GitHub
                 otaStatusText = "☁ SUBIENDO UPDATE v${otaManifest.versionName}..."
                 onSessionOrVaultChanged?.invoke()
 
@@ -698,7 +872,7 @@ class CloudVaultService {
             }
         }
 
-        return "👑 [DESPLIEGUE OTA v${otaManifest.versionName}] Compilando tu código nuevo y subiendo el binario actualizado a GitHub. En unos segundos todas las PCs conectadas se descargarán e instalarán la versión ${otaManifest.versionName} solas."
+        return "👑 [DESPLIEGUE OTA v${otaManifest.versionName}] Compilando tu código nuevo y subiendo el binario actualizado a GitHub."
     }
 
     fun findKnowledgeMatch(normalizedInput: String): String? {
@@ -766,7 +940,7 @@ class CloudVaultService {
         IntentNode(
             tag = "global_identidad",
             patterns = listOf("quien eres", "que es daemon", "como funcionas"),
-            responses = listOf("Soy Daemon v12.0, un sistema operativo de inteligencia artificial con auto-actualización OTA en la nube y memoria por cuenta de usuario, creado por Cristian Alexis.")
+            responses = listOf("Soy Daemon v12.5, un sistema operativo de inteligencia artificial con sincronización en vivo entre dispositivos y auto-actualización OTA, creado por Cristian Alexis.")
         ),
         IntentNode(
             tag = "global_proceso_hilo",
@@ -1334,8 +1508,8 @@ class SystemScanner(
         acc.personalModes.removeIf { it.id == cleanId }
         acc.personalModes.add(newMode)
         acc.updatedAt = System.currentTimeMillis()
-        cloudVault.pushToCloudAsync()
-        return "Modo '$cleanId' guardado en la cuenta en la nube de '${acc.username.uppercase()}'."
+        cloudVault.pushVaultEverywhereAsync("sync: nuevo modo personalizado de ${acc.username}")
+        return "Modo '$cleanId' guardado y sincronizado en la cuenta de '${acc.username.uppercase()}'."
     }
 
     fun scanInstalledApplications(): Int {
@@ -1779,8 +1953,8 @@ class DaemonBrain(
         startContinuousWakeWordEar()
         val acc = cloudVault.getCurrentAccount()
         speakAndDisplay(
-            "NÚCLEO OTA v12.0",
-            "Daemon activo sobre ${systemScanner.getOSLabel()}. Cuenta actual: ${acc.username.uppercase()}."
+            "NÚCLEO LIVE v12.5",
+            "Daemon activo sobre ${systemScanner.getOSLabel()}. Sincronización en vivo entre dispositivos activada."
         )
     }
 
@@ -1922,7 +2096,6 @@ class DaemonBrain(
             normalized = normalized.replace(Regex("""^(?:oye\s+|hola\s+)?$w\b\s*"""), "").trim()
         }
 
-        // 1. INICIAR SESIÓN / REGISTRAR / CERRAR SESIÓN POR COMANDO
         val loginRegex = Regex("""^(?:iniciar\s+sesion|inicia\s+sesion|login|entrar\s+como)\s+(?:como\s+)?([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
         loginRegex.find(input)?.let { m ->
             val res = cloudVault.loginUser(m.groupValues[1], m.groupValues[2])
@@ -1939,15 +2112,14 @@ class DaemonBrain(
             return cloudVault.logoutToGuest()
         }
 
-        if (normalized in setOf("buscar actualizaciones", "actualiza daemon", "sincronizar nube", "sync")) {
-            return cloudVault.checkForUpdatesAndSyncNow(silent = false)
+        if (normalized in setOf("buscar actualizaciones", "actualiza daemon", "sincronizar nube", "sync", "sincronizar cuentas")) {
+            return cloudVault.syncAllChannelsNow(silent = false)
         }
 
         if (normalized in setOf("publicar actualizacion", "subir update", "admin publicar update")) {
             return cloudVault.adminPublishOtaUpdateToAllDevices()
         }
 
-        // 2. APRENDIZAJE PERSONAL EN LA NUBE (LIGADO A LA CUENTA ACTIVA)
         if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ") || normalized.startsWith("memoriza que ")) {
             val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
             return recordAndReturn(input, cloudVault.addPersonalFactToCurrentUser(fact))
@@ -1963,7 +2135,6 @@ class DaemonBrain(
             }
         }
 
-        // 3. MODOS DE TRABAJO DEL USUARIO ACTIVO
         val currentAcc = cloudVault.getCurrentAccount()
         val activeModes = if (currentAcc.personalModes.isNotEmpty()) currentAcc.personalModes else cloudVault.buildDefaultModesForUser(currentAcc.username)
 
@@ -1984,7 +2155,6 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.createCustomModeForCurrentUser(modeName, apps))
         }
 
-        // 4. CONTROL DE VENTANAS, OPERA GX, VIDEO Y SPOTIFY
         if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
             starkHud?.setOrbMode(false)
             return recordAndReturn(input, "Desplegando el panel completo.")
@@ -2096,12 +2266,10 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.closeAppByName(normalized))
         }
 
-        // 5. BASE DE CONOCIMIENTO EN LA NUBE (PERSONAL + GLOBAL DEL ADMIN)
         cloudVault.findKnowledgeMatch(normalized)?.let { exactNodeReply ->
             return recordAndReturn(input, exactNodeReply)
         }
 
-        // 6. CÓRTEX CONVERSACIONAL CON LA MEMORIA EN LA NUBE DEL USUARIO ACTIVO
         if (isOllamaOnline) {
             generateOllamaConversationalResponse(input)?.let { reply ->
                 return recordAndReturn(input, reply)
@@ -2123,7 +2291,7 @@ class DaemonBrain(
             cloudVault.vault.globalKnowledge.take(15).joinToString("\n") { "- ${it.tag}: ${it.responses.firstOrNull() ?: ""}" }
 
         return """
-            Eres Daemon (v12.0), un asistente de inteligencia artificial estilo J.A.R.V.I.S. con auto-actualización OTA y memoria en la nube, creado por Cristian Alexis.
+            Eres Daemon (v12.5), un asistente de inteligencia artificial estilo J.A.R.V.I.S. con sincronización en vivo entre dispositivos, creado por Cristian Alexis.
             Estás atendiendo a la cuenta: ${acc.username.uppercase()} (Rol: ${acc.role}) en un dispositivo ${systemScanner.getOSLabel()}.
             Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
@@ -2201,7 +2369,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkOTA/12.0")
+                .header("User-Agent", "DaemonStarkOTA/12.5")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -2251,7 +2419,7 @@ class DaemonBrain(
             }
         }
         acc.updatedAt = System.currentTimeMillis()
-        cloudVault.pushToCloudAsync()
+        cloudVault.pushVaultEverywhereAsync("sync: historial de conversacion")
         return daemonReply
     }
 
@@ -2312,7 +2480,7 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 4. INTERFAZ PRINCIPAL + VENTANAS HOLOGRÁFICAS ANIMADAS (CUENTAS Y ADMIN)
+// 4. INTERFAZ PRINCIPAL + VENTANAS HOLOGRÁFICAS ANIMADAS CON RECARGA EN VIVO
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
@@ -2341,7 +2509,6 @@ class StarkHologramHUD(
     private val hudCanvas = HolographicChassisPanel()
     private val fullHudContent = JPanel(BorderLayout(12, 8))
 
-    // El botón ADMIN permanece OCULTO para todos los usuarios excepto cuando Cristian inicia sesión
     private lateinit var adminHoloBtn: JComponent
 
     init {
@@ -2364,14 +2531,13 @@ class StarkHologramHUD(
         hudCanvas.isOpaque = true
         hudCanvas.background = bgSpaceDark
 
-        // 1. CABECERA POLIGONAL CON VISIBILIDAD ESTRICTA DE ADMIN
         val headerBar = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = EmptyBorder(2, 6, 6, 6)
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON OTA v12.0").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON LIVE v12.5").apply {
                     foreground = neonCyan
                     font = Font("Monospaced", Font.BOLD, 13)
                 }
@@ -2390,7 +2556,6 @@ class StarkHologramHUD(
                 val orbBtn = createHoloButton("◉ NÚCLEO", neonCyan, 82) { setOrbMode(true) }
                 val closeBtn = createHoloButton("✕", neonCrimson, 28) { System.exit(0) }
 
-                // Solo visible si la sesión verificada en esta PC es "cristian"
                 adminHoloBtn.isVisible = cloudVault.isAdminLoggedIn()
 
                 add(accountBtn)
@@ -2411,7 +2576,6 @@ class StarkHologramHUD(
             }
         }
 
-        // 2. ALAS LATERALES DEL PANEL COMPLETO
         val centerDeck = JPanel(BorderLayout(10, 0)).apply {
             isOpaque = false
 
@@ -2436,7 +2600,7 @@ class StarkHologramHUD(
                 preferredSize = Dimension(150, 220)
                 border = EmptyBorder(12, 2, 12, 2)
 
-                val lbl = JLabel("◣ SPOTIFY & OTA").apply {
+                val lbl = JLabel("◣ SPOTIFY & SYNC").apply {
                     foreground = starkGold
                     font = Font("Monospaced", Font.BOLD, 11)
                     horizontalAlignment = SwingConstants.RIGHT
@@ -2445,14 +2609,13 @@ class StarkHologramHUD(
                 add(createHoloButton("▶ PLAY SPOTIFY", neonEmerald, 145) { runQuickCommand("dale play") })
                 add(createHoloButton("⏸ PAUSA SPOTIFY", starkGold, 145) { runQuickCommand("pausa") })
                 add(createHoloButton("⏭ SIGUIENTE", neonCyan, 145) { runQuickCommand("siguiente cancion") })
-                add(createHoloButton("🔄 BUSCAR UPDATE", Color(160, 140, 255), 145) { runQuickCommand("buscar actualizaciones") })
+                add(createHoloButton("🔄 SYNC CUENTAS", Color(160, 140, 255), 145) { runQuickCommand("sincronizar cuentas") })
             }
 
             add(leftWing, BorderLayout.WEST)
             add(rightWing, BorderLayout.EAST)
         }
 
-        // 3. CONSOLA INFERIOR
         val bottomDeck = JPanel(BorderLayout(0, 8)).apply {
             isOpaque = false
             border = EmptyBorder(4, 6, 2, 6)
@@ -2574,22 +2737,31 @@ class StarkHologramHUD(
     }
 
     // ========================================================================
-    // VENTANA HOLOGRÁFICA ANIMADA 1: PORTAL DE CUENTAS E IDENTIDAD STARK
+    // PORTAL HOLOGRÁFICO DE CUENTAS CON SINCRONIZACIÓN EN CALIENTE AL ABRIRSE
     // ========================================================================
     private fun openAnimatedAccountHoloModal() {
         val modal = StarkAnimatedHoloModal(
             parent = this,
             title = "◢ STARK IDENTITY // PORTAL DE CUENTAS CLOUD",
-            subtitle = "AUTENTICACIÓN BIOMÉTRICA Y SINCRONIZACIÓN MULTI-DISPOSITIVO",
+            subtitle = "SINCRONIZACIÓN EN TIEMPO REAL WINDOWS <-> MAC <-> CLOUD",
             accentColor = neonCyan,
-            widthPx = 500,
-            heightPx = 410
+            widthPx = 540,
+            heightPx = 435
         )
 
         val currentAcc = cloudVault.getCurrentAccount()
         val body = JPanel(GridLayout(6, 1, 0, 8)).apply {
             isOpaque = false
             border = EmptyBorder(8, 18, 8, 18)
+        }
+
+        val l1 = JLabel("SESIÓN ACTIVA: ${currentAcc.username.uppercase()} [${currentAcc.role}]").apply {
+            foreground = neonEmerald
+            font = Font("Monospaced", Font.BOLD, 12)
+        }
+        val l2 = JLabel("CUENTAS SINCRONIZADAS: ${cloudVault.vault.accounts.joinToString(" | ") { it.username.uppercase() }}").apply {
+            foreground = Color(180, 235, 255)
+            font = Font("Monospaced", Font.PLAIN, 10)
         }
 
         val badgePanel = JPanel(GridLayout(2, 1)).apply {
@@ -2599,14 +2771,6 @@ class StarkHologramHUD(
                 BorderFactory.createLineBorder(neonEmerald, 1),
                 EmptyBorder(6, 12, 6, 12)
             )
-            val l1 = JLabel("SESIÓN ACTIVA: ${currentAcc.username.uppercase()} [${currentAcc.role}]").apply {
-                foreground = neonEmerald
-                font = Font("Monospaced", Font.BOLD, 12)
-            }
-            val l2 = JLabel("RECUERDOS EN LA NUBE: ${currentAcc.personalFacts.size}  |  ESTADO: ${cloudVault.cloudSyncStatus}").apply {
-                foreground = Color(180, 235, 255)
-                font = Font("Monospaced", Font.PLAIN, 10)
-            }
             add(l1)
             add(l2)
         }
@@ -2614,35 +2778,57 @@ class StarkHologramHUD(
         val userField = createStarkTextField(if (currentAcc.username == "invitado") "" else currentAcc.username)
         val passField = createStarkPasswordField()
 
-        val feedbackLabel = JLabel("Ingresa tus credenciales para sincronizar tu cuenta o regístrate.").apply {
+        val feedbackLabel = JLabel("Sincronizando cuentas con tus otros dispositivos...").apply {
             foreground = starkGold
             font = Font("Monospaced", Font.BOLD, 11)
         }
 
-        val actionsRow = JPanel(FlowLayout(FlowLayout.CENTER, 10, 2)).apply {
+        // Sincronizar en caliente en cuanto se abre el modal para detectar cuentas creadas en otra PC sin reiniciar
+        thread {
+            cloudVault.syncAllChannelsNow(silent = true)
+            SwingUtilities.invokeLater {
+                l2.text = "CUENTAS SINCRONIZADAS: ${cloudVault.vault.accounts.joinToString(" | ") { it.username.uppercase() }}"
+                feedbackLabel.text = "Bóveda actualizada en vivo (${cloudVault.vault.accounts.size} cuentas disponibles)."
+            }
+        }
+
+        val actionsRow = JPanel(FlowLayout(FlowLayout.CENTER, 8, 2)).apply {
             isOpaque = false
-            val loginBtn = createHoloButton("⚡ INICIAR SESIÓN", neonCyan, 142) {
+            val loginBtn = createHoloButton("⚡ INICIAR SESIÓN", neonCyan, 134) {
                 val u = userField.text.trim()
                 val p = String(passField.password)
                 val (ok, msg) = cloudVault.loginUser(u, p)
+                l2.text = "CUENTAS SINCRONIZADAS: ${cloudVault.vault.accounts.joinToString(" | ") { it.username.uppercase() }}"
                 feedbackLabel.foreground = if (ok) neonEmerald else neonCrimson
-                feedbackLabel.text = msg.take(64)
+                feedbackLabel.text = msg.take(66)
                 brain.speakAndDisplay("CUENTA CLOUD", msg)
                 if (ok) {
                     adminHoloBtn.isVisible = cloudVault.isAdminLoggedIn()
                     modal.dispose()
                 }
             }
-            val regBtn = createHoloButton("✨ CREAR CUENTA", neonEmerald, 138) {
+            val regBtn = createHoloButton("✨ CREAR CUENTA", neonEmerald, 128) {
                 val u = userField.text.trim()
                 val p = String(passField.password)
                 val (ok, msg) = cloudVault.registerNewUser(u, p)
+                l2.text = "CUENTAS SINCRONIZADAS: ${cloudVault.vault.accounts.joinToString(" | ") { it.username.uppercase() }}"
                 feedbackLabel.foreground = if (ok) neonEmerald else neonCrimson
-                feedbackLabel.text = msg.take(64)
+                feedbackLabel.text = msg.take(66)
                 brain.speakAndDisplay("NUEVA CUENTA", msg)
                 if (ok) modal.dispose()
             }
-            val logoutBtn = createHoloButton("🚪 SALIR", neonCrimson, 86) {
+            val syncBtn = createHoloButton("🔄 SYNC", starkGold, 76) {
+                feedbackLabel.text = "Sincronizando con Windows / Mac / Cloud..."
+                thread {
+                    val msg = cloudVault.syncAllChannelsNow(silent = false)
+                    SwingUtilities.invokeLater {
+                        l2.text = "CUENTAS SINCRONIZADAS: ${cloudVault.vault.accounts.joinToString(" | ") { it.username.uppercase() }}"
+                        feedbackLabel.foreground = neonEmerald
+                        feedbackLabel.text = msg.take(66)
+                    }
+                }
+            }
+            val logoutBtn = createHoloButton("🚪 SALIR", neonCrimson, 76) {
                 val msg = cloudVault.logoutToGuest()
                 adminHoloBtn.isVisible = false
                 brain.speakAndDisplay("SESIÓN CERRADA", msg)
@@ -2650,11 +2836,12 @@ class StarkHologramHUD(
             }
             add(loginBtn)
             add(regBtn)
+            add(syncBtn)
             add(logoutBtn)
         }
 
         body.add(badgePanel)
-        body.add(createLabeledInputBox("IDENTIFICADOR DE USUARIO (EJ: CRISTIAN / USUARIO):", userField, neonCyan))
+        body.add(createLabeledInputBox("IDENTIFICADOR DE USUARIO (EJ: CRISTIAN / NUEVO USUARIO):", userField, neonCyan))
         body.add(createLabeledInputBox("CLAVE CRIPTOGRÁFICA DE ACCESO (SHA-256):", passField, neonCyan))
         body.add(feedbackLabel)
         body.add(actionsRow)
@@ -2664,7 +2851,7 @@ class StarkHologramHUD(
     }
 
     // ========================================================================
-    // VENTANA HOLOGRÁFICA ANIMADA 2: CENTRO DE MANDO ADMIN (EXCLUSIVO CRISTIAN)
+    // CENTRO DE MANDO HOLOGRÁFICO ADMIN (EXCLUSIVO CRISTIAN)
     // ========================================================================
     private fun openAnimatedAdminHoloModal() {
         if (!cloudVault.isAdminLoggedIn()) {
@@ -2686,7 +2873,6 @@ class StarkHologramHUD(
             border = EmptyBorder(6, 18, 10, 18)
         }
 
-        // Panel Superior: Inyección de Conocimiento Global + Configuración OTA
         val formsGrid = JPanel(GridLayout(4, 1, 0, 7)).apply {
             isOpaque = false
         }
@@ -2701,7 +2887,6 @@ class StarkHologramHUD(
         formsGrid.add(createLabeledInputBox("3. URL FIREBASE / CLOUD DB COMPARTIDA (OPCIONAL):", cloudUrlField, neonCyan))
         formsGrid.add(createLabeledInputBox("4. REPOSITORIO OTA RAW (AUTO-DETECTADO DE TU GITHUB):", repoRawField, neonCyan))
 
-        // Monitor en vivo de cuentas registradas y nodos globales
         val telemetryArea = JTextArea().apply {
             isOpaque = true
             background = Color(6, 15, 28)
@@ -2714,7 +2899,6 @@ class StarkHologramHUD(
             text = "NODOS GLOBALES ACTIVOS: ${cloudVault.vault.globalKnowledge.size}  |  VERSIÓN OTA: v${cloudVault.otaManifest.versionName}\nCUENTAS EN LA BÓVEDA: $usersList"
         }
 
-        // Botonera de Acciones Maestras del Administrador
         val adminBtns = JPanel(FlowLayout(FlowLayout.CENTER, 8, 4)).apply {
             isOpaque = false
 
@@ -2797,9 +2981,6 @@ class StarkHologramHUD(
         }
     }
 
-    // ========================================================================
-    // MOTOR DE SUB-VENTANAS HOLOGRÁFICAS CON ESCÁNER LÁSER Y ANILLOS ANIMADOS
-    // ========================================================================
     inner class StarkAnimatedHoloModal(
         parent: JFrame,
         private val title: String,
@@ -2821,19 +3002,16 @@ class StarkHologramHUD(
                 val h = height
                 val cut = 22
 
-                // Rejilla táctica sutil
                 g2.color = Color(0, 40, 65)
                 var gx = 24
                 while (gx < w - 24) { g2.drawLine(gx, 16, gx, h - 16); gx += 32 }
                 var gy = 16
                 while (gy < h - 16) { g2.drawLine(24, gy, w - 24, gy); gy += 32 }
 
-                // Línea de escaneo láser animada que recorre el holograma
                 val scanY = ((sin(animTick) + 1.0) * 0.5 * (h - 30) + 15).toInt()
                 g2.color = Color(accentColor.red / 4, accentColor.green / 4, accentColor.blue / 4)
                 g2.drawLine(10, scanY, w - 10, scanY)
 
-                // Anillo de telemetría giratorio en la esquina superior derecha
                 val rx = w - 75
                 val ry = 14
                 g2.color = accentColor
@@ -2842,7 +3020,6 @@ class StarkHologramHUD(
                 g2.drawArc(rx, ry, 26, 26, a1, 110)
                 g2.drawArc(rx, ry, 26, 26, a1 + 180, 110)
 
-                // Borde exterior y esquinas biseladas Stark
                 g2.color = Color(accentColor.red / 2, accentColor.green / 2, accentColor.blue / 2)
                 g2.stroke = BasicStroke(1.4f)
                 g2.drawRect(2, 2, w - 5, h - 5)
@@ -3132,7 +3309,7 @@ class StarkHologramHUD(
             g2.font = telemetryFont
             g2.color = neonCyan
             g2.drawString("CPU:${scanner.cachedCpuLoad}% RAM:${scanner.cachedRamMb}MB", 184, 76)
-            g2.drawString(cloudVault.otaStatusText, 412, 76)
+            g2.drawString(cloudVault.cloudSyncStatus, 415, 76)
 
             val acc = cloudVault.getCurrentAccount()
             g2.color = if (acc.role == "ADMIN") starkGold else neonEmerald
@@ -3258,7 +3435,10 @@ class DaemonController(
 
     @PutMapping("/cloud-vault")
     fun updateVault(@RequestBody incomingVault: CloudVaultState): CloudVaultState {
-        cloudVault.mergeCloudVault(incomingVault)
+        val changed = cloudVault.mergeCloudVault(incomingVault)
+        if (changed) {
+            cloudVault.onSessionOrVaultChanged?.invoke()
+        }
         return cloudVault.vault
     }
 }
