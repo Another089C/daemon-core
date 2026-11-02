@@ -5,7 +5,7 @@
   "appsToOpen" : [ "vscode", "notion", "opera gx" ],
   "appsToClose" : [ ],
   "spotifyPlaylist" : "mis me gusta",
-  "greeting" : "Activando Modo Trabajo, Cristian. Abriendo Visual Studio Code, Notion, Opera GX y reproduciendo tus canciones de Mis Me Gusta en Spotify."
+  "greeting" : "Activando Modo Trabajo en tu WINDOWS, Cristian. Abriendo Visual Studio Code, Notion, Opera GX y reproduciendo tus canciones de Mis Me Gusta."
 }, {
   "id" : "TAREA",
   "name" : "PROTOCOLO TAREA",
@@ -30,12 +30,4 @@
   "appsToClose" : [ "vscode", "notion" ],
   "spotifyPlaylist" : "mis me gusta",
   "greeting" : "Modo Gaming activo, Cristian. Cerrando aplicaciones de trabajo, abriendo Discord y reproduciendo tu música."
-}, {
-  "id" : "DESCANSO",
-  "name" : "PROTOCOLO DESCANSO",
-  "triggers" : [ "vamos a descansar", "modo descanso", "modo relax", "protocolo descanso", "terminamos de trabajar" ],
-  "appsToOpen" : [ "opera gx" ],
-  "appsToClose" : [ "vscode", "notion" ],
-  "spotifyPlaylist" : "mis me gusta",
-  "greeting" : "Cerrando entorno de trabajo y activando Modo Descanso, Cristian."
 } ]

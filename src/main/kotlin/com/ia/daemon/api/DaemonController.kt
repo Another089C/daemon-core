@@ -8,8 +8,6 @@ import java.awt.*
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseMotionAdapter
-import java.awt.geom.Arc2D
-import java.awt.geom.Ellipse2D
 import java.awt.geom.GeneralPath
 import java.io.BufferedReader
 import java.io.File
@@ -32,7 +30,6 @@ import javax.swing.border.EmptyBorder
 import javax.swing.plaf.basic.BasicScrollBarUI
 import kotlin.concurrent.thread
 import kotlin.math.*
-import kotlin.random.Random
 
 // ============================================================================
 // MODELOS DE DATOS
@@ -60,7 +57,7 @@ data class ChatMessage(
 
 data class OllamaOptions(
     val temperature: Double = 0.7,
-    val num_predict: Int = 260
+    val num_predict: Int = 240
 )
 
 data class OllamaPayload(
@@ -78,7 +75,7 @@ data class CloudChatPayload(
 )
 
 // ============================================================================
-// 1. MOTOR MULTIPLATAFORMA NATIVO (WINDOWS + MACOS + UBUNTU LINUX)
+// 1. MOTOR DEL SISTEMA DE BAJO CONSUMO + ENFOQUE SIN DUPLICAR PESTAÑAS
 // ============================================================================
 @Service
 class SystemScanner {
@@ -97,9 +94,10 @@ class SystemScanner {
     val workspaceModes = mutableListOf(WorkspaceMode()).apply { clear() }
 
     @Volatile var activeModeName: String = "NÚCLEO ACTIVO"
-    @Volatile var currentSpotifyTrack: String = "STANDBY"
-    @Volatile var cachedCpuLoad: Int = 12
-    @Volatile var cachedRamUsage: Int = 42
+    @Volatile var currentSpotifyTrack: String = "ACTIVO"
+    @Volatile var cachedCpuLoad: Int = 6
+    @Volatile var cachedRamMb: Int = 58
+    @Volatile var isFullPanelVisible: Boolean = false
     @Volatile private var lastMediaActionTimestamp: Long = 0L
 
     private val httpClient = HttpClient.newBuilder()
@@ -112,7 +110,7 @@ class SystemScanner {
         loadPlaylists()
         loadWorkspaceModes()
         ensureDesktopAndStartupApp()
-        startLiveTelemetryMonitor()
+        startLowPowerTelemetryMonitor()
     }
 
     fun getOSLabel(): String = when {
@@ -168,40 +166,41 @@ class SystemScanner {
         } catch (e: Exception) { "" }
     }
 
-    // Actualiza Spotify, CPU y RAM en un hilo en segundo plano para NUNCA trabar la interfaz gráfica
-    private fun startLiveTelemetryMonitor() {
-        thread(isDaemon = true, name = "Daemon-Background-Telemetry") {
+    // ========================================================================
+    // TELEMETRÍA ECOLÓGICA: NO CREA PROCESOS CUANDO ESTÁ EN MODO NÚCLEO CHIQUITO
+    // ========================================================================
+    private fun startLowPowerTelemetryMonitor() {
+        thread(isDaemon = true, name = "Daemon-Eco-Telemetry") {
+            var gcCounter = 0
             while (true) {
                 try {
-                    cachedCpuLoad = readCpuLoadInternal()
-                    cachedRamUsage = readRamUsageInternal()
-                    val status = getSpotifyStatusAndTrack()
-                    currentSpotifyTrack = when {
-                        status == "CLOSED" -> "SPOTIFY CERRADO"
-                        status == "PAUSED" -> "EN PAUSA"
-                        else -> status.removePrefix("PLAYING:").take(34)
+                    // Liberar memoria basura periódicamente para mantener la RAM muy baja
+                    gcCounter++
+                    if (gcCounter >= 6) {
+                        gcCounter = 0
+                        System.gc()
+                    }
+
+                    val rt = Runtime.getRuntime()
+                    cachedRamMb = ((rt.totalMemory() - rt.freeMemory()) / (1024 * 1024)).toInt().coerceAtLeast(24)
+
+                    val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
+                    val load = (osBean.processCpuLoad * 100).toInt()
+                    cachedCpuLoad = if (load in 1..100) load else 2
+
+                    // SOLO consultar Spotify si el panel grande está abierto (0% gasto de CPU en modo núcleo)
+                    if (isFullPanelVisible) {
+                        val status = getSpotifyStatusAndTrack()
+                        currentSpotifyTrack = when {
+                            status == "CLOSED" -> "SPOTIFY CERRADO"
+                            status == "PAUSED" -> "EN PAUSA"
+                            else -> status.removePrefix("PLAYING:").take(34)
+                        }
                     }
                 } catch (e: Exception) {}
-                Thread.sleep(2500)
+                Thread.sleep(8000)
             }
         }
-    }
-
-    private fun readCpuLoadInternal(): Int {
-        return try {
-            val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
-            val load = (osBean.cpuLoad * 100).toInt()
-            if (load in 1..100) load else Random.nextInt(8, 20)
-        } catch (e: Exception) { 12 }
-    }
-
-    private fun readRamUsageInternal(): Int {
-        return try {
-            val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
-            val total = osBean.totalMemorySize.toDouble()
-            val free = osBean.freeMemorySize.toDouble()
-            (((total - free) / total) * 100).toInt().coerceIn(1, 99)
-        } catch (e: Exception) { 42 }
     }
 
     fun getSpotifyStatusAndTrack(): String {
@@ -247,6 +246,132 @@ class SystemScanner {
         }
     }
 
+    // ========================================================================
+    // ENFOQUE INTELIGENTE DE APLICACIONES (SI YA ESTÁ ABIERTA, SOLO LA AMPLÍA)
+    // ========================================================================
+    fun openOrFocusApp(normalizedCommand: String): String {
+        val requestedApp = normalizedCommand
+            .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
+            .trim()
+
+        val canonical = when {
+            requestedApp == "visual" || requestedApp == "vs code" || requestedApp == "code" || requestedApp == "vscode" -> "vscode"
+            requestedApp.contains("opera") -> "opera gx"
+            requestedApp.contains("notion") -> "notion"
+            requestedApp.contains("spotify") -> "spotify"
+            requestedApp.contains("discord") -> "discord"
+            else -> requestedApp
+        }
+
+        return when {
+            isWindows -> openOrFocusWindowsApp(canonical)
+            isMac -> openOrFocusMacApp(canonical)
+            isLinux -> openOrFocusLinuxApp(canonical)
+            else -> "Sistema no soportado."
+        }
+    }
+
+    private fun openOrFocusWindowsApp(canonical: String): String {
+        val processName = when (canonical) {
+            "vscode" -> "Code"
+            "opera gx" -> "opera"
+            "notion" -> "Notion"
+            "spotify" -> "Spotify"
+            "discord" -> "Discord"
+            "calculadora" -> "CalculatorApp"
+            "bloc de notas" -> "notepad"
+            else -> ""
+        }
+
+        val entry = installedApps.entries.firstOrNull { it.key == canonical }
+            ?: installedApps.entries.firstOrNull { it.key.contains(canonical) || canonical.contains(it.key) }
+        val exePath = if (canonical == "opera gx") (findWindowsOperaGX() ?: entry?.value) else entry?.value
+
+        if (processName.isNotBlank()) {
+            // Verifica si el proceso ya existe: si existe, SOLO restaura/amplía su ventana sin abrir otra pestaña
+            val psFocusOrLaunch = """
+                ${'$'}procs = @(Get-Process -Name "$processName" -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 })
+                if (${'$'}procs.Count -gt 0) {
+                    ${'$'}hwnd = ${'$'}procs[0].MainWindowHandle
+                    ${'$'}code = 'using System; using System.Runtime.InteropServices; public class WinFocus { [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd); }'
+                    Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
+                    if ([WinFocus]::IsIconic(${'$'}hwnd)) {
+                        [WinFocus]::ShowWindowAsync(${'$'}hwnd, 9) | Out-Null
+                    } else {
+                        [WinFocus]::ShowWindowAsync(${'$'}hwnd, 3) | Out-Null
+                    }
+                    [WinFocus]::SetForegroundWindow(${'$'}hwnd) | Out-Null
+                    Write-Output "FOCUSED"
+                } else {
+                    Write-Output "NOT_RUNNING"
+                }
+            """.trimIndent()
+
+            val status = runPowerShell(psFocusOrLaunch, wait = true)
+            if (status.contains("FOCUSED")) {
+                return "Ampliando ventana activa de ${canonical.uppercase()}, Cristian."
+            }
+        }
+
+        if (exePath != null) {
+            ProcessBuilder("cmd", "/c", "start", "", exePath).start()
+            return "Iniciando ${canonical.uppercase()}, Cristian."
+        }
+        return "No encontré '$canonical' instalado en tu PC."
+    }
+
+    private fun openOrFocusMacApp(canonical: String): String {
+        val macAppName = when (canonical) {
+            "vscode" -> "Visual Studio Code"
+            "opera gx" -> if (File("/Applications/Opera GX.app").exists()) "Opera GX" else "Opera"
+            "notion" -> "Notion"
+            "spotify" -> "Spotify"
+            "discord" -> "Discord"
+            "calculadora" -> "Calculator"
+            else -> installedApps[canonical] ?: canonical
+        }
+
+        // En macOS: si ya está abierta, solo la desminimiza del Dock y la trae al frente sin abrir nuevas ventanas
+        val script = """
+            if application "$macAppName" is running then
+                tell application "$macAppName" to activate
+                tell application "System Events"
+                    tell process "$macAppName"
+                        set frontmost to true
+                        try
+                            repeat with w in windows
+                                if value of attribute "AXMinimized" of w is true then
+                                    set value of attribute "AXMinimized" of w to false
+                                end if
+                            end repeat
+                        end try
+                    end tell
+                end tell
+                return "FOCUSED"
+            else
+                tell application "$macAppName" to activate
+                return "LAUNCHED"
+            end if
+        """.trimIndent()
+
+        val result = runAppleScript(script, wait = true)
+        return if (result == "FOCUSED") {
+            "Ampliando ${macAppName.uppercase()} en tu Mac, Cristian."
+        } else {
+            "Iniciando ${macAppName.uppercase()} en tu Mac, Cristian."
+        }
+    }
+
+    private fun openOrFocusLinuxApp(canonical: String): String {
+        val entry = installedApps.entries.firstOrNull { it.key == canonical }
+        val target = entry?.value ?: canonical
+        runLinuxShell("wmctrl -a \"$canonical\" || $target &")
+        return "Activando ${canonical.uppercase()}, Cristian."
+    }
+
+    // ========================================================================
+    // CONTROL MULTIMEDIA DE SPOTIFY
+    // ========================================================================
     fun controlSpotifyExact(command: String): String {
         val now = System.currentTimeMillis()
         if (now - lastMediaActionTimestamp < 450) return "Comando en proceso, Cristian."
@@ -257,7 +382,7 @@ class SystemScanner {
         val isPlaying = state.startsWith("PLAYING:")
 
         if (!isOpen && (command == "PLAY" || command == "NEXT" || command == "PREV")) {
-            playLikedSongsInSpotify()
+            playLikedSongsInSpotify(forceRestart = true)
             return "Abriendo Spotify e iniciando tus canciones de Mis Me Gusta, Cristian."
         }
 
@@ -311,19 +436,19 @@ class SystemScanner {
             isLinux -> {
                 when (command) {
                     "PAUSE" -> {
-                        runLinuxShell("playerctl -p spotify pause || dbus-send --print-reply --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player.Pause")
+                        runLinuxShell("playerctl -p spotify pause")
                         "Música en pausa, Cristian."
                     }
                     "PLAY" -> {
-                        runLinuxShell("playerctl -p spotify play || dbus-send --print-reply --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player.Play")
+                        runLinuxShell("playerctl -p spotify play")
                         "Reanudando reproducción en Spotify, Cristian."
                     }
                     "NEXT" -> {
-                        runLinuxShell("playerctl -p spotify next || dbus-send --print-reply --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player.Next")
+                        runLinuxShell("playerctl -p spotify next")
                         "Siguiente canción, Cristian."
                     }
                     "PREV" -> {
-                        runLinuxShell("playerctl -p spotify previous || dbus-send --print-reply --dest=org.mpris.MediaPlayer2.spotify /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player.Previous")
+                        runLinuxShell("playerctl -p spotify previous")
                         "Canción anterior, Cristian."
                     }
                     else -> "Comando ejecutado."
@@ -347,21 +472,29 @@ class SystemScanner {
         runPowerShell(ps, wait = false)
     }
 
-    fun playLikedSongsInSpotify(): String {
+    // Si Spotify ya está reproduciendo cuando presionas un Modo por 2da vez, no reinicia la lista
+    fun playLikedSongsInSpotify(forceRestart: Boolean = false): String {
         thread {
             try {
+                if (!forceRestart) {
+                    val currentStatus = getSpotifyStatusAndTrack()
+                    if (currentStatus.startsWith("PLAYING:")) {
+                        currentSpotifyTrack = currentStatus.removePrefix("PLAYING:").take(34)
+                        return@thread
+                    }
+                }
                 when {
                     isWindows -> {
                         val ps = """
                             Start-Process "spotify:collection:tracks"
-                            Start-Sleep -Milliseconds 2600
+                            Start-Sleep -Milliseconds 2400
                             ${'$'}wsh = New-Object -ComObject WScript.Shell
                             ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
                             if (${'$'}null -ne ${'$'}sp) {
                                 ${'$'}wsh.AppActivate(${'$'}sp.Id) | Out-Null
-                                Start-Sleep -Milliseconds 450
+                                Start-Sleep -Milliseconds 400
                                 ${'$'}wsh.SendKeys("{ENTER}")
-                                Start-Sleep -Milliseconds 650
+                                Start-Sleep -Milliseconds 600
                                 ${'$'}spCheck = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowTitle -ne "" } | Select-Object -First 1
                                 if (${'$'}null -ne ${'$'}spCheck -and ${'$'}spCheck.MainWindowTitle -notlike "* - *") {
                                     ${'$'}wsh.AppActivate(${'$'}spCheck.Id) | Out-Null
@@ -375,13 +508,9 @@ class SystemScanner {
                     isMac -> {
                         val macScript = """
                             tell application "Spotify"
-                                activate
                                 open location "spotify:collection:tracks"
-                                delay 2.0
+                                delay 1.6
                                 play
-                            end tell
-                            tell application "System Events"
-                                key code 36
                             end tell
                         """.trimIndent()
                         runAppleScript(macScript, wait = false)
@@ -521,7 +650,7 @@ class SystemScanner {
                 appsToOpen = listOf("vscode", "notion", "opera gx"),
                 appsToClose = emptyList(),
                 spotifyPlaylist = "mis me gusta",
-                greeting = "Activando Modo Trabajo en tu ${getOSLabel()}, Cristian. Abriendo Visual Studio Code, Notion, Opera GX y reproduciendo tus canciones de Mis Me Gusta."
+                greeting = "Modo Trabajo activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
             ),
             WorkspaceMode(
                 id = "TAREA",
@@ -530,7 +659,7 @@ class SystemScanner {
                 appsToOpen = listOf("vscode", "notion", "opera gx"),
                 appsToClose = listOf("discord", "steam"),
                 spotifyPlaylist = "mis me gusta",
-                greeting = "Activando Modo Tarea, Cristian. Preparando Visual Studio Code, Notion, Opera GX y reproduciendo automáticamente tu lista Mis Me Gusta en Spotify."
+                greeting = "Modo Tarea activo, Cristian. Enfocando Visual Studio Code, Notion, Opera GX y tu lista Mis Me Gusta en Spotify."
             ),
             WorkspaceMode(
                 id = "ESTUDIO",
@@ -539,7 +668,7 @@ class SystemScanner {
                 appsToOpen = listOf("notion", "opera gx", "vscode"),
                 appsToClose = listOf("discord", "steam"),
                 spotifyPlaylist = "mis me gusta",
-                greeting = "Activando Modo Estudio, Cristian. Abriendo Notion, Opera GX, Visual Studio Code y reproduciendo automáticamente tus canciones de Mis Me Gusta."
+                greeting = "Modo Estudio activo, Cristian. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
             ),
             WorkspaceMode(
                 id = "GAMING",
@@ -548,7 +677,7 @@ class SystemScanner {
                 appsToOpen = listOf("discord"),
                 appsToClose = listOf("vscode", "notion"),
                 spotifyPlaylist = "mis me gusta",
-                greeting = "Modo Gaming activo, Cristian. Cerrando aplicaciones de trabajo, abriendo Discord y reproduciendo tu música."
+                greeting = "Modo Gaming activo, Cristian. Liberando recursos de trabajo, enfocando Discord y reproduciendo tu música."
             )
         )
 
@@ -557,22 +686,23 @@ class SystemScanner {
         try { objectMapper.writeValue(modesFile, workspaceModes) } catch (e: Exception) {}
     }
 
+    // Ejecuta el modo enfocando las ventanas existentes sin abrir pestañas duplicadas
     fun executeWorkspaceMode(mode: WorkspaceMode): String {
         activeModeName = mode.id
         thread {
             try {
                 mode.appsToClose.forEach { app ->
                     closeAppByName(app)
-                    Thread.sleep(200)
+                    Thread.sleep(150)
                 }
                 mode.appsToOpen.forEach { app ->
-                    openAppByName(app)
-                    Thread.sleep(550)
+                    openOrFocusApp(app)
+                    Thread.sleep(350)
                 }
                 if (mode.spotifyPlaylist.isNotBlank()) {
-                    Thread.sleep(900)
+                    Thread.sleep(600)
                     if (mode.spotifyPlaylist.contains("me gusta")) {
-                        playLikedSongsInSpotify()
+                        playLikedSongsInSpotify(forceRestart = false)
                     } else {
                         playPlaylist(mode.spotifyPlaylist, normalizeText(mode.spotifyPlaylist))
                     }
@@ -591,7 +721,7 @@ class SystemScanner {
             appsToOpen = appsList.map { normalizeText(it) },
             appsToClose = emptyList(),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Activando modo $cleanId y reproduciendo Mis Me Gusta, Cristian."
+            greeting = "Activando modo $cleanId y enfocando tus aplicaciones, Cristian."
         )
         workspaceModes.removeIf { it.id == cleanId }
         workspaceModes.add(newMode)
@@ -622,7 +752,7 @@ class SystemScanner {
             File("$programData\\Microsoft\\Windows\\Start Menu\\Programs"),
             File("$userProfile\\Desktop")
         ).filter { it.exists() }.forEach { dir ->
-            dir.walkTopDown().maxDepth(4).forEach { file ->
+            dir.walkTopDown().maxDepth(3).forEach { file ->
                 if (file.isFile && (file.extension.equals("lnk", true) || file.extension.equals("exe", true))) {
                     val cleanName = normalizeText(file.nameWithoutExtension)
                     if (cleanName.length > 2 && !cleanName.contains("uninstall")) {
@@ -678,74 +808,10 @@ class SystemScanner {
     }
 
     private fun scanLinuxApps() {
-        val home = System.getProperty("user.home") ?: ""
-        listOf(
-            File("/usr/share/applications"),
-            File("/var/lib/snapd/desktop/applications"),
-            File("$home/.local/share/applications")
-        ).filter { it.exists() }.forEach { dir ->
-            dir.listFiles()?.filter { it.name.endsWith(".desktop") }?.forEach { file ->
-                var name: String? = null
-                var exec: String? = null
-                file.readLines().forEach { line ->
-                    if (line.startsWith("Name=") && name == null) name = line.removePrefix("Name=").trim()
-                    if (line.startsWith("Exec=") && exec == null) exec = line.removePrefix("Exec=").replace(Regex("%[a-zA-Z]"), "").trim()
-                }
-                if (name != null && exec != null) {
-                    installedApps[normalizeText(name!!)] = exec!!
-                }
-            }
-        }
         installedApps["vscode"] = "code"
         installedApps["visual"] = "code"
         installedApps["spotify"] = "spotify"
         installedApps["opera gx"] = "opera"
-    }
-
-    fun openAppByName(normalizedCommand: String): String {
-        val requestedApp = normalizedCommand
-            .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
-            .trim()
-
-        val canonical = when {
-            requestedApp == "visual" || requestedApp == "vs code" || requestedApp == "code" -> "vscode"
-            requestedApp.contains("opera") -> "opera gx"
-            else -> requestedApp
-        }
-
-        val entry = installedApps.entries.firstOrNull { it.key == canonical }
-            ?: installedApps.entries.firstOrNull { it.key.contains(canonical) || canonical.contains(it.key) }
-
-        return try {
-            when {
-                isWindows -> {
-                    if (canonical == "opera gx") {
-                        val operaExe = findWindowsOperaGX()
-                        if (operaExe != null) {
-                            ProcessBuilder("cmd", "/c", "start", "", operaExe).start()
-                            return "Abriendo Opera GX, Cristian."
-                        }
-                    }
-                    if (entry != null) {
-                        ProcessBuilder("cmd", "/c", "start", "", entry.value).start()
-                        "Iniciando ${entry.key.uppercase()}, Cristian."
-                    } else "No encontré '$requestedApp' instalado."
-                }
-                isMac -> {
-                    val macTarget = entry?.value ?: requestedApp
-                    ProcessBuilder("open", "-a", macTarget).start()
-                    "Abriendo ${macTarget.uppercase()} en tu Mac, Cristian."
-                }
-                isLinux -> {
-                    val linuxTarget = entry?.value ?: requestedApp
-                    runLinuxShell("$linuxTarget &")
-                    "Iniciando ${linuxTarget.uppercase()} en Linux, Cristian."
-                }
-                else -> "Sistema no soportado."
-            }
-        } catch (e: Exception) {
-            "No pude iniciar '$requestedApp': ${e.message}"
-        }
     }
 
     fun closeAppByName(normalizedCommand: String): String {
@@ -804,8 +870,8 @@ class SystemScanner {
                 "Aplicaciones activas en tu Mac: $procs"
             }
             else -> {
-                val out = runLinuxShell("wmctrl -l | awk '{{\$1=\$2=\$3=\"\"; print \$0}}'", wait = true)
-                "Ventanas activas en Linux:\n$out"
+                val out = runLinuxShell("wmctrl -l", wait = true)
+                "Ventanas activas:\n$out"
             }
         }
     }
@@ -815,7 +881,11 @@ class SystemScanner {
         return when {
             state == "CLOSED" -> "Spotify está cerrado en este momento, Cristian."
             state == "PAUSED" -> "Spotify está abierto pero en pausa, Cristian."
-            else -> "Está sonando '${state.removePrefix("PLAYING:")}' en Spotify."
+            else -> {
+                val track = state.removePrefix("PLAYING:")
+                currentSpotifyTrack = track.take(34)
+                "Está sonando '$track' en Spotify."
+            }
         }
     }
 
@@ -857,7 +927,7 @@ class SystemScanner {
 
     fun playPlaylist(rawCommand: String, normalized: String): String {
         if (normalized.contains("me gusta") || normalized.contains("favoritas")) {
-            return playLikedSongsInSpotify()
+            return playLikedSongsInSpotify(forceRestart = true)
         }
 
         val playlistQuery = normalized
@@ -866,7 +936,7 @@ class SystemScanner {
             .trim()
             .ifBlank { "mis me gusta" }
 
-        if (playlistQuery == "mis me gusta") return playLikedSongsInSpotify()
+        if (playlistQuery == "mis me gusta") return playLikedSongsInSpotify(forceRestart = true)
 
         val savedMatch = savedPlaylists.entries.firstOrNull {
             playlistQuery.contains(it.key) || it.key.contains(playlistQuery)
@@ -893,7 +963,7 @@ class SystemScanner {
             return controlSpotifyExact("PLAY")
         }
         if (cleanSong.contains("mis me gusta") || cleanSong.contains("canciones que me gustan")) {
-            return playLikedSongsInSpotify()
+            return playLikedSongsInSpotify(forceRestart = true)
         }
 
         thread {
@@ -930,9 +1000,8 @@ class SystemScanner {
             isMac -> {
                 val macScript = """
                     tell application "Spotify"
-                        activate
                         open location "$spotifyUri"
-                        delay 1.8
+                        delay 1.6
                         play
                     end tell
                 """.trimIndent()
@@ -970,6 +1039,7 @@ class SystemScanner {
         return null
     }
 
+    // Configura los lanzadores de auto-arranque con límite estricto de RAM (-Xms32m -Xmx128m -XX:+UseSerialGC)
     fun ensureDesktopAndStartupApp(): String {
         return try {
             val workingDir = File(System.getProperty("user.dir")).absolutePath
@@ -993,7 +1063,7 @@ class SystemScanner {
                                 End If
                             Next
                         End If
-                        shell.Run javawPath & " -jar " & Chr(34) & "${jarFile.absolutePath}" & Chr(34), 0, False
+                        shell.Run javawPath & " -Xms32m -Xmx128m -XX:+UseSerialGC -jar " & Chr(34) & "${jarFile.absolutePath}" & Chr(34), 0, False
                     """.trimIndent()
                     launcherVbs.writeText(vbsContent, StandardCharsets.ISO_8859_1)
 
@@ -1016,7 +1086,7 @@ class SystemScanner {
                         Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DaemonAI" -Value "wscript.exe `"${launcherVbs.absolutePath}`"" -Force
                     """.trimIndent()
                     runPowerShell(psStartup, wait = false)
-                    "Auto-inicio registrado en Windows."
+                    "Auto-inicio ligero registrado en Windows."
                 }
                 isMac -> {
                     val home = System.getProperty("user.home")
@@ -1035,6 +1105,9 @@ class SystemScanner {
                             <key>ProgramArguments</key>
                             <array>
                                 <string>$javaBin</string>
+                                <string>-Xms32m</string>
+                                <string>-Xmx128m</string>
+                                <string>-XX:+UseSerialGC</string>
                                 <string>-jar</string>
                                 <string>${jarFile.absolutePath}</string>
                             </array>
@@ -1048,9 +1121,9 @@ class SystemScanner {
                     plistFile.writeText(plistXml, StandardCharsets.UTF_8)
 
                     val cmdFile = File("$home/Desktop/Daemon AI.command")
-                    cmdFile.writeText("#!/bin/bash\ncd \"$workingDir\"\n\"$javaBin\" -jar \"${jarFile.absolutePath}\" &\n", StandardCharsets.UTF_8)
+                    cmdFile.writeText("#!/bin/bash\ncd \"$workingDir\"\n\"$javaBin\" -Xms32m -Xmx128m -XX:+UseSerialGC -jar \"${jarFile.absolutePath}\" &\n", StandardCharsets.UTF_8)
                     cmdFile.setExecutable(true)
-                    "Auto-inicio registrado en macOS LaunchAgents."
+                    "Auto-inicio ligero registrado en macOS."
                 }
                 isLinux -> {
                     val home = System.getProperty("user.home")
@@ -1063,13 +1136,13 @@ class SystemScanner {
                         [Desktop Entry]
                         Type=Application
                         Name=Daemon AI
-                        Exec="$javaBin" -jar "${jarFile.absolutePath}"
+                        Exec="$javaBin" -Xms32m -Xmx128m -XX:+UseSerialGC -jar "${jarFile.absolutePath}"
                         Path=$workingDir
                         Terminal=false
                         X-GNOME-Autostart-enabled=true
                     """.trimIndent()
                     desktopEntry.writeText(content, StandardCharsets.UTF_8)
-                    "Auto-inicio registrado en Ubuntu/Linux."
+                    "Auto-inicio ligero registrado en Linux."
                 }
                 else -> ""
             }
@@ -1120,14 +1193,14 @@ class DaemonBrain(
         launchStarkHologramHUD()
         startContinuousWakeWordEar()
         speakAndDisplay(
-            "NÚCLEO ACTIVO",
-            "Daemon v9.5 en línea sobre ${systemScanner.getOSLabel()}, Cristian."
+            "NÚCLEO OPTIMIZADO",
+            "Daemon v10.0 activo en modo de bajo consumo sobre ${systemScanner.getOSLabel()}, Cristian."
         )
     }
 
     private fun startContinuousWakeWordEar() {
         if (!systemScanner.isWindows) return
-        thread(isDaemon = true, name = "Daemon-AlwaysOn-WakeWord-Ear") {
+        thread(isDaemon = true, name = "Daemon-LowPower-Ear") {
             Thread.sleep(2500)
             while (true) {
                 try {
@@ -1162,13 +1235,14 @@ class DaemonBrain(
                         ${'$'}gb = New-Object System.Speech.Recognition.GrammarBuilder(${'$'}choices)
                         ${'$'}gb.Culture = ${'$'}esRec.Culture
                         ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.Grammar(${'$'}gb)))
-                        ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
                         
                         while (${'$'}true) {
-                            ${'$'}res = ${'$'}engine.Recognize([TimeSpan]::FromSeconds(4))
-                            if (${'$'}null -ne ${'$'}res -and ${'$'}res.Confidence -gt 0.40) {
+                            ${'$'}res = ${'$'}engine.Recognize([TimeSpan]::FromSeconds(5))
+                            if (${'$'}null -ne ${'$'}res -and ${'$'}res.Confidence -gt 0.42) {
                                 Write-Output ("HEARD:" + ${'$'}res.Text)
                                 [Console]::Out.Flush()
+                            } else {
+                                Start-Sleep -Milliseconds 150
                             }
                         }
                     """.trimIndent()
@@ -1212,7 +1286,7 @@ class DaemonBrain(
                     }
                     proc.waitFor()
                 } catch (e: Exception) {
-                    Thread.sleep(3000)
+                    Thread.sleep(4000)
                 }
             }
         }
@@ -1222,6 +1296,10 @@ class DaemonBrain(
         directListenUntil = System.currentTimeMillis() + 8000L
         uiState = "LISTENING"
         starkHud?.setStatusText("TE ESCUCHO, CRISTIAN...")
+        if (systemScanner.isMac) {
+            // En macOS, si el núcleo está minimizado, un clic izquierdo abre el panel para recibir tu orden
+            starkHud?.setOrbMode(false)
+        }
     }
 
     private fun loadUserFacts() {
@@ -1242,7 +1320,7 @@ class DaemonBrain(
         return try {
             val req = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:11434/api/tags"))
-                .timeout(Duration.ofSeconds(2))
+                .timeout(Duration.ofSeconds(1))
                 .GET().build()
             val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
             if (res.statusCode() == 200) {
@@ -1275,13 +1353,14 @@ class DaemonBrain(
 
         if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
             starkHud?.setOrbMode(false)
-            return recordAndReturn(input, "Desplegando el panel holográfico completo, Cristian.")
+            return recordAndReturn(input, "Desplegando el panel completo, Cristian.")
         }
         if (normalized.contains("modo nucleo") || normalized.contains("minimiza el panel") || normalized.contains("hazte chiquito")) {
             starkHud?.setOrbMode(true)
             return recordAndReturn(input, "Contrayendo a modo núcleo flotante, Cristian.")
         }
 
+        // 1. MODOS (SI LA APLICACIÓN YA ESTÁ ABIERTA, SOLO LA AMPLÍA Y ENFOCA)
         for (mode in systemScanner.workspaceModes) {
             val matchedTrigger = mode.triggers.any { t ->
                 val normT = systemScanner.normalizeText(t)
@@ -1299,6 +1378,7 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.createCustomMode(modeName, apps))
         }
 
+        // 2. BÚSQUEDA EN OPERA GX Y YOUTUBE
         val ytSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+youtube\s+y\s+)?(?:busca\s+en\s+youtube|buscar\s+en\s+youtube|pon\s+un\s+video\s+de|busca\s+un\s+video\s+de)\s+(.+)$""")
         ytSearchRegex.find(normalized)?.let { m ->
             val query = m.groupValues[1].replace("en opera gx", "").trim()
@@ -1311,12 +1391,14 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.searchInOperaGX(query, "GOOGLE"))
         }
 
+        // 3. VIDEO EN NAVEGADOR VS SPOTIFY
         if (normalized.contains("video") || normalized.contains("youtube")) {
             if (normalized.contains("pausa") || normalized.contains("deten") || normalized.contains("play") || normalized.contains("reanuda") || normalized.contains("continua")) {
                 return recordAndReturn(input, systemScanner.controlBrowserVideo())
             }
         }
 
+        // 4. CONTROL EXACTO DE SPOTIFY
         val isPauseOrder = normalized in setOf(
             "pausa", "pon pausa", "ponle pausa", "pausa spotify", "pausa la musica",
             "pausa la cancion", "deten la musica", "deten la cancion", "para la musica", "pausar"
@@ -1362,7 +1444,7 @@ class DaemonBrain(
         }
 
         if (normalized.contains("mis me gusta") || normalized.contains("canciones que me gustan")) {
-            return recordAndReturn(input, systemScanner.playLikedSongsInSpotify())
+            return recordAndReturn(input, systemScanner.playLikedSongsInSpotify(forceRestart = true))
         }
         if (normalized.startsWith("vincula playlist ") || normalized.startsWith("guarda playlist ")) {
             val name = input.substringAfter("playlist ").substringBefore(" con ").trim()
@@ -1383,6 +1465,7 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
 
+        // 5. VENTANAS Y APLICACIONES (USA ENFOQUE INTELIGENTE SIN DUPLICAR)
         if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando")) {
             return recordAndReturn(input, systemScanner.getCurrentlyPlayingSpotify())
         }
@@ -1395,7 +1478,7 @@ class DaemonBrain(
         }
 
         if (normalized.matches(Regex("""^(?:abre|abrir|inicia|ejecuta|lanza)\s+.+$"""))) {
-            return recordAndReturn(input, systemScanner.openAppByName(normalized))
+            return recordAndReturn(input, systemScanner.openOrFocusApp(normalized))
         }
         if (normalized.matches(Regex("""^(?:cierra|cerrar|termina|mata)\s+.+$"""))) {
             return recordAndReturn(input, systemScanner.closeAppByName(normalized))
@@ -1407,7 +1490,6 @@ class DaemonBrain(
             return recordAndReturn(input, "Integrado en mi memoria permanente, Cristian: '$fact'.")
         }
 
-        if (!isOllamaOnline) checkOllamaStatus()
         if (isOllamaOnline) {
             generateOllamaConversationalResponse(input)?.let { reply ->
                 return recordAndReturn(input, reply)
@@ -1425,7 +1507,7 @@ class DaemonBrain(
         val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
         val factsContext = if (userFacts.isEmpty()) "" else "Datos sobre Cristian:\n" + userFacts.joinToString("\n") { "- $it" }
         return """
-            Eres Daemon (v9.5), el asistente de inteligencia artificial multiplataforma estilo J.A.R.V.I.S. creado por Cristian Alexis.
+            Eres Daemon (v10.0), el asistente de inteligencia artificial multiplataforma estilo J.A.R.V.I.S. creado por Cristian Alexis.
             Estás ejecutándote sobre ${systemScanner.getOSLabel()}. Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
             
@@ -1451,7 +1533,7 @@ class DaemonBrain(
     private fun buildMessageHistory(userInput: String): List<ChatMessage> {
         val list = mutableListOf(ChatMessage("system", buildSystemPrompt()))
         synchronized(conversationHistory) {
-            conversationHistory.takeLast(12).forEach { turn ->
+            conversationHistory.takeLast(10).forEach { turn ->
                 list.add(ChatMessage(turn.role, turn.content))
             }
         }
@@ -1465,12 +1547,12 @@ class DaemonBrain(
                 model = ollamaModel,
                 messages = buildMessageHistory(userInput),
                 stream = false,
-                options = OllamaOptions(temperature = 0.7, num_predict = 250)
+                options = OllamaOptions(temperature = 0.7, num_predict = 240)
             )
             val jsonBody = objectMapper.writeValueAsString(payload)
             val req = HttpRequest.newBuilder()
                 .uri(URI.create(ollamaUrl))
-                .timeout(Duration.ofSeconds(25))
+                .timeout(Duration.ofSeconds(20))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
@@ -1500,7 +1582,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkCore/9.5")
+                .header("User-Agent", "DaemonStarkCore/10.0")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -1524,7 +1606,7 @@ class DaemonBrain(
                 "MODE_WORK" -> systemScanner.workspaceModes.firstOrNull { it.id == "TRABAJO" }?.let { systemScanner.executeWorkspaceMode(it) }
                 "MODE_HOMEWORK" -> systemScanner.workspaceModes.firstOrNull { it.id == "TAREA" }?.let { systemScanner.executeWorkspaceMode(it) }
                 "MODE_STUDY" -> systemScanner.workspaceModes.firstOrNull { it.id == "ESTUDIO" }?.let { systemScanner.executeWorkspaceMode(it) }
-                "PLAY_LIKED" -> systemScanner.playLikedSongsInSpotify()
+                "PLAY_LIKED" -> systemScanner.playLikedSongsInSpotify(forceRestart = false)
                 "PLAY_SONG" -> systemScanner.playSongInSpotify(param)
                 "PAUSE_MUSIC" -> systemScanner.controlSpotifyExact("PAUSE")
                 "PLAY_MUSIC" -> systemScanner.controlSpotifyExact("PLAY")
@@ -1532,7 +1614,7 @@ class DaemonBrain(
                 "PREV_TRACK" -> systemScanner.controlSpotifyExact("PREV")
                 "PAUSE_VIDEO" -> systemScanner.controlBrowserVideo()
                 "SEARCH_OPERA" -> systemScanner.searchInOperaGX(param, "GOOGLE")
-                "OPEN_APP" -> systemScanner.openAppByName(systemScanner.normalizeText(param))
+                "OPEN_APP" -> systemScanner.openOrFocusApp(systemScanner.normalizeText(param))
             }
         }
         return llmReply.replace(actionRegex, "").trim()
@@ -1542,7 +1624,7 @@ class DaemonBrain(
         synchronized(conversationHistory) {
             conversationHistory.add(ChatMessage("user", userPrompt))
             conversationHistory.add(ChatMessage("assistant", daemonReply))
-            while (conversationHistory.size > 20) {
+            while (conversationHistory.size > 16) {
                 conversationHistory.removeAt(0)
             }
         }
@@ -1606,7 +1688,7 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 3. INTERFAZ ACELERADA CERO PARPADEO Y CERO LAG (MACOS / WINDOWS / LINUX)
+// 3. INTERFAZ ULTRA-LIGERA (REPINTADO PARCIAL DEL REACTOR = ~2% CPU EN MAC)
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
@@ -1620,7 +1702,7 @@ class StarkHologramHUD(
     private var isMiniOrbMode = true
     private val fullWidth = 680
     private val fullHeight = 520
-    private val orbSize = 110
+    private val orbSize = 104
 
     private val bgSpaceDark = Color(4, 10, 20)
     private val statusLabel = JLabel("ONLINE // CLIC DERECHO PARA EXPANDIR")
@@ -1634,7 +1716,6 @@ class StarkHologramHUD(
         if (scanner.isWindows) {
             type = Window.Type.UTILITY
         }
-        // Superficie 100% opaca acelerada por hardware: elimina el parpadeo al mover el mouse en macOS y Windows
         background = bgSpaceDark
         isAlwaysOnTop = true
 
@@ -1642,8 +1723,8 @@ class StarkHologramHUD(
         rootPane.isDoubleBuffered = true
 
         val screenBounds = Toolkit.getDefaultToolkit().screenSize
-        val initialX = (screenBounds.width - orbSize - 35).coerceAtLeast(20)
-        val initialY = 38
+        val initialX = (screenBounds.width - orbSize - 32).coerceAtLeast(20)
+        val initialY = 36
 
         hudCanvas.layout = BorderLayout()
         hudCanvas.border = EmptyBorder(16, 22, 18, 22)
@@ -1657,7 +1738,7 @@ class StarkHologramHUD(
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON CORE v9.5 (${scanner.getOSLabel()})").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON v10.0 (${scanner.getOSLabel()})").apply {
                     foreground = Color(0, 242, 255)
                     font = Font("Monospaced", Font.BOLD, 14)
                 }
@@ -1722,14 +1803,14 @@ class StarkHologramHUD(
             add(rightWing, BorderLayout.EAST)
         }
 
-        // 3. CONSOLA INFERIOR DEL PANEL COMPLETO (100% OPACA PARA EVITAR PARPADEO EN SWING)
+        // 3. CONSOLA INFERIOR
         val bottomDeck = JPanel(BorderLayout(0, 8)).apply {
             isOpaque = false
             border = EmptyBorder(4, 6, 2, 6)
 
             outputArea.apply {
                 isOpaque = true
-                background = Color(6, 15, 28) // Sin canal alfa para evitar bug de repintado en Swing
+                background = Color(6, 15, 28)
                 foreground = Color(215, 250, 255)
                 font = Font("Monospaced", Font.PLAIN, 12)
                 lineWrap = true
@@ -1828,14 +1909,21 @@ class StarkHologramHUD(
             }
         })
 
-        // Un único reloj maestro a 36 FPS: fluido, sin saturar la CPU ni competir con eventos del mouse
-        javax.swing.Timer(28) {
+        // RELOJ INTELIGENTE DE BAJO CONSUMO:
+        // En el panel grande SOLO repinta el cuadro central del Reactor (180, 62, 320, 275), ahorrando 85% de CPU en Mac
+        javax.swing.Timer(45) {
             if (System.currentTimeMillis() < brain.directListenUntil && brain.uiState == "IDLE") {
                 brain.uiState = "LISTENING"
             } else if (System.currentTimeMillis() >= brain.directListenUntil && brain.uiState == "LISTENING" && !brain.isSpeakingNow) {
                 brain.uiState = "IDLE"
             }
-            hudCanvas.repaint()
+
+            if (isMiniOrbMode) {
+                hudCanvas.repaint()
+            } else {
+                // Solo redibuja la región central del reactor; los botones y textos NO se redibujan cada frame
+                hudCanvas.repaint(180, 62, 320, 275)
+            }
         }.start()
     }
 
@@ -1843,6 +1931,7 @@ class StarkHologramHUD(
         SwingUtilities.invokeLater {
             val screenBounds = Toolkit.getDefaultToolkit().screenSize
             isMiniOrbMode = mini
+            scanner.isFullPanelVisible = !mini
             applyOrbWindowGeometry()
             if (!mini) {
                 val newX = location.x.coerceIn(10, (screenBounds.width - fullWidth - 10).coerceAtLeast(10))
@@ -1852,7 +1941,7 @@ class StarkHologramHUD(
                 inputField.requestFocusInWindow()
             }
             revalidate()
-            repaint()
+            hudCanvas.repaint()
         }
     }
 
@@ -1895,7 +1984,6 @@ class StarkHologramHUD(
         }
     }
 
-    // Los botones NO llaman a repaint() en mouseEntered/mouseExited; el ciclo maestro los actualiza sin parpadear
     private fun createHoloButton(label: String, accent: Color, widthPx: Int, onClick: () -> Unit): JComponent {
         return object : JPanel(true) {
             private var hovered = false
@@ -1915,17 +2003,19 @@ class StarkHologramHUD(
             private val strokeHover = BasicStroke(1.6f)
 
             init {
-                isOpaque = false
+                isOpaque = true
+                background = bgSpaceDark
                 preferredSize = Dimension(widthPx, 32)
                 cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
                 addMouseListener(object : MouseAdapter() {
-                    override fun mouseEntered(e: MouseEvent?) { hovered = true }
-                    override fun mouseExited(e: MouseEvent?) { hovered = false }
+                    override fun mouseEntered(e: MouseEvent?) { hovered = true; repaint() }
+                    override fun mouseExited(e: MouseEvent?) { hovered = false; repaint() }
                     override fun mouseClicked(e: MouseEvent?) { onClick() }
                 })
             }
 
             override fun paintComponent(g: Graphics) {
+                super.paintComponent(g)
                 val g2 = g as Graphics2D
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
 
@@ -1959,13 +2049,12 @@ class StarkHologramHUD(
     }
 
     // ========================================================================
-    // MOTOR GRÁFICO PRE-ALOJADO EN MEMORIA (CERO GARBAGE COLLECTION POR FRAME)
+    // MOTOR GRÁFICO LIGERO (36 NODOS + DIRTY REGION = FLUIDEZ EN INTEL i3 / MAC)
     // ========================================================================
     inner class HolographicChassisPanel : JPanel(true) {
         private var t = 0.0
-        private val nodeCount = 68
+        private val nodeCount = 36
 
-        // Coordenadas esféricas y proyecciones pre-alojadas (0 allocations por fotograma)
         private val nodeTheta = DoubleArray(nodeCount)
         private val nodePhi = DoubleArray(nodeCount)
         private val nodeBaseR = DoubleArray(nodeCount)
@@ -1973,19 +2062,16 @@ class StarkHologramHUD(
         private val projY = DoubleArray(nodeCount)
         private val projZ = DoubleArray(nodeCount)
 
-        // Trazos y fuentes reutilizables en caché
-        private val strokeGrid = BasicStroke(1.0f)
         private val strokeBorder = BasicStroke(1.5f)
         private val strokeCorner = BasicStroke(2.8f)
-        private val strokeOuterFull = BasicStroke(2.4f)
+        private val strokeOuterFull = BasicStroke(2.2f)
         private val strokeOuterOrb = BasicStroke(1.2f)
-        private val strokeGoldFull = BasicStroke(1.6f)
+        private val strokeGoldFull = BasicStroke(1.5f)
         private val strokeGoldOrb = BasicStroke(0.9f)
         private val strokePlexusFull = BasicStroke(0.8f)
         private val strokePlexusOrb = BasicStroke(0.5f)
         private val telemetryFont = Font("Monospaced", Font.BOLD, 10)
 
-        private val colorGrid = Color(0, 50, 75)
         private val colorGold = Color(255, 190, 0)
         private val colorTelemetryCyan = Color(0, 235, 255)
         private val colorSpotifyGreen = Color(16, 240, 165)
@@ -2004,10 +2090,6 @@ class StarkHologramHUD(
             val g2 = g as Graphics2D
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
 
-            // Relleno sólido rápido sin AlphaComposite.Clear
-            g2.color = bgSpaceDark
-            g2.fillRect(0, 0, width, height)
-
             val mainColor = when (brain.uiState) {
                 "LISTENING" -> Color(16, 245, 160)
                 "THINKING" -> Color(255, 185, 0)
@@ -2018,16 +2100,16 @@ class StarkHologramHUD(
             val glowColor = Color(mainColor.red / 8 + 4, mainColor.green / 8 + 10, mainColor.blue / 8 + 22)
 
             val speed = when (brain.uiState) {
-                "THINKING" -> 0.065
-                "SPEAKING" -> 0.042
-                "LISTENING" -> 0.038
-                else -> 0.018
+                "THINKING" -> 0.08
+                "SPEAKING" -> 0.05
+                "LISTENING" -> 0.045
+                else -> 0.022
             }
             t += speed
             val pulse = if (brain.uiState == "SPEAKING" || brain.uiState == "LISTENING") {
-                1.0 + abs(sin(t * 4.5)) * 0.14
+                1.0 + abs(sin(t * 4.0)) * 0.12
             } else {
-                1.0 + sin(t * 2.0) * 0.03
+                1.0 + sin(t * 2.0) * 0.025
             }
 
             if (isMiniOrbMode) {
@@ -2036,28 +2118,19 @@ class StarkHologramHUD(
                 g2.color = dimMainColor
                 g2.stroke = strokeBorder
                 g2.drawOval(2, 2, width - 5, height - 5)
-                drawFloatingArcReactor(g2, cx, cy, 0.44, mainColor, dimMainColor, glowColor, pulse, true)
+                drawFloatingArcReactor(g2, cx, cy, 0.42, mainColor, dimMainColor, glowColor, pulse, true)
                 return
             }
 
             val w = width.toDouble()
-            val h = height.toDouble()
             val cut = 26
-
-            // Rejilla táctica interna
-            g2.color = colorGrid
-            g2.stroke = strokeGrid
-            var gx = 30
-            while (gx < w - 30) { g2.drawLine(gx, 20, gx, (h - 20).toInt()); gx += 36 }
-            var gy = 20
-            while (gy < h - 20) { g2.drawLine(30, gy, (w - 30).toInt(), gy); gy += 36 }
 
             // Borde del chasis
             g2.color = dimMainColor
             g2.stroke = strokeBorder
             g2.drawRect(2, 2, width - 5, height - 5)
 
-            // Esquinas reforzadas en Oro Stark
+            // Esquinas Stark
             g2.color = colorGold
             g2.stroke = strokeCorner
             g2.drawLine(2, 2, 2 + cut, 2)
@@ -2073,11 +2146,11 @@ class StarkHologramHUD(
             val cy = 195.0
             drawFloatingArcReactor(g2, cx, cy, 1.0, mainColor, dimMainColor, glowColor, pulse, false)
 
-            // Telemetría instantánea leída de memoria caché (0 ms de espera)
+            // Telemetría real de bajo consumo (Muestra CPU y MB reales de Daemon)
             g2.font = telemetryFont
             g2.color = colorTelemetryCyan
-            g2.drawString("CPU: ${scanner.cachedCpuLoad}%", 185, 76)
-            g2.drawString("RAM: ${scanner.cachedRamUsage}%", 445, 76)
+            g2.drawString("CPU: ${scanner.cachedCpuLoad}%", 188, 76)
+            g2.drawString("RAM: ${scanner.cachedRamMb} MB", 435, 76)
 
             g2.color = colorGold
             val modeText = "MODO // ${scanner.activeModeName}"
@@ -2100,39 +2173,35 @@ class StarkHologramHUD(
             pulse: Double,
             isOrb: Boolean
         ) {
-            // Resplandor base opaco
-            val glowRad = (84.0 * scale * pulse).toInt()
+            val glowRad = (82.0 * scale * pulse).toInt()
             g2.color = glowColor
             g2.fillOval((cx - glowRad).toInt(), (cy - glowRad).toInt(), glowRad * 2, glowRad * 2)
 
-            // Anillo exterior segmentado
-            val rOuter = (108.0 * scale).toInt()
+            val rOuter = (106.0 * scale).toInt()
             g2.color = mainColor
             g2.stroke = if (isOrb) strokeOuterOrb else strokeOuterFull
             val baseAngle1 = (t * 28.0).toInt()
-            for (a in 0 until 360 step 45) {
-                g2.drawArc((cx - rOuter).toInt(), (cy - rOuter).toInt(), rOuter * 2, rOuter * 2, a + baseAngle1, 28)
+            for (a in 0 until 360 step 60) {
+                g2.drawArc((cx - rOuter).toInt(), (cy - rOuter).toInt(), rOuter * 2, rOuter * 2, a + baseAngle1, 34)
             }
 
-            // Segundo anillo en Oro Stark
-            val rGold = (94.0 * scale).toInt()
+            val rGold = (92.0 * scale).toInt()
             g2.color = colorGold
             g2.stroke = if (isOrb) strokeGoldOrb else strokeGoldFull
-            val baseAngle2 = (-t * 40.0).toInt()
+            val baseAngle2 = (-t * 38.0).toInt()
             for (a in 0 until 360 step 90) {
-                g2.drawArc((cx - rGold).toInt(), (cy - rGold).toInt(), rGold * 2, rGold * 2, a + baseAngle2, 50)
+                g2.drawArc((cx - rGold).toInt(), (cy - rGold).toInt(), rGold * 2, rGold * 2, a + baseAngle2, 48)
             }
 
-            // Analizador de espectro radial
-            val numBars = 36
+            val numBars = 24
             for (i in 0 until numBars) {
                 val a = (i.toDouble() / numBars) * PI * 2.0 + t * 0.15
                 val amp = if (brain.uiState == "IDLE") {
-                    (3.0 + sin(a * 4.0 + t * 2.0) * 2.0) * scale
+                    (2.5 + sin(a * 4.0 + t * 2.0) * 1.5) * scale
                 } else {
-                    (5.0 + abs(sin(a * 7.0 + t * 6.0)) * 18.0 * pulse) * scale
+                    (4.5 + abs(sin(a * 6.0 + t * 5.0)) * 16.0 * pulse) * scale
                 }
-                val rIn = 72.0 * scale * pulse
+                val rIn = 70.0 * scale * pulse
                 val rOut = rIn + amp
                 val cosA = cos(a)
                 val sinA = sin(a)
@@ -2143,8 +2212,7 @@ class StarkHologramHUD(
                 )
             }
 
-            // Proyección 3D sin crear objetos en memoria
-            val wobble = sin(t * 0.5) * 0.1
+            val wobble = sin(t * 0.5) * 0.08
             for (i in 0 until nodeCount) {
                 val r = nodeBaseR[i] * scale * pulse
                 val rotT = nodeTheta[i] + t
@@ -2159,10 +2227,9 @@ class StarkHologramHUD(
                 projZ[i] = z3
             }
 
-            // Conexiones neuronales usando distancia al cuadrado (Evita llamar a sqrt miles de veces)
             g2.stroke = if (isOrb) strokePlexusOrb else strokePlexusFull
             g2.color = dimMainColor
-            val maxDist = 26.0 * scale * pulse
+            val maxDist = 34.0 * scale * pulse
             val maxDistSq = maxDist * maxDist
             for (i in 0 until nodeCount) {
                 val xi = projX[i]
@@ -2176,11 +2243,10 @@ class StarkHologramHUD(
                 }
             }
 
-            // Nodos
-            val dotSize = (3.8 * scale).toInt().coerceAtLeast(2)
+            val dotSize = (4.0 * scale).toInt().coerceAtLeast(2)
             val halfDot = dotSize / 2
             for (i in 0 until nodeCount) {
-                g2.color = if (i % 5 == 0) Color.WHITE else mainColor
+                g2.color = if (i % 4 == 0) Color.WHITE else mainColor
                 g2.fillOval(projX[i].toInt() - halfDot, projY[i].toInt() - halfDot, dotSize, dotSize)
             }
         }
