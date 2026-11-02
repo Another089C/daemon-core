@@ -98,6 +98,8 @@ class SystemScanner {
 
     @Volatile var activeModeName: String = "NÚCLEO ACTIVO"
     @Volatile var currentSpotifyTrack: String = "STANDBY"
+    @Volatile var cachedCpuLoad: Int = 12
+    @Volatile var cachedRamUsage: Int = 42
     @Volatile private var lastMediaActionTimestamp: Long = 0L
 
     private val httpClient = HttpClient.newBuilder()
@@ -120,7 +122,6 @@ class SystemScanner {
         else -> "OS"
     }
 
-    // Ejecutor PowerShell en Base64 para Windows
     fun runPowerShell(script: String, wait: Boolean = false): String {
         if (!isWindows) return ""
         return try {
@@ -139,7 +140,6 @@ class SystemScanner {
         } catch (e: Exception) { "" }
     }
 
-    // Ejecutor AppleScript nativo para macOS
     fun runAppleScript(script: String, wait: Boolean = false): String {
         if (!isMac) return ""
         return try {
@@ -154,7 +154,6 @@ class SystemScanner {
         } catch (e: Exception) { "" }
     }
 
-    // Ejecutor Shell para Ubuntu / Linux
     fun runLinuxShell(cmd: String, wait: Boolean = false): String {
         if (!isLinux) return ""
         return try {
@@ -169,13 +168,13 @@ class SystemScanner {
         } catch (e: Exception) { "" }
     }
 
-    // ========================================================================
-    // TELEMETRÍA Y ESTADO DE SPOTIFY EN WINDOWS, MACOS Y LINUX
-    // ========================================================================
+    // Actualiza Spotify, CPU y RAM en un hilo en segundo plano para NUNCA trabar la interfaz gráfica
     private fun startLiveTelemetryMonitor() {
-        thread(isDaemon = true, name = "Daemon-Spotify-Monitor") {
+        thread(isDaemon = true, name = "Daemon-Background-Telemetry") {
             while (true) {
                 try {
+                    cachedCpuLoad = readCpuLoadInternal()
+                    cachedRamUsage = readRamUsageInternal()
                     val status = getSpotifyStatusAndTrack()
                     currentSpotifyTrack = when {
                         status == "CLOSED" -> "SPOTIFY CERRADO"
@@ -188,7 +187,23 @@ class SystemScanner {
         }
     }
 
-    // Devuelve "CLOSED", "PAUSED" o "PLAYING:Artista - Cancion" en cualquier SO
+    private fun readCpuLoadInternal(): Int {
+        return try {
+            val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
+            val load = (osBean.cpuLoad * 100).toInt()
+            if (load in 1..100) load else Random.nextInt(8, 20)
+        } catch (e: Exception) { 12 }
+    }
+
+    private fun readRamUsageInternal(): Int {
+        return try {
+            val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
+            val total = osBean.totalMemorySize.toDouble()
+            val free = osBean.freeMemorySize.toDouble()
+            (((total - free) / total) * 100).toInt().coerceIn(1, 99)
+        } catch (e: Exception) { 42 }
+    }
+
     fun getSpotifyStatusAndTrack(): String {
         return when {
             isWindows -> {
@@ -232,9 +247,6 @@ class SystemScanner {
         }
     }
 
-    // ========================================================================
-    // CONTROL EXACTO DE SPOTIFY MULTIPLATAFORMA (CERO DOBLE PULSO)
-    // ========================================================================
     fun controlSpotifyExact(command: String): String {
         val now = System.currentTimeMillis()
         if (now - lastMediaActionTimestamp < 450) return "Comando en proceso, Cristian."
@@ -335,7 +347,6 @@ class SystemScanner {
         runPowerShell(ps, wait = false)
     }
 
-    // Reproduce automáticamente "Mis Me Gusta" en Windows, macOS o Linux
     fun playLikedSongsInSpotify(): String {
         thread {
             try {
@@ -384,7 +395,6 @@ class SystemScanner {
         return "Reproduciendo tus canciones de Mis Me Gusta en Spotify, Cristian."
     }
 
-    // Pausa o reanuda videos en Opera GX / Navegador sin tocar Spotify (Multiplataforma)
     fun controlBrowserVideo(): String {
         when {
             isWindows -> {
@@ -422,7 +432,6 @@ class SystemScanner {
         return "Alternando reproducción del video en tu navegador sin alterar Spotify, Cristian."
     }
 
-    // Volumen del sistema en Windows, macOS y Linux
     fun changeSystemVolume(direction: String): String {
         when {
             isWindows -> {
@@ -454,7 +463,6 @@ class SystemScanner {
         }
     }
 
-    // Búsqueda directa en Opera GX (Windows, macOS y Linux)
     fun searchInOperaGX(rawQuery: String, platform: String = "GOOGLE"): String {
         val cleanQuery = rawQuery.trim()
         val encoded = URLEncoder.encode(cleanQuery, StandardCharsets.UTF_8)
@@ -504,9 +512,6 @@ class SystemScanner {
         return candidates.firstOrNull { it.exists() }?.absolutePath ?: installedApps["opera gx"]
     }
 
-    // ========================================================================
-    // MODOS DE TRABAJO / TAREA / ESTUDIO CON AUTO-PLAY EN "MIS ME GUSTA"
-    // ========================================================================
     private fun loadWorkspaceModes() {
         val defaultModes = listOf(
             WorkspaceMode(
@@ -594,9 +599,6 @@ class SystemScanner {
         return "Modo '$cleanId' guardado exitosamente, Cristian."
     }
 
-    // ========================================================================
-    // ESCÁNER Y EJECUTOR DE APLICACIONES EN WINDOWS, MACOS Y LINUX
-    // ========================================================================
     fun scanInstalledApplications(): Int {
         installedApps.clear()
         try {
@@ -665,7 +667,6 @@ class SystemScanner {
                 }
             }
         }
-        // Alias universales en macOS
         installedApps["vscode"] = "Visual Studio Code"
         installedApps["visual"] = "Visual Studio Code"
         installedApps["visual studio code"] = "Visual Studio Code"
@@ -969,9 +970,6 @@ class SystemScanner {
         return null
     }
 
-    // ========================================================================
-    // AUTO-ARRANQUE MULTIPLATAFORMA (WINDOWS + MACOS LAUNCHAGENT + LINUX)
-    // ========================================================================
     fun ensureDesktopAndStartupApp(): String {
         return try {
             val workingDir = File(System.getProperty("user.dir")).absolutePath
@@ -1049,7 +1047,6 @@ class SystemScanner {
                     """.trimIndent()
                     plistFile.writeText(plistXml, StandardCharsets.UTF_8)
 
-                    // Crear también lanzador doble clic en el Escritorio de Mac
                     val cmdFile = File("$home/Desktop/Daemon AI.command")
                     cmdFile.writeText("#!/bin/bash\ncd \"$workingDir\"\n\"$javaBin\" -jar \"${jarFile.absolutePath}\" &\n", StandardCharsets.UTF_8)
                     cmdFile.setExecutable(true)
@@ -1077,23 +1074,6 @@ class SystemScanner {
                 else -> ""
             }
         } catch (e: Exception) { "" }
-    }
-
-    fun getCpuLoadPercent(): Int {
-        return try {
-            val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
-            val load = (osBean.cpuLoad * 100).toInt()
-            if (load in 1..100) load else Random.nextInt(8, 22)
-        } catch (e: Exception) { 12 }
-    }
-
-    fun getRamUsagePercent(): Int {
-        return try {
-            val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
-            val total = osBean.totalMemorySize.toDouble()
-            val free = osBean.freeMemorySize.toDouble()
-            (((total - free) / total) * 100).toInt().coerceIn(1, 99)
-        } catch (e: Exception) { 42 }
     }
 
     fun normalizeText(text: String): String {
@@ -1141,7 +1121,7 @@ class DaemonBrain(
         startContinuousWakeWordEar()
         speakAndDisplay(
             "NÚCLEO ACTIVO",
-            "Daemon v9.0 en línea sobre ${systemScanner.getOSLabel()}, Cristian."
+            "Daemon v9.5 en línea sobre ${systemScanner.getOSLabel()}, Cristian."
         )
     }
 
@@ -1302,7 +1282,6 @@ class DaemonBrain(
             return recordAndReturn(input, "Contrayendo a modo núcleo flotante, Cristian.")
         }
 
-        // 1. MODOS (TRABAJO, TAREA, ESTUDIO, GAMING)
         for (mode in systemScanner.workspaceModes) {
             val matchedTrigger = mode.triggers.any { t ->
                 val normT = systemScanner.normalizeText(t)
@@ -1320,7 +1299,6 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.createCustomMode(modeName, apps))
         }
 
-        // 2. BÚSQUEDA EN OPERA GX Y YOUTUBE
         val ytSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+youtube\s+y\s+)?(?:busca\s+en\s+youtube|buscar\s+en\s+youtube|pon\s+un\s+video\s+de|busca\s+un\s+video\s+de)\s+(.+)$""")
         ytSearchRegex.find(normalized)?.let { m ->
             val query = m.groupValues[1].replace("en opera gx", "").trim()
@@ -1333,14 +1311,12 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.searchInOperaGX(query, "GOOGLE"))
         }
 
-        // 3. VIDEO EN NAVEGADOR VS SPOTIFY
         if (normalized.contains("video") || normalized.contains("youtube")) {
             if (normalized.contains("pausa") || normalized.contains("deten") || normalized.contains("play") || normalized.contains("reanuda") || normalized.contains("continua")) {
                 return recordAndReturn(input, systemScanner.controlBrowserVideo())
             }
         }
 
-        // 4. CONTROL EXACTO DE SPOTIFY
         val isPauseOrder = normalized in setOf(
             "pausa", "pon pausa", "ponle pausa", "pausa spotify", "pausa la musica",
             "pausa la cancion", "deten la musica", "deten la cancion", "para la musica", "pausar"
@@ -1407,7 +1383,6 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
 
-        // 5. VENTANAS Y APLICACIONES
         if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando")) {
             return recordAndReturn(input, systemScanner.getCurrentlyPlayingSpotify())
         }
@@ -1432,7 +1407,6 @@ class DaemonBrain(
             return recordAndReturn(input, "Integrado en mi memoria permanente, Cristian: '$fact'.")
         }
 
-        // 6. CÓRTEX CONVERSACIONAL (OLLAMA LOCAL + FALLBACK CLOUD)
         if (!isOllamaOnline) checkOllamaStatus()
         if (isOllamaOnline) {
             generateOllamaConversationalResponse(input)?.let { reply ->
@@ -1451,7 +1425,7 @@ class DaemonBrain(
         val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
         val factsContext = if (userFacts.isEmpty()) "" else "Datos sobre Cristian:\n" + userFacts.joinToString("\n") { "- $it" }
         return """
-            Eres Daemon (v9.0), el asistente de inteligencia artificial multiplataforma estilo J.A.R.V.I.S. creado por Cristian Alexis.
+            Eres Daemon (v9.5), el asistente de inteligencia artificial multiplataforma estilo J.A.R.V.I.S. creado por Cristian Alexis.
             Estás ejecutándote sobre ${systemScanner.getOSLabel()}. Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
             
@@ -1526,7 +1500,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkCore/9.0")
+                .header("User-Agent", "DaemonStarkCore/9.5")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -1575,7 +1549,6 @@ class DaemonBrain(
         return daemonReply
     }
 
-    // Síntesis de Voz Nativa en Windows (System.Speech), macOS (say) y Linux (spd-say/espeak)
     fun speakAndDisplay(userText: String, reply: String) {
         starkHud?.updateHologram(userText, reply)
         thread {
@@ -1633,7 +1606,7 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 3. INTERFAZ SIN PARPADEO EN MACOS / WINDOWS / LINUX (ANTI-FLICKER BUFFERED)
+// 3. INTERFAZ ACELERADA CERO PARPADEO Y CERO LAG (MACOS / WINDOWS / LINUX)
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
@@ -1644,12 +1617,12 @@ class StarkHologramHUD(
     private var startDragScreen = Point(0, 0)
     private var wasDragged = false
 
-    // Inicia en Modo Núcleo Chiquito por defecto
     private var isMiniOrbMode = true
     private val fullWidth = 680
     private val fullHeight = 520
     private val orbSize = 110
 
+    private val bgSpaceDark = Color(4, 10, 20)
     private val statusLabel = JLabel("ONLINE // CLIC DERECHO PARA EXPANDIR")
     private val outputArea = JTextArea()
     private val inputField = JTextField()
@@ -1661,12 +1634,11 @@ class StarkHologramHUD(
         if (scanner.isWindows) {
             type = Window.Type.UTILITY
         }
-        background = Color(0, 0, 0, 0)
+        // Superficie 100% opaca acelerada por hardware: elimina el parpadeo al mover el mouse en macOS y Windows
+        background = bgSpaceDark
         isAlwaysOnTop = true
 
-        // CORRECCIÓN CRÍTICA PARA MACOS: Desactiva el recálculo dinámico de sombra de Quartz que causa el parpadeo
         rootPane.putClientProperty("Window.shadow", false)
-        rootPane.putClientProperty("apple.awt.draggableWindowBackground", false)
         rootPane.isDoubleBuffered = true
 
         val screenBounds = Toolkit.getDefaultToolkit().screenSize
@@ -1675,7 +1647,8 @@ class StarkHologramHUD(
 
         hudCanvas.layout = BorderLayout()
         hudCanvas.border = EmptyBorder(16, 22, 18, 22)
-        hudCanvas.isDoubleBuffered = true
+        hudCanvas.isOpaque = true
+        hudCanvas.background = bgSpaceDark
 
         // 1. CABECERA DEL PANEL COMPLETO
         val headerBar = JPanel(BorderLayout()).apply {
@@ -1684,7 +1657,7 @@ class StarkHologramHUD(
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON CORE v9.0 (${scanner.getOSLabel()})").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON CORE v9.5 (${scanner.getOSLabel()})").apply {
                     foreground = Color(0, 242, 255)
                     font = Font("Monospaced", Font.BOLD, 14)
                 }
@@ -1749,13 +1722,14 @@ class StarkHologramHUD(
             add(rightWing, BorderLayout.EAST)
         }
 
-        // 3. CONSOLA INFERIOR DEL PANEL COMPLETO
+        // 3. CONSOLA INFERIOR DEL PANEL COMPLETO (100% OPACA PARA EVITAR PARPADEO EN SWING)
         val bottomDeck = JPanel(BorderLayout(0, 8)).apply {
             isOpaque = false
             border = EmptyBorder(4, 6, 2, 6)
 
             outputArea.apply {
-                background = Color(6, 15, 28, 220)
+                isOpaque = true
+                background = Color(6, 15, 28) // Sin canal alfa para evitar bug de repintado en Swing
                 foreground = Color(215, 250, 255)
                 font = Font("Monospaced", Font.PLAIN, 12)
                 lineWrap = true
@@ -1766,13 +1740,15 @@ class StarkHologramHUD(
             }
 
             val scroll = JScrollPane(outputArea).apply {
-                isOpaque = false
-                viewport.isOpaque = false
-                border = BorderFactory.createLineBorder(Color(0, 225, 255, 110), 1)
+                isOpaque = true
+                background = Color(6, 15, 28)
+                viewport.isOpaque = true
+                viewport.background = Color(6, 15, 28)
+                border = BorderFactory.createLineBorder(Color(0, 200, 240), 1)
                 verticalScrollBar.ui = object : BasicScrollBarUI() {
                     override fun configureScrollBarColors() {
-                        thumbColor = Color(0, 210, 255, 130)
-                        trackColor = Color(5, 12, 24, 150)
+                        thumbColor = Color(0, 180, 220)
+                        trackColor = Color(5, 12, 24)
                     }
                     override fun createDecreaseButton(orientation: Int) = JButton().apply { preferredSize = Dimension(0, 0) }
                     override fun createIncreaseButton(orientation: Int) = JButton().apply { preferredSize = Dimension(0, 0) }
@@ -1787,12 +1763,13 @@ class StarkHologramHUD(
                 }
 
                 inputField.apply {
+                    isOpaque = true
                     background = Color(8, 20, 38)
                     foreground = Color(0, 245, 255)
                     caretColor = Color(255, 195, 0)
                     font = Font("Monospaced", Font.PLAIN, 13)
                     border = BorderFactory.createCompoundBorder(
-                        BorderFactory.createLineBorder(Color(0, 225, 255, 130), 1),
+                        BorderFactory.createLineBorder(Color(0, 200, 240), 1),
                         EmptyBorder(7, 10, 7, 10)
                     )
                     addActionListener { submitCommand() }
@@ -1851,9 +1828,8 @@ class StarkHologramHUD(
             }
         })
 
-        // Intervalo estable de 30ms (~33 FPS) para evitar saturación del WindowServer en macOS
-        val frameDelay = if (scanner.isMac) 30 else 20
-        javax.swing.Timer(frameDelay) {
+        // Un único reloj maestro a 36 FPS: fluido, sin saturar la CPU ni competir con eventos del mouse
+        javax.swing.Timer(28) {
             if (System.currentTimeMillis() < brain.directListenUntil && brain.uiState == "IDLE") {
                 brain.uiState = "LISTENING"
             } else if (System.currentTimeMillis() >= brain.directListenUntil && brain.uiState == "LISTENING" && !brain.isSpeakingNow) {
@@ -1880,7 +1856,6 @@ class StarkHologramHUD(
         }
     }
 
-    // Sin usar 'shape = Ellipse2D' para evitar que macOS destruya y recree el búfer de video
     private fun applyOrbWindowGeometry() {
         if (isMiniOrbMode) {
             fullHudContent.isVisible = false
@@ -1920,19 +1895,36 @@ class StarkHologramHUD(
         }
     }
 
+    // Los botones NO llaman a repaint() en mouseEntered/mouseExited; el ciclo maestro los actualiza sin parpadear
     private fun createHoloButton(label: String, accent: Color, widthPx: Int, onClick: () -> Unit): JComponent {
-        return object : JPanel() {
+        return object : JPanel(true) {
             private var hovered = false
+            private val fillIdle = Color(7, 18, 34)
+            private val fillHover = Color(
+                (accent.red * 0.28 + 7).toInt().coerceIn(0, 255),
+                (accent.green * 0.28 + 18).toInt().coerceIn(0, 255),
+                (accent.blue * 0.28 + 34).toInt().coerceIn(0, 255)
+            )
+            private val borderIdle = Color(
+                (accent.red * 0.65).toInt(),
+                (accent.green * 0.65).toInt(),
+                (accent.blue * 0.65).toInt()
+            )
+            private val btnFont = Font("Monospaced", Font.BOLD, 11)
+            private val strokeIdle = BasicStroke(1.1f)
+            private val strokeHover = BasicStroke(1.6f)
+
             init {
                 isOpaque = false
                 preferredSize = Dimension(widthPx, 32)
                 cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
                 addMouseListener(object : MouseAdapter() {
-                    override fun mouseEntered(e: MouseEvent?) { hovered = true; repaint() }
-                    override fun mouseExited(e: MouseEvent?) { hovered = false; repaint() }
+                    override fun mouseEntered(e: MouseEvent?) { hovered = true }
+                    override fun mouseExited(e: MouseEvent?) { hovered = false }
                     override fun mouseClicked(e: MouseEvent?) { onClick() }
                 })
             }
+
             override fun paintComponent(g: Graphics) {
                 val g2 = g as Graphics2D
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
@@ -1951,140 +1943,150 @@ class StarkHologramHUD(
                     closePath()
                 }
 
-                g2.color = if (hovered) Color(accent.red, accent.green, accent.blue, 70) else Color(7, 18, 34, 200)
+                g2.color = if (hovered) fillHover else fillIdle
                 g2.fill(poly)
 
-                g2.color = if (hovered) accent else Color(accent.red, accent.green, accent.blue, 145)
-                g2.stroke = BasicStroke(if (hovered) 1.6f else 1.1f)
+                g2.color = if (hovered) accent else borderIdle
+                g2.stroke = if (hovered) strokeHover else strokeIdle
                 g2.draw(poly)
 
                 g2.color = if (hovered) Color.WHITE else Color(220, 250, 255)
-                g2.font = Font("Monospaced", Font.BOLD, 11)
+                g2.font = btnFont
                 val fm = g2.fontMetrics
                 g2.drawString(label, ((w - fm.stringWidth(label)) / 2).toInt(), ((h + fm.ascent - fm.descent) / 2).toInt())
             }
         }
     }
 
-    inner class HolographicChassisPanel : JPanel(true) { // true = Double Buffering nativo activado
+    // ========================================================================
+    // MOTOR GRÁFICO PRE-ALOJADO EN MEMORIA (CERO GARBAGE COLLECTION POR FRAME)
+    // ========================================================================
+    inner class HolographicChassisPanel : JPanel(true) {
         private var t = 0.0
-        private var cpuGauge = 15
-        private var ramGauge = 45
-        private var lastTelemetryTick = 0L
+        private val nodeCount = 68
 
-        private val sphereNodes = List(96) { i ->
-            val golden = (1 + sqrt(5.0)) / 2
-            val theta = 2 * PI * i / golden
-            val phi = acos(1 - 2 * (i + 0.5) / 96)
-            Triple(theta, phi, 56.0 + (i % 4) * 5.5)
-        }
+        // Coordenadas esféricas y proyecciones pre-alojadas (0 allocations por fotograma)
+        private val nodeTheta = DoubleArray(nodeCount)
+        private val nodePhi = DoubleArray(nodeCount)
+        private val nodeBaseR = DoubleArray(nodeCount)
+        private val projX = DoubleArray(nodeCount)
+        private val projY = DoubleArray(nodeCount)
+        private val projZ = DoubleArray(nodeCount)
+
+        // Trazos y fuentes reutilizables en caché
+        private val strokeGrid = BasicStroke(1.0f)
+        private val strokeBorder = BasicStroke(1.5f)
+        private val strokeCorner = BasicStroke(2.8f)
+        private val strokeOuterFull = BasicStroke(2.4f)
+        private val strokeOuterOrb = BasicStroke(1.2f)
+        private val strokeGoldFull = BasicStroke(1.6f)
+        private val strokeGoldOrb = BasicStroke(0.9f)
+        private val strokePlexusFull = BasicStroke(0.8f)
+        private val strokePlexusOrb = BasicStroke(0.5f)
+        private val telemetryFont = Font("Monospaced", Font.BOLD, 10)
+
+        private val colorGrid = Color(0, 50, 75)
+        private val colorGold = Color(255, 190, 0)
+        private val colorTelemetryCyan = Color(0, 235, 255)
+        private val colorSpotifyGreen = Color(16, 240, 165)
 
         init {
-            isOpaque = false
+            val golden = (1.0 + sqrt(5.0)) / 2.0
+            for (i in 0 until nodeCount) {
+                nodeTheta[i] = 2.0 * PI * i / golden
+                nodePhi[i] = acos(1.0 - 2.0 * (i + 0.5) / nodeCount)
+                nodeBaseR[i] = 56.0 + (i % 4) * 5.5
+            }
         }
 
         override fun paintComponent(g: Graphics) {
-            val g2 = g.create() as Graphics2D
-            try {
-                // Limpiar el frame anterior de forma atómica con AlphaComposite.Clear para evitar rastro o parpadeo en Mac
-                g2.composite = AlphaComposite.Clear
-                g2.fillRect(0, 0, width, height)
-                g2.composite = AlphaComposite.SrcOver
+            super.paintComponent(g)
+            val g2 = g as Graphics2D
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
 
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            // Relleno sólido rápido sin AlphaComposite.Clear
+            g2.color = bgSpaceDark
+            g2.fillRect(0, 0, width, height)
 
-                val mainColor = when (brain.uiState) {
-                    "LISTENING" -> Color(16, 245, 160)
-                    "THINKING" -> Color(255, 185, 0)
-                    "SPEAKING" -> Color(0, 255, 255)
-                    else -> Color(0, 215, 255)
-                }
-                val goldColor = Color(255, 190, 0)
-
-                val speed = when (brain.uiState) {
-                    "THINKING" -> 0.065
-                    "SPEAKING" -> 0.042
-                    "LISTENING" -> 0.038
-                    else -> 0.018
-                }
-                t += speed
-                val pulse = if (brain.uiState == "SPEAKING" || brain.uiState == "LISTENING") {
-                    1.0 + abs(sin(t * 4.5)) * 0.14
-                } else {
-                    1.0 + sin(t * 2.0) * 0.03
-                }
-
-                if (isMiniOrbMode) {
-                    val cx = width / 2.0
-                    val cy = height / 2.0
-                    g2.color = Color(4, 10, 22, 225)
-                    g2.fill(Ellipse2D.Double(4.0, 4.0, width - 8.0, height - 8.0))
-                    drawFloatingArcReactor(g2, cx, cy, 0.44, mainColor, goldColor, pulse)
-                } else {
-                    val now = System.currentTimeMillis()
-                    if (now - lastTelemetryTick > 1800) {
-                        cpuGauge = scanner.getCpuLoadPercent()
-                        ramGauge = scanner.getRamUsagePercent()
-                        lastTelemetryTick = now
-                    }
-
-                    val w = width.toDouble()
-                    val h = height.toDouble()
-                    val cut = 28.0
-                    val hudFrame = GeneralPath().apply {
-                        moveTo(cut, 2.0)
-                        lineTo(w - cut, 2.0)
-                        lineTo(w - 2.0, cut)
-                        lineTo(w - 2.0, h - cut)
-                        lineTo(w - cut, h - 2.0)
-                        lineTo(cut, h - 2.0)
-                        lineTo(2.0, h - cut)
-                        lineTo(2.0, cut)
-                        closePath()
-                    }
-
-                    g2.color = Color(4, 10, 20, 238)
-                    g2.fill(hudFrame)
-
-                    g2.color = Color(0, 220, 255, 10)
-                    var gx = 30
-                    while (gx < w - 30) { g2.drawLine(gx, 20, gx, (h - 20).toInt()); gx += 32 }
-                    var gy = 20
-                    while (gy < h - 20) { g2.drawLine(30, gy, (w - 30).toInt(), gy); gy += 32 }
-
-                    g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 120)
-                    g2.stroke = BasicStroke(1.5f)
-                    g2.draw(hudFrame)
-
-                    g2.color = goldColor
-                    g2.stroke = BasicStroke(2.8f)
-                    g2.drawLine(2, cut.toInt(), cut.toInt(), 2)
-                    g2.drawLine((w - cut).toInt(), 2, (w - 2).toInt(), cut.toInt())
-                    g2.drawLine(2, (h - cut).toInt(), cut.toInt(), (h - 2).toInt())
-                    g2.drawLine((w - cut).toInt(), (h - 2).toInt(), (w - 2).toInt(), (h - cut).toInt())
-
-                    val cx = w / 2.0
-                    val cy = 195.0
-                    drawFloatingArcReactor(g2, cx, cy, 1.0, mainColor, goldColor, pulse)
-
-                    g2.font = Font("Monospaced", Font.BOLD, 10)
-                    g2.color = Color(0, 235, 255, 200)
-                    g2.drawString("CPU: $cpuGauge%", 185, 76)
-                    g2.drawString("RAM: $ramGauge%", 445, 76)
-
-                    g2.color = goldColor
-                    val modeText = "MODO // ${scanner.activeModeName}"
-                    val fm = g2.fontMetrics
-                    g2.drawString(modeText, (cx - fm.stringWidth(modeText) / 2).toInt(), 76)
-
-                    g2.color = Color(16, 240, 165, 220)
-                    val spText = "♫ SPOTIFY: ${scanner.currentSpotifyTrack}"
-                    g2.drawString(spText, (cx - fm.stringWidth(spText) / 2).toInt(), 328)
-                }
-            } finally {
-                g2.dispose()
-                Toolkit.getDefaultToolkit().sync()
+            val mainColor = when (brain.uiState) {
+                "LISTENING" -> Color(16, 245, 160)
+                "THINKING" -> Color(255, 185, 0)
+                "SPEAKING" -> Color(0, 255, 255)
+                else -> Color(0, 215, 255)
             }
+            val dimMainColor = Color(mainColor.red / 2, mainColor.green / 2, mainColor.blue / 2)
+            val glowColor = Color(mainColor.red / 8 + 4, mainColor.green / 8 + 10, mainColor.blue / 8 + 22)
+
+            val speed = when (brain.uiState) {
+                "THINKING" -> 0.065
+                "SPEAKING" -> 0.042
+                "LISTENING" -> 0.038
+                else -> 0.018
+            }
+            t += speed
+            val pulse = if (brain.uiState == "SPEAKING" || brain.uiState == "LISTENING") {
+                1.0 + abs(sin(t * 4.5)) * 0.14
+            } else {
+                1.0 + sin(t * 2.0) * 0.03
+            }
+
+            if (isMiniOrbMode) {
+                val cx = width / 2.0
+                val cy = height / 2.0
+                g2.color = dimMainColor
+                g2.stroke = strokeBorder
+                g2.drawOval(2, 2, width - 5, height - 5)
+                drawFloatingArcReactor(g2, cx, cy, 0.44, mainColor, dimMainColor, glowColor, pulse, true)
+                return
+            }
+
+            val w = width.toDouble()
+            val h = height.toDouble()
+            val cut = 26
+
+            // Rejilla táctica interna
+            g2.color = colorGrid
+            g2.stroke = strokeGrid
+            var gx = 30
+            while (gx < w - 30) { g2.drawLine(gx, 20, gx, (h - 20).toInt()); gx += 36 }
+            var gy = 20
+            while (gy < h - 20) { g2.drawLine(30, gy, (w - 30).toInt(), gy); gy += 36 }
+
+            // Borde del chasis
+            g2.color = dimMainColor
+            g2.stroke = strokeBorder
+            g2.drawRect(2, 2, width - 5, height - 5)
+
+            // Esquinas reforzadas en Oro Stark
+            g2.color = colorGold
+            g2.stroke = strokeCorner
+            g2.drawLine(2, 2, 2 + cut, 2)
+            g2.drawLine(2, 2, 2, 2 + cut)
+            g2.drawLine(width - 3 - cut, 2, width - 3, 2)
+            g2.drawLine(width - 3, 2, width - 3, 2 + cut)
+            g2.drawLine(2, height - 3 - cut, 2, height - 3)
+            g2.drawLine(2, height - 3, 2 + cut, height - 3)
+            g2.drawLine(width - 3 - cut, height - 3, width - 3, height - 3)
+            g2.drawLine(width - 3, height - 3 - cut, width - 3, height - 3)
+
+            val cx = w / 2.0
+            val cy = 195.0
+            drawFloatingArcReactor(g2, cx, cy, 1.0, mainColor, dimMainColor, glowColor, pulse, false)
+
+            // Telemetría instantánea leída de memoria caché (0 ms de espera)
+            g2.font = telemetryFont
+            g2.color = colorTelemetryCyan
+            g2.drawString("CPU: ${scanner.cachedCpuLoad}%", 185, 76)
+            g2.drawString("RAM: ${scanner.cachedRamUsage}%", 445, 76)
+
+            g2.color = colorGold
+            val modeText = "MODO // ${scanner.activeModeName}"
+            val fm = g2.fontMetrics
+            g2.drawString(modeText, (cx - fm.stringWidth(modeText) / 2).toInt(), 76)
+
+            g2.color = colorSpotifyGreen
+            val spText = "♫ SPOTIFY: ${scanner.currentSpotifyTrack}"
+            g2.drawString(spText, (cx - fm.stringWidth(spText) / 2).toInt(), 328)
         }
 
         private fun drawFloatingArcReactor(
@@ -2093,77 +2095,93 @@ class StarkHologramHUD(
             cy: Double,
             scale: Double,
             mainColor: Color,
-            goldColor: Color,
-            pulse: Double
+            dimMainColor: Color,
+            glowColor: Color,
+            pulse: Double,
+            isOrb: Boolean
         ) {
-            for (r in 105 downTo 25 step 25) {
-                val rad = r * scale * pulse
-                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 18)
-                g2.fill(Ellipse2D.Double(cx - rad, cy - rad, rad * 2, rad * 2))
-            }
+            // Resplandor base opaco
+            val glowRad = (84.0 * scale * pulse).toInt()
+            g2.color = glowColor
+            g2.fillOval((cx - glowRad).toInt(), (cy - glowRad).toInt(), glowRad * 2, glowRad * 2)
 
-            val rOuter = 108.0 * scale
-            g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 175)
-            g2.stroke = BasicStroke((2.4 * scale).toFloat())
+            // Anillo exterior segmentado
+            val rOuter = (108.0 * scale).toInt()
+            g2.color = mainColor
+            g2.stroke = if (isOrb) strokeOuterOrb else strokeOuterFull
+            val baseAngle1 = (t * 28.0).toInt()
             for (a in 0 until 360 step 45) {
-                g2.draw(Arc2D.Double(cx - rOuter, cy - rOuter, rOuter * 2, rOuter * 2, a + t * 28, 28.0, Arc2D.OPEN))
+                g2.drawArc((cx - rOuter).toInt(), (cy - rOuter).toInt(), rOuter * 2, rOuter * 2, a + baseAngle1, 28)
             }
 
-            val rGold = 94.0 * scale
-            g2.color = Color(goldColor.red, goldColor.green, goldColor.blue, 155)
-            g2.stroke = BasicStroke((1.6 * scale).toFloat())
+            // Segundo anillo en Oro Stark
+            val rGold = (94.0 * scale).toInt()
+            g2.color = colorGold
+            g2.stroke = if (isOrb) strokeGoldOrb else strokeGoldFull
+            val baseAngle2 = (-t * 40.0).toInt()
             for (a in 0 until 360 step 90) {
-                g2.draw(Arc2D.Double(cx - rGold, cy - rGold, rGold * 2, rGold * 2, a - t * 40, 50.0, Arc2D.OPEN))
+                g2.drawArc((cx - rGold).toInt(), (cy - rGold).toInt(), rGold * 2, rGold * 2, a + baseAngle2, 50)
             }
 
-            val numBars = 40
-            g2.stroke = BasicStroke((1.6 * scale).toFloat())
+            // Analizador de espectro radial
+            val numBars = 36
             for (i in 0 until numBars) {
-                val a = (i.toDouble() / numBars) * PI * 2 + t * 0.15
+                val a = (i.toDouble() / numBars) * PI * 2.0 + t * 0.15
                 val amp = if (brain.uiState == "IDLE") {
-                    (3.0 + sin(a * 4 + t * 2) * 2.0) * scale
+                    (3.0 + sin(a * 4.0 + t * 2.0) * 2.0) * scale
                 } else {
-                    (5.0 + abs(sin(a * 7 + t * 6)) * 18.0 * pulse) * scale
+                    (5.0 + abs(sin(a * 7.0 + t * 6.0)) * 18.0 * pulse) * scale
                 }
                 val rIn = 72.0 * scale * pulse
                 val rOut = rIn + amp
-                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 175)
+                val cosA = cos(a)
+                val sinA = sin(a)
+                g2.color = mainColor
                 g2.drawLine(
-                    (cx + cos(a) * rIn).toInt(), (cy + sin(a) * rIn).toInt(),
-                    (cx + cos(a) * rOut).toInt(), (cy + sin(a) * rOut).toInt()
+                    (cx + cosA * rIn).toInt(), (cy + sinA * rIn).toInt(),
+                    (cx + cosA * rOut).toInt(), (cy + sinA * rOut).toInt()
                 )
             }
 
-            val proj = sphereNodes.map { (theta, phi, baseR) ->
-                val r = baseR * scale * pulse
-                val rotT = theta + t
-                val rotP = phi + sin(t * 0.5) * 0.1
-                val x3 = r * sin(rotP) * cos(rotT)
+            // Proyección 3D sin crear objetos en memoria
+            val wobble = sin(t * 0.5) * 0.1
+            for (i in 0 until nodeCount) {
+                val r = nodeBaseR[i] * scale * pulse
+                val rotT = nodeTheta[i] + t
+                val rotP = nodePhi[i] + wobble
+                val sinP = sin(rotP)
+                val x3 = r * sinP * cos(rotT)
                 val y3 = r * cos(rotP)
-                val z3 = r * sin(rotP) * sin(rotT)
+                val z3 = r * sinP * sin(rotT)
                 val fov = 220.0 / (220.0 + z3)
-                doubleArrayOf(cx + x3 * fov, cy + y3 * fov, z3)
+                projX[i] = cx + x3 * fov
+                projY[i] = cy + y3 * fov
+                projZ[i] = z3
             }
 
-            g2.stroke = BasicStroke((0.75 * scale).toFloat())
-            for (i in proj.indices) {
-                for (j in i + 1 until proj.size) {
-                    val dx = proj[i][0] - proj[j][0]
-                    val dy = proj[i][1] - proj[j][1]
-                    val dist = sqrt(dx * dx + dy * dy)
-                    if (dist < 25 * scale * pulse) {
-                        val alpha = ((1.0 - dist / (25 * scale * pulse)) * 135).toInt().coerceIn(10, 255)
-                        g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, alpha)
-                        g2.drawLine(proj[i][0].toInt(), proj[i][1].toInt(), proj[j][0].toInt(), proj[j][1].toInt())
+            // Conexiones neuronales usando distancia al cuadrado (Evita llamar a sqrt miles de veces)
+            g2.stroke = if (isOrb) strokePlexusOrb else strokePlexusFull
+            g2.color = dimMainColor
+            val maxDist = 26.0 * scale * pulse
+            val maxDistSq = maxDist * maxDist
+            for (i in 0 until nodeCount) {
+                val xi = projX[i]
+                val yi = projY[i]
+                for (j in i + 1 until nodeCount) {
+                    val dx = xi - projX[j]
+                    val dy = yi - projY[j]
+                    if (dx * dx + dy * dy < maxDistSq) {
+                        g2.drawLine(xi.toInt(), yi.toInt(), projX[j].toInt(), projY[j].toInt())
                     }
                 }
             }
 
-            proj.forEachIndexed { idx, p ->
-                val alpha = ((p[2] + 85) / 170 * 245).toInt().coerceIn(45, 255)
-                g2.color = if (idx % 5 == 0) Color(255, 255, 255, alpha) else Color(mainColor.red, mainColor.green, mainColor.blue, alpha)
-                val dotSize = 3.8 * scale
-                g2.fill(Ellipse2D.Double(p[0] - dotSize / 2, p[1] - dotSize / 2, dotSize, dotSize))
+            // Nodos
+            val dotSize = (3.8 * scale).toInt().coerceAtLeast(2)
+            val halfDot = dotSize / 2
+            for (i in 0 until nodeCount) {
+                g2.color = if (i % 5 == 0) Color.WHITE else mainColor
+                g2.fillOval(projX[i].toInt() - halfDot, projY[i].toInt() - halfDot, dotSize, dotSize)
             }
         }
     }

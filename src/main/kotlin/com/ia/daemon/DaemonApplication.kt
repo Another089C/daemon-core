@@ -11,10 +11,9 @@ fun main(args: Array<String>) {
     val os = System.getProperty("os.name").lowercase()
 
     if (os.contains("mac")) {
-        // Evita el parpadeo del compositor Quartz/Metal en macOS Monterey y superiores
         System.setProperty("apple.awt.application.name", "Daemon AI")
-        System.setProperty("apple.awt.graphics.UseQuartz", "true")
-        System.setProperty("sun.java2d.metal", "false")
+        // Activa aceleración por hardware nativa y evita parpadeo de bordes en macOS
+        System.setProperty("sun.java2d.opengl", "true")
     } else if (os.contains("win")) {
         System.setProperty("sun.java2d.noddraw", "true")
     } else {
