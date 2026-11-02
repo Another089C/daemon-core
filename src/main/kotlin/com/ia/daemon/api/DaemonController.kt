@@ -11,9 +11,9 @@ import java.awt.event.MouseMotionAdapter
 import java.awt.geom.Arc2D
 import java.awt.geom.Ellipse2D
 import java.awt.geom.GeneralPath
-import java.io.BufferedWriter
+import java.io.BufferedReader
 import java.io.File
-import java.io.OutputStreamWriter
+import java.io.InputStreamReader
 import java.lang.management.ManagementFactory
 import java.net.URI
 import java.net.URLDecoder
@@ -35,7 +35,7 @@ import kotlin.math.*
 import kotlin.random.Random
 
 // ============================================================================
-// MODELOS DE DATOS FUERTEMENTE TIPADOS
+// MODELOS DE DATOS
 // ============================================================================
 data class ChatRequest(
     val prompt: String = "",
@@ -84,198 +84,8 @@ data class CloudChatPayload(
     val jsonMode: Boolean = false
 )
 
-data class StemSample(
-    val stems: List<String>,
-    val targetIdx: Int
-)
-
-data class SparseSample(
-    val activeInputs: IntArray,
-    val targetIdx: Int
-)
-
-data class PredictionResult(
-    val node: IntentNode?,
-    val confidence: Double
-)
-
 // ============================================================================
-// 1. RED NEURONAL MULTICAPA LOCAL (MLP)
-// ============================================================================
-class SynapticNeuralNetwork {
-    private var vocabulary = listOf<String>()
-    private var intents = listOf<IntentNode>()
-
-    private var hiddenSize = 72
-    private var w1 = arrayOf<DoubleArray>()
-    private var b1 = DoubleArray(0)
-    private var w2 = arrayOf<DoubleArray>()
-    private var b2 = DoubleArray(0)
-
-    private val stopWords = setOf(
-        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "en",
-        "y", "o", "a", "por", "para", "con", "mi", "tu", "su", "daemon", "oye",
-        "porfa", "favor", "dime", "sabes", "puedes", "podrias", "sobre", "acerca"
-    )
-
-    fun normalizeAndStem(text: String): List<String> {
-        val clean = Normalizer.normalize(text.lowercase(), Normalizer.Form.NFD)
-            .replace(Regex("[\\p{InCombiningDiacriticalMarks}]"), "")
-            .replace(Regex("[^a-z0-9\\s]"), " ")
-            .trim()
-        return clean.split(Regex("\\s+"))
-            .filter { it.length > 1 && it !in stopWords }
-            .map { word -> if (word.length > 5) word.take(5) else word }
-    }
-
-    fun train(dataset: List<IntentNode>) {
-        intents = dataset
-        val vocabSet = linkedSetOf("").apply { clear() }
-        val trainingSamples = mutableListOf(SparseSample(IntArray(0), 0)).apply { clear() }
-        val tempSamples = mutableListOf(StemSample(emptyList(), 0)).apply { clear() }
-
-        intents.forEachIndexed { intentIdx, node ->
-            node.patterns.forEach { pattern ->
-                val stems = normalizeAndStem(pattern)
-                if (stems.isNotEmpty()) {
-                    vocabSet.addAll(stems)
-                    tempSamples.add(StemSample(stems, intentIdx))
-                }
-            }
-        }
-
-        vocabulary = vocabSet.toList()
-        val vocabIndexMap = vocabulary.withIndex().associate { it.value to it.index }
-        val inputSize = vocabulary.size
-        val outputSize = intents.size
-        if (inputSize == 0 || outputSize == 0) return
-
-        for (sample in tempSamples) {
-            val activeIndices = sample.stems.mapNotNull { vocabIndexMap[it] }.distinct().toIntArray()
-            if (activeIndices.isNotEmpty()) {
-                trainingSamples.add(SparseSample(activeIndices, sample.targetIdx))
-            }
-        }
-
-        val rnd = Random(42)
-        w1 = Array(inputSize) { DoubleArray(hiddenSize) { (rnd.nextDouble() - 0.5) * sqrt(2.0 / inputSize) } }
-        b1 = DoubleArray(hiddenSize) { 0.01 }
-        w2 = Array(hiddenSize) { DoubleArray(outputSize) { (rnd.nextDouble() - 0.5) * sqrt(2.0 / hiddenSize) } }
-        b2 = DoubleArray(outputSize) { 0.0 }
-
-        val lr = 0.07
-        val epochs = 200
-        val hidden = DoubleArray(hiddenSize)
-        val logits = DoubleArray(outputSize)
-        val probs = DoubleArray(outputSize)
-        val dOut = DoubleArray(outputSize)
-        val dHidden = DoubleArray(hiddenSize)
-
-        for (epoch in 0 until epochs) {
-            for (sampleIdx in trainingSamples.indices) {
-                val sample = trainingSamples[sampleIdx]
-                val activeInputs = sample.activeInputs
-                val target = sample.targetIdx
-
-                for (j in 0 until hiddenSize) {
-                    var sum = b1[j]
-                    for (i in activeInputs) sum += w1[i][j]
-                    hidden[j] = if (sum > 0.0) sum else 0.0
-                }
-
-                var maxLogit = Double.NEGATIVE_INFINITY
-                for (k in 0 until outputSize) {
-                    var sum = b2[k]
-                    for (j in 0 until hiddenSize) if (hidden[j] > 0.0) sum += hidden[j] * w2[j][k]
-                    logits[k] = sum
-                    if (sum > maxLogit) maxLogit = sum
-                }
-
-                var expSum = 0.0
-                for (k in 0 until outputSize) {
-                    probs[k] = exp(logits[k] - maxLogit)
-                    expSum += probs[k]
-                }
-                for (k in 0 until outputSize) {
-                    probs[k] /= expSum
-                    dOut[k] = probs[k] - (if (k == target) 1.0 else 0.0)
-                }
-
-                for (j in 0 until hiddenSize) {
-                    if (hidden[j] > 0.0) {
-                        var grad = 0.0
-                        for (k in 0 until outputSize) grad += dOut[k] * w2[j][k]
-                        dHidden[j] = grad
-                    } else {
-                        dHidden[j] = 0.0
-                    }
-                }
-
-                for (k in 0 until outputSize) b2[k] -= lr * dOut[k]
-                for (j in 0 until hiddenSize) {
-                    val hj = hidden[j]
-                    if (hj > 0.0) {
-                        val rowW2 = w2[j]
-                        for (k in 0 until outputSize) rowW2[k] -= lr * hj * dOut[k]
-                    }
-                }
-                for (j in 0 until hiddenSize) {
-                    val dh = dHidden[j]
-                    if (dh != 0.0) {
-                        b1[j] -= lr * dh
-                        for (i in activeInputs) w1[i][j] -= lr * dh
-                    }
-                }
-            }
-        }
-    }
-
-    fun predict(rawInput: String): PredictionResult {
-        if (vocabulary.isEmpty() || intents.isEmpty()) return PredictionResult(null, 0.0)
-        val stems = normalizeAndStem(rawInput)
-        if (stems.isEmpty()) return PredictionResult(null, 0.0)
-
-        val activeInputs = vocabulary.indices.filter { vocabulary[it] in stems }
-        if (activeInputs.isEmpty()) return PredictionResult(null, 0.0)
-
-        val hidden = DoubleArray(hiddenSize)
-        for (j in 0 until hiddenSize) {
-            var sum = b1[j]
-            for (i in activeInputs) sum += w1[i][j]
-            hidden[j] = if (sum > 0.0) sum else 0.0
-        }
-
-        val logits = DoubleArray(intents.size)
-        var maxLogit = Double.NEGATIVE_INFINITY
-        for (k in intents.indices) {
-            var sum = b2[k]
-            for (j in 0 until hiddenSize) if (hidden[j] > 0.0) sum += hidden[j] * w2[j][k]
-            logits[k] = sum
-            if (sum > maxLogit) maxLogit = sum
-        }
-
-        val probs = DoubleArray(intents.size)
-        var expSum = 0.0
-        for (k in intents.indices) {
-            probs[k] = exp(logits[k] - maxLogit)
-            expSum += probs[k]
-        }
-
-        var bestIdx = 0
-        var bestProb = 0.0
-        for (k in intents.indices) {
-            probs[k] /= expSum
-            if (probs[k] > bestProb) {
-                bestProb = probs[k]
-                bestIdx = k
-            }
-        }
-        return PredictionResult(intents[bestIdx], bestProb)
-    }
-}
-
-// ============================================================================
-// 2. MOTOR DE SISTEMA ULTRARRÁPIDO, MODOS DE TRABAJO, OPERA GX Y SPOTIFY PURO
+// 1. MOTOR DEL SISTEMA OPERATIVO, SPOTIFY INFALIBLE Y MODOS DE TRABAJO
 // ============================================================================
 @Service
 class SystemScanner {
@@ -291,11 +101,9 @@ class SystemScanner {
     private val savedPlaylists = mutableMapOf("init" to "init").apply { clear() }
     val workspaceModes = mutableListOf(WorkspaceMode()).apply { clear() }
 
-    @Volatile var activeModeName: String = "STANDBY"
-    @Volatile var currentSpotifyTrack: String = "SIN REPRODUCCIÓN"
-
-    // Motor persistente de PowerShell en memoria (ejecución en 2 milisegundos, 0 lag)
-    private var persistentPsStdin: BufferedWriter? = null
+    @Volatile var activeModeName: String = "NÚCLEO ACTIVO"
+    @Volatile var currentSpotifyTrack: String = "STANDBY"
+    @Volatile private var lastMediaActionTimestamp: Long = 0L
 
     private val httpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(4))
@@ -303,7 +111,6 @@ class SystemScanner {
         .build()
 
     init {
-        startPersistentWin32Worker()
         scanInstalledApplications()
         loadPlaylists()
         loadWorkspaceModes()
@@ -311,62 +118,7 @@ class SystemScanner {
         startLiveTelemetryMonitor()
     }
 
-    // Levanta un único proceso Win32 en segundo plano para que los comandos sean instantáneos
-    private fun startPersistentWin32Worker() {
-        if (!isWindows) return
-        thread(isDaemon = true, name = "Daemon-Win32-Kernel-Worker") {
-            try {
-                val proc = ProcessBuilder(
-                    "powershell.exe", "-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", "-"
-                ).start()
-                val writer = BufferedWriter(OutputStreamWriter(proc.outputStream, StandardCharsets.UTF_8))
-                persistentPsStdin = writer
-
-                val initWin32Code = """
-                    [Console]::InputEncoding = [System.Text.Encoding]::UTF8
-                    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-                    ${'$'}wsh = New-Object -ComObject WScript.Shell
-                    ${'$'}code = @"
-                    using System;
-                    using System.Runtime.InteropServices;
-                    public class JarvisWin32 {
-                        [DllImport("user32.dll")]
-                        public static extern IntPtr PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-                        [DllImport("user32.dll")]
-                        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
-                        [DllImport("user32.dll")]
-                        public static extern bool SetForegroundWindow(IntPtr hWnd);
-                    }
-"@
-                    Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
-                """.trimIndent()
-
-                writer.write(initWin32Code + "\n")
-                writer.flush()
-            } catch (e: Exception) {
-                println("[DAEMON WORKER ERROR] ${e.message}")
-            }
-        }
-    }
-
-    private fun sendFastWorkerCommand(psCommands: String) {
-        if (!isWindows) return
-        try {
-            val w = persistentPsStdin
-            if (w != null) {
-                synchronized(w) {
-                    w.write(psCommands + "\n")
-                    w.flush()
-                }
-            } else {
-                runPowerShell(psCommands, wait = false)
-            }
-        } catch (e: Exception) {
-            startPersistentWin32Worker()
-            runPowerShell(psCommands, wait = false)
-        }
-    }
-
+    // Ejecutor PowerShell en Base64 UTF-16LE (Sin errores de comillas ni bloqueos de stdin)
     fun runPowerShell(script: String, wait: Boolean = false): String {
         if (!isWindows) return ""
         return try {
@@ -387,140 +139,158 @@ class SystemScanner {
         }
     }
 
-    // Monitorea en segundo plano qué canción suena en Spotify para mostrarlo en el HUD y evitar el bug de Play/Pausa
     private fun startLiveTelemetryMonitor() {
         if (!isWindows) return
-        thread(isDaemon = true, name = "Daemon-Spotify-Telemetry") {
+        thread(isDaemon = true, name = "Daemon-Spotify-Monitor") {
             while (true) {
                 try {
                     val title = getSpotifyWindowTitle()
                     currentSpotifyTrack = when {
                         title.isBlank() -> "SPOTIFY CERRADO"
-                        title.equals("Spotify Free", true) || title.equals("Spotify Premium", true) || title.equals("Spotify", true) ->
-                            "EN PAUSA"
+                        !title.contains(" - ") -> "EN PAUSA"
                         else -> title.take(34)
                     }
                 } catch (e: Exception) {}
-                Thread.sleep(2000)
+                Thread.sleep(2200)
             }
         }
     }
 
-    private fun getSpotifyWindowTitle(): String {
+    fun getSpotifyWindowTitle(): String {
         val script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -First 1 -ExpandProperty MainWindowTitle"
         return runPowerShell(script, wait = true).trim()
     }
 
     // ========================================================================
-    // CONTROL IDEMPOTENTE DE SPOTIFY (NUNCA HACE PLAY Y PAUSA AL MISMO TIEMPO)
+    // PULSACIÓN DE HARDWARE ÚNICA (USER32.DLL KEYBD_EVENT) CON ANTI-REBOTE
     // ========================================================================
+    private fun triggerHardwareMediaKey(vkCode: Int, repeat: Int = 1) {
+        val now = System.currentTimeMillis()
+        if (now - lastMediaActionTimestamp < 450 && repeat == 1) return
+        lastMediaActionTimestamp = now
+
+        val ps = """
+            ${'$'}code = 'using System; using System.Runtime.InteropServices; public class Win32Key { [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo); }'
+            Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
+            for (${'$'}i = 0; ${'$'}i -lt $repeat; ${'$'}i++) {
+                [Win32Key]::keybd_event([byte]$vkCode, 0, 0, 0)
+                Start-Sleep -Milliseconds 25
+                [Win32Key]::keybd_event([byte]$vkCode, 0, 2, 0)
+                if ($repeat -gt 1) { Start-Sleep -Milliseconds 20 }
+            }
+        """.trimIndent()
+        runPowerShell(ps, wait = false)
+    }
+
+    // Control exacto de Spotify: separa Play, Pausa, Siguiente y Anterior sin doble pulso
     fun controlSpotifyExact(command: String): String {
-        if (!isWindows) return "Control multimedia disponible en Windows."
+        if (!isWindows) return "Control multimedia activo en Windows."
 
         val title = getSpotifyWindowTitle()
         val isSpotifyOpen = title.isNotBlank()
-        // En Spotify de escritorio: si tiene " - " en el título está reproduciendo; si dice "Spotify..." está en pausa
-        val isCurrentlyPlaying = isSpotifyOpen && title.contains(" - ")
+        val isPlayingNow = isSpotifyOpen && title.contains(" - ")
 
-        if (!isSpotifyOpen && (command == "PLAY" || command == "TOGGLE")) {
-            openAppByName("spotify")
-            thread {
-                Thread.sleep(2500)
-                sendSpotifyAppCommand(917504)
-            }
-            return "Abriendo Spotify e iniciando reproducción, Cristian."
+        if (!isSpotifyOpen && (command == "PLAY" || command == "NEXT" || command == "PREV")) {
+            playLikedSongsInSpotify()
+            return "Abriendo Spotify y reproduciendo tus canciones de Mis Me Gusta, Cristian."
         }
 
         return when (command) {
             "PAUSE" -> {
-                if (!isSpotifyOpen) return "Spotify está cerrado en este momento, Cristian."
-                if (!isCurrentlyPlaying) return "Spotify ya se encuentra en pausa, Cristian."
-                sendSpotifyAppCommand(917504) // Envía UN SOLO mensaje directo a la ventana de Spotify
+                if (isSpotifyOpen && !isPlayingNow) {
+                    return "Spotify ya está en pausa, Cristian."
+                }
+                triggerHardwareMediaKey(0xB3, 1) // 0xB3 = VK_MEDIA_PLAY_PAUSE (1 solo pulso)
                 currentSpotifyTrack = "EN PAUSA"
                 "Música en pausa, Cristian."
             }
             "PLAY" -> {
-                if (isCurrentlyPlaying) return "La música ya se está reproduciendo en Spotify ($title), Cristian."
-                sendSpotifyAppCommand(917504) // Envía UN SOLO mensaje directo para reanudar
+                if (isPlayingNow) {
+                    return "La música ya se está reproduciendo ($title), Cristian."
+                }
+                triggerHardwareMediaKey(0xB3, 1) // 1 solo pulso para reanudar
                 "Reanudando reproducción en Spotify, Cristian."
             }
-            "TOGGLE" -> {
-                sendSpotifyAppCommand(917504)
-                if (isCurrentlyPlaying) "Música pausada, Cristian." else "Música reanudada, Cristian."
-            }
             "NEXT" -> {
-                sendSpotifyAppCommand(720896) // APPCOMMAND_MEDIA_NEXTTRACK (11 << 16)
-                "Siguiente pista en Spotify, Cristian."
+                triggerHardwareMediaKey(0xB0, 1) // 0xB0 = VK_MEDIA_NEXT_TRACK
+                "Siguiente canción en Spotify, Cristian."
             }
             "PREV" -> {
-                sendSpotifyAppCommand(786432) // APPCOMMAND_MEDIA_PREVIOUSTRACK (12 << 16)
-                "Pista anterior en Spotify, Cristian."
+                triggerHardwareMediaKey(0xB1, 1) // 0xB1 = VK_MEDIA_PREV_TRACK
+                "Canción anterior en Spotify, Cristian."
             }
-            else -> "Comando enviado a Spotify."
+            else -> "Comando multimedia ejecutado."
         }
     }
 
-    // Envía la orden ÚNICAMENTE al proceso principal de Spotify (Sin tocar YouTube ni mandar doble tecla)
-    private fun sendSpotifyAppCommand(appCommandCode: Int) {
-        val cmd = """
-            ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
-            if (${'$'}null -ne ${'$'}sp) {
-                [JarvisWin32]::PostMessageW(${'$'}sp.MainWindowHandle, 0x0319, ${'$'}sp.MainWindowHandle, [IntPtr]$appCommandCode) | Out-Null
-            }
-        """.trimIndent()
-        sendFastWorkerCommand(cmd)
+    // Reproduce automáticamente la lista "Mis Me Gusta" (Canciones que te gustan) en Spotify
+    fun playLikedSongsInSpotify(): String {
+        if (!isWindows) return "Iniciando Mis Me Gusta."
+        thread {
+            try {
+                val ps = """
+                    Start-Process "spotify:collection:tracks"
+                    Start-Sleep -Milliseconds 2600
+                    ${'$'}wsh = New-Object -ComObject WScript.Shell
+                    ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
+                    if (${'$'}null -ne ${'$'}sp) {
+                        ${'$'}wsh.AppActivate(${'$'}sp.Id) | Out-Null
+                        Start-Sleep -Milliseconds 450
+                        ${'$'}wsh.SendKeys("{ENTER}")
+                        Start-Sleep -Milliseconds 700
+                        ${'$'}spCheck = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowTitle -ne "" } | Select-Object -First 1
+                        if (${'$'}null -ne ${'$'}spCheck -and ${'$'}spCheck.MainWindowTitle -notlike "* - *") {
+                            ${'$'}wsh.AppActivate(${'$'}spCheck.Id) | Out-Null
+                            Start-Sleep -Milliseconds 250
+                            ${'$'}wsh.SendKeys("{TAB}{ENTER}")
+                            Start-Sleep -Milliseconds 500
+                            ${'$'}spCheck2 = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowTitle -ne "" } | Select-Object -First 1
+                            if (${'$'}null -ne ${'$'}spCheck2 -and ${'$'}spCheck2.MainWindowTitle -notlike "* - *") {
+                                ${'$'}code = 'using System; using System.Runtime.InteropServices; public class Win32Key { [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo); }'
+                                Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
+                                [Win32Key]::keybd_event(0xB3, 0, 0, 0)
+                                Start-Sleep -Milliseconds 25
+                                [Win32Key]::keybd_event(0xB3, 0, 2, 0)
+                            }
+                        }
+                    }
+                """.trimIndent()
+                runPowerShell(ps, wait = false)
+            } catch (e: Exception) {}
+        }
+        return "Reproduciendo tus canciones de Mis Me Gusta en Spotify, Cristian."
     }
 
-    // ========================================================================
-    // CONTROL EXCLUSIVO DE VIDEO EN NAVEGADOR (SIN AFECTAR A SPOTIFY)
-    // ========================================================================
+    // Control exclusivo para pausar/reanudar un video en Opera GX sin afectar a Spotify
     fun controlBrowserVideo(): String {
-        if (!isWindows) return "Control de video activo en Windows."
-        val cmd = """
-            ${'$'}browser = Get-Process opera, chrome, msedge, brave -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
-            if (${'$'}null -ne ${'$'}browser) {
-                [JarvisWin32]::SetForegroundWindow(${'$'}browser.MainWindowHandle) | Out-Null
-                Start-Sleep -Milliseconds 120
+        if (!isWindows) return "Control de video disponible en Windows."
+        val ps = """
+            ${'$'}wsh = New-Object -ComObject WScript.Shell
+            ${'$'}b = Get-Process opera, chrome, msedge, brave -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
+            if (${'$'}null -ne ${'$'}b) {
+                ${'$'}wsh.AppActivate(${'$'}b.Id) | Out-Null
+                Start-Sleep -Milliseconds 180
                 ${'$'}wsh.SendKeys("k")
             }
         """.trimIndent()
-        sendFastWorkerCommand(cmd)
-        return "Alternando reproducción del video en tu navegador sin alterar Spotify, Cristian."
+        runPowerShell(ps, wait = false)
+        return "Alternando reproducción del video en Opera GX sin tocar tu música de Spotify, Cristian."
     }
 
-    // Control de volumen del sistema (Usa keybd_event exclusivo para audio)
     fun changeSystemVolume(direction: String): String {
-        val vk = when (direction) {
-            "UP" -> 0xAF
-            "DOWN" -> 0xAE
-            "MUTE" -> 0xAD
-            else -> return ""
-        }
-        val times = if (direction == "MUTE") 1 else 5
-        val cmd = """
-            for (${'$'}i = 0; ${'$'}i -lt $times; ${'$'}i++) {
-                [JarvisWin32]::keybd_event([byte]$vk, 0, 0, 0)
-                Start-Sleep -Milliseconds 15
-                [JarvisWin32]::keybd_event([byte]$vk, 0, 2, 0)
-            }
-        """.trimIndent()
-        sendFastWorkerCommand(cmd)
         return when (direction) {
-            "UP" -> "Volumen incrementado, Cristian."
-            "DOWN" -> "Volumen reducido, Cristian."
-            else -> "Audio del sistema silenciado/activado, Cristian."
+            "UP" -> { triggerHardwareMediaKey(0xAF, 5); "Subiendo volumen del sistema, Cristian." }
+            "DOWN" -> { triggerHardwareMediaKey(0xAE, 5); "Bajando volumen del sistema, Cristian." }
+            else -> { triggerHardwareMediaKey(0xAD, 1); "Audio del sistema silenciado/activado, Cristian." }
         }
     }
 
-    // ========================================================================
-    // BÚSQUEDA Y CONTROL DIRECTO EN OPERA GX / YOUTUBE / WEB
-    // ========================================================================
+    // Búsqueda directa en Opera GX
     fun searchInOperaGX(rawQuery: String, platform: String = "GOOGLE"): String {
         val cleanQuery = rawQuery.trim()
         val encoded = URLEncoder.encode(cleanQuery, StandardCharsets.UTF_8)
         val targetUrl = when (platform) {
             "YOUTUBE" -> "https://www.youtube.com/results?search_query=$encoded"
-            "DIRECT_URL" -> if (cleanQuery.startsWith("http")) cleanQuery else "https://$cleanQuery"
             else -> "https://www.google.com/search?q=$encoded"
         }
 
@@ -535,10 +305,10 @@ class SystemScanner {
             ProcessBuilder("cmd", "/c", "start", "", targetUrl).start()
         }
 
-        return when (platform) {
-            "YOUTUBE" -> "Abriendo Opera GX y buscando '$cleanQuery' en YouTube, Cristian."
-            "DIRECT_URL" -> "Abriendo $cleanQuery en Opera GX, Cristian."
-            else -> "Ejecutando búsqueda de '$cleanQuery' en Opera GX, Cristian."
+        return if (platform == "YOUTUBE") {
+            "Buscando '$cleanQuery' en YouTube dentro de Opera GX, Cristian."
+        } else {
+            "Buscando '$cleanQuery' en Opera GX, Cristian."
         }
     }
 
@@ -556,79 +326,84 @@ class SystemScanner {
     }
 
     // ========================================================================
-    // GESTOR DE "MODOS" / PROTOCOLOS DE TRABAJO ESTILO J.A.R.V.I.S.
+    // MODOS DE TRABAJO / TAREA / ESTUDIO CON AUTO-PLAY EN "MIS ME GUSTA"
     // ========================================================================
     private fun loadWorkspaceModes() {
         val defaultModes = listOf(
             WorkspaceMode(
                 id = "TRABAJO",
-                name = "PROTOCOLO DE TRABAJO",
-                triggers = listOf("vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar", "modo programacion", "inicia modo trabajo", "activa modo trabajo"),
-                appsToOpen = listOf("vscode", "notion", "opera gx", "spotify"),
+                name = "PROTOCOLO TRABAJO",
+                triggers = listOf("vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar", "modo programacion", "activa modo trabajo"),
+                appsToOpen = listOf("vscode", "notion", "opera gx"),
                 appsToClose = emptyList(),
-                spotifyPlaylist = "programar",
-                greeting = "Activando Protocolo de Trabajo, Cristian. Desplegando Visual Studio Code, Notion, Opera GX y sincronizando tu música en Spotify."
+                spotifyPlaylist = "mis me gusta",
+                greeting = "Activando Modo Trabajo, Cristian. Abriendo Visual Studio Code, Notion, Opera GX y reproduciendo tus canciones de Mis Me Gusta en Spotify."
+            ),
+            WorkspaceMode(
+                id = "TAREA",
+                name = "PROTOCOLO TAREA",
+                triggers = listOf("vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea", "activa modo tarea"),
+                appsToOpen = listOf("vscode", "notion", "opera gx"),
+                appsToClose = listOf("discord", "steam"),
+                spotifyPlaylist = "mis me gusta",
+                greeting = "Activando Modo Tarea, Cristian. Preparando Visual Studio Code, Notion, Opera GX y reproduciendo automáticamente tu lista Mis Me Gusta en Spotify."
             ),
             WorkspaceMode(
                 id = "ESTUDIO",
-                name = "PROTOCOLO POLITÉCNICO / ESTUDIO",
-                triggers = listOf("vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom", "hora de estudiar"),
+                name = "PROTOCOLO ESTUDIO",
+                triggers = listOf("vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom", "hora de estudiar", "activa modo estudio"),
                 appsToOpen = listOf("notion", "opera gx", "vscode"),
                 appsToClose = listOf("discord", "steam"),
-                spotifyPlaylist = "programar",
-                greeting = "Protocolo de Estudio activado, Cristian. Cerrando distracciones y abriendo Notion, Opera GX y tu entorno de código."
+                spotifyPlaylist = "mis me gusta",
+                greeting = "Activando Modo Estudio, Cristian. Abriendo Notion, Opera GX, Visual Studio Code y reproduciendo automáticamente tus canciones de Mis Me Gusta."
             ),
             WorkspaceMode(
                 id = "GAMING",
                 name = "PROTOCOLO GAMING",
                 triggers = listOf("vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar", "activa modo gaming"),
-                appsToOpen = listOf("discord", "spotify"),
+                appsToOpen = listOf("discord"),
                 appsToClose = listOf("vscode", "notion"),
-                spotifyPlaylist = "reggaeton",
-                greeting = "Protocolo Gaming en línea, Cristian. Liberando memoria RAM de aplicaciones de trabajo e iniciando Discord y Spotify."
+                spotifyPlaylist = "mis me gusta",
+                greeting = "Modo Gaming activo, Cristian. Cerrando aplicaciones de trabajo, abriendo Discord y reproduciendo tu música."
             ),
             WorkspaceMode(
                 id = "DESCANSO",
-                name = "PROTOCOLO DESCANSO / RELAX",
-                triggers = listOf("vamos a descansar", "modo descanso", "modo relax", "protocolo descanso", "modo cine", "terminamos de trabajar"),
-                appsToOpen = listOf("opera gx", "spotify"),
+                name = "PROTOCOLO DESCANSO",
+                triggers = listOf("vamos a descansar", "modo descanso", "modo relax", "protocolo descanso", "terminamos de trabajar"),
+                appsToOpen = listOf("opera gx"),
                 appsToClose = listOf("vscode", "notion"),
                 spotifyPlaylist = "mis me gusta",
-                greeting = "Cerrando entorno de trabajo y activando Modo Descanso, Cristian. Relájate."
+                greeting = "Cerrando entorno de trabajo y activando Modo Descanso, Cristian."
             )
         )
 
-        if (!modesFile.exists()) {
-            workspaceModes.addAll(defaultModes)
+        // Actualizar siempre los modos base para asegurar que Tarea y Estudio usen "mis me gusta"
+        workspaceModes.clear()
+        workspaceModes.addAll(defaultModes)
+        try {
             objectMapper.writeValue(modesFile, workspaceModes)
-        } else {
-            try {
-                val loaded = objectMapper.readValue(modesFile, Array<WorkspaceMode>::class.java)
-                workspaceModes.addAll(loaded)
-            } catch (e: Exception) {
-                workspaceModes.addAll(defaultModes)
-            }
-        }
+        } catch (e: Exception) {}
     }
 
     fun executeWorkspaceMode(mode: WorkspaceMode): String {
         activeModeName = mode.id
         thread {
             try {
-                // 1. Cerrar aplicaciones que no corresponden al modo
                 mode.appsToClose.forEach { app ->
                     closeAppByName(app)
                     Thread.sleep(200)
                 }
-                // 2. Abrir todas las aplicaciones del modo (VS Code, Notion, Opera GX, Spotify, etc.)
                 mode.appsToOpen.forEach { app ->
                     openAppByName(app)
-                    Thread.sleep(650)
+                    Thread.sleep(550)
                 }
-                // 3. Si el modo incluye música en Spotify, iniciarla
                 if (mode.spotifyPlaylist.isNotBlank()) {
-                    Thread.sleep(1600)
-                    playPlaylist(mode.spotifyPlaylist, normalizeText(mode.spotifyPlaylist))
+                    Thread.sleep(900)
+                    if (mode.spotifyPlaylist.contains("me gusta")) {
+                        playLikedSongsInSpotify()
+                    } else {
+                        playPlaylist(mode.spotifyPlaylist, normalizeText(mode.spotifyPlaylist))
+                    }
                 }
             } catch (e: Exception) {}
         }
@@ -640,21 +415,18 @@ class SystemScanner {
         val newMode = WorkspaceMode(
             id = cleanId,
             name = "PROTOCOLO $cleanId",
-            triggers = listOf("modo ${normalizeText(name)}", "vamos a ${normalizeText(name)}", "protocolo ${normalizeText(name)}"),
+            triggers = listOf("modo ${normalizeText(name)}", "vamos a ${normalizeText(name)}"),
             appsToOpen = appsList.map { normalizeText(it) },
             appsToClose = emptyList(),
-            spotifyPlaylist = "",
-            greeting = "Activando modo personalizado $cleanId, Cristian. Abriendo: ${appsList.joinToString(", ")}."
+            spotifyPlaylist = "mis me gusta",
+            greeting = "Activando modo $cleanId y reproduciendo Mis Me Gusta, Cristian."
         )
         workspaceModes.removeIf { it.id == cleanId }
         workspaceModes.add(newMode)
         objectMapper.writeValue(modesFile, workspaceModes)
-        return "Modo '$cleanId' guardado en daemon_modes.json. Se activará cuando digas 'modo ${normalizeText(name)}' y abrirá: ${appsList.joinToString(", ")}, Cristian."
+        return "Modo '$cleanId' guardado exitosamente, Cristian."
     }
 
-    // ========================================================================
-    // ESCÁNER PROFUNDO DE APLICACIONES (VS CODE, NOTION, OPERA GX, SPOTIFY...)
-    // ========================================================================
     fun scanInstalledApplications(): Int {
         installedApps.clear()
         if (!isWindows) return 0
@@ -679,7 +451,6 @@ class SystemScanner {
                 }
             }
 
-            // Rutas exactas de tus herramientas principales para que los Modos nunca fallen
             val directPaths = listOf(
                 Pair("spotify", "$appData\\Spotify\\Spotify.exe"),
                 Pair("vscode", "$localAppData\\Programs\\Microsoft VS Code\\Code.exe"),
@@ -688,17 +459,14 @@ class SystemScanner {
                 Pair("notion", "$localAppData\\Programs\\Notion\\Notion.exe"),
                 Pair("opera gx", "$localAppData\\Programs\\Opera GX\\opera.exe"),
                 Pair("opera", "$localAppData\\Programs\\Opera GX\\opera.exe"),
-                Pair("discord", "$localAppData\\Discord\\app-1.0.9015\\Discord.exe"),
                 Pair("calculadora", "calc.exe"),
                 Pair("bloc de notas", "notepad.exe"),
                 Pair("explorador", "explorer.exe"),
                 Pair("administrador de tareas", "taskmgr.exe")
             )
             for (item in directPaths) {
-                val key = item.first
-                val path = item.second
-                if (!path.contains("\\") || File(path).exists()) {
-                    installedApps[key] = path
+                if (!item.second.contains("\\") || File(item.second).exists()) {
+                    installedApps[item.first] = item.second
                 }
             }
         } catch (e: Exception) {}
@@ -710,7 +478,6 @@ class SystemScanner {
             .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
             .trim()
 
-        // Alias rápidos
         val canonical = when {
             requestedApp == "visual" || requestedApp == "vs code" || requestedApp == "code" -> "vscode"
             requestedApp.contains("opera") -> "opera gx"
@@ -721,7 +488,7 @@ class SystemScanner {
             val operaExe = findOperaGXExecutable()
             if (operaExe != null) {
                 ProcessBuilder("cmd", "/c", "start", "", operaExe).start()
-                return "Iniciando OPERA GX en tu sistema, Cristian."
+                return "Abriendo Opera GX, Cristian."
             }
         }
 
@@ -730,9 +497,9 @@ class SystemScanner {
 
         if (entry != null) {
             ProcessBuilder("cmd", "/c", "start", "", entry.value).start()
-            return "Iniciando ${entry.key.uppercase()} en tu sistema, Cristian."
+            return "Iniciando ${entry.key.uppercase()}, Cristian."
         }
-        return "No encontré '$requestedApp' en el registro de aplicaciones. Verifica si está instalado."
+        return "No encontré '$requestedApp' instalado en tu PC."
     }
 
     fun closeAppByName(normalizedCommand: String): String {
@@ -756,15 +523,15 @@ class SystemScanner {
     }
 
     fun minimizeAllWindows() {
-        sendFastWorkerCommand("(New-Object -ComObject Shell.Application).ToggleDesktop()")
+        runPowerShell("(New-Object -ComObject Shell.Application).ToggleDesktop()", wait = false)
     }
 
     fun getOpenWindowsReport(): String {
         val script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Process | Where-Object { \$_.MainWindowTitle -ne '' } | Select-Object -ExpandProperty MainWindowTitle"
         val out = runPowerShell(script, wait = true)
         val titles = out.lines().map { it.trim() }.filter { it.isNotBlank() }
-        return if (titles.isEmpty()) "No detecto ventanas visibles abiertas."
-        else "Ventanas activas (${titles.size}):\n" + titles.joinToString("\n") { "• $it" }
+        return if (titles.isEmpty()) "No hay ventanas visibles abiertas."
+        else "Ventanas abiertas (${titles.size}):\n" + titles.joinToString("\n") { "• $it" }
     }
 
     fun getCurrentlyPlayingSpotify(): String {
@@ -777,21 +544,21 @@ class SystemScanner {
     }
 
     private fun loadPlaylists() {
-        if (!playlistsFile.exists()) {
-            savedPlaylists["mis me gusta"] = "spotify:collection:tracks"
-            savedPlaylists["favoritas"] = "spotify:collection:tracks"
-            savedPlaylists["reggaeton"] = "spotify:playlist:37i9dQZF1DWY7IeIP1cdjF"
-            savedPlaylists["rock en espanol"] = "spotify:playlist:37i9dQZF1DWZjqjZMudx9T"
-            savedPlaylists["programar"] = "spotify:playlist:37i9dQZF1DX5trt9i14X7j"
-            savedPlaylists["entrenar"] = "spotify:playlist:37i9dQZF1DX76Wlfdnj7AP"
-            savePlaylists()
-        } else {
+        savedPlaylists["mis me gusta"] = "spotify:collection:tracks"
+        savedPlaylists["favoritas"] = "spotify:collection:tracks"
+        savedPlaylists["reggaeton"] = "spotify:playlist:37i9dQZF1DWY7IeIP1cdjF"
+        savedPlaylists["rock en espanol"] = "spotify:playlist:37i9dQZF1DWZjqjZMudx9T"
+        savedPlaylists["programar"] = "spotify:playlist:37i9dQZF1DX5trt9i14X7j"
+        savedPlaylists["entrenar"] = "spotify:playlist:37i9dQZF1DX76Wlfdnj7AP"
+        if (playlistsFile.exists()) {
             try {
                 val rootNode = objectMapper.readTree(playlistsFile)
                 rootNode.fields().forEachRemaining { entry ->
                     savedPlaylists[entry.key] = entry.value.asText()
                 }
             } catch (e: Exception) {}
+        } else {
+            savePlaylists()
         }
     }
 
@@ -813,11 +580,17 @@ class SystemScanner {
     }
 
     fun playPlaylist(rawCommand: String, normalized: String): String {
+        if (normalized.contains("me gusta") || normalized.contains("favoritas")) {
+            return playLikedSongsInSpotify()
+        }
+
         val playlistQuery = normalized
             .replace(Regex("""^.*?(?:playlist|lista\s+de\s+reproduccion|lista|mis\s+canciones\s+de|musica\s+para)\s*(?:de\s+|llamada\s+|para\s+)?"""), "")
             .replace("en spotify", "")
             .trim()
             .ifBlank { "mis me gusta" }
+
+        if (playlistQuery == "mis me gusta") return playLikedSongsInSpotify()
 
         val savedMatch = savedPlaylists.entries.firstOrNull {
             playlistQuery.contains(it.key) || it.key.contains(playlistQuery)
@@ -835,17 +608,16 @@ class SystemScanner {
             } catch (e: Exception) {}
         }
 
-        return if (savedMatch != null) {
-            "Iniciando tu playlist '${savedMatch.key.uppercase()}' en Spotify, Cristian."
-        } else {
-            "Cargando y reproduciendo la playlist '$playlistQuery' en Spotify, Cristian."
-        }
+        return "Iniciando playlist '$playlistQuery' en Spotify, Cristian."
     }
 
     fun playSongInSpotify(songQuery: String?): String {
         val cleanSong = songQuery?.trim() ?: ""
         if (cleanSong.isBlank() || cleanSong in setOf("musica", "la musica", "la cancion", "spotify")) {
             return controlSpotifyExact("PLAY")
+        }
+        if (cleanSong.contains("mis me gusta") || cleanSong.contains("canciones que me gustan")) {
+            return playLikedSongsInSpotify()
         }
 
         thread {
@@ -867,11 +639,14 @@ class SystemScanner {
         val keysToSend = if (isSearch) "{TAB}{ENTER}" else "{ENTER}"
         val ps = """
             Start-Process "$spotifyUri"
-            Start-Sleep -Milliseconds 2100
+            Start-Sleep -Milliseconds 2200
             ${'$'}wsh = New-Object -ComObject WScript.Shell
-            ${'$'}wsh.AppActivate("Spotify") | Out-Null
-            Start-Sleep -Milliseconds 400
-            ${'$'}wsh.SendKeys("$keysToSend")
+            ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
+            if (${'$'}null -ne ${'$'}sp) {
+                ${'$'}wsh.AppActivate(${'$'}sp.Id) | Out-Null
+                Start-Sleep -Milliseconds 400
+                ${'$'}wsh.SendKeys("$keysToSend")
+            }
         """.trimIndent()
         runPowerShell(ps, wait = false)
     }
@@ -902,6 +677,7 @@ class SystemScanner {
         return null
     }
 
+    // Registra a Daemon en el Registro de Arranque de Windows (HKCU\...\Run) y en shell:startup
     fun ensureDesktopAndStartupApp(): String {
         if (!isWindows) return ""
         return try {
@@ -928,25 +704,29 @@ class SystemScanner {
             """.trimIndent()
             launcherVbs.writeText(vbsContent, StandardCharsets.ISO_8859_1)
 
-            val psShortcut = """
+            val psStartup = """
                 ${'$'}wsh = New-Object -ComObject WScript.Shell
                 ${'$'}desktop = [Environment]::GetFolderPath('Desktop')
                 ${'$'}startup = [Environment]::GetFolderPath('Startup')
+                
                 ${'$'}s1 = ${'$'}wsh.CreateShortcut("${'$'}desktop\Daemon AI.lnk")
                 ${'$'}s1.TargetPath = "wscript.exe"
                 ${'$'}s1.Arguments = '"${launcherVbs.absolutePath}"'
                 ${'$'}s1.WorkingDirectory = "$workingDir"
                 ${'$'}s1.IconLocation = "shell32.dll,13"
                 ${'$'}s1.Save()
+
                 ${'$'}s2 = ${'$'}wsh.CreateShortcut("${'$'}startup\Daemon AI.lnk")
                 ${'$'}s2.TargetPath = "wscript.exe"
                 ${'$'}s2.Arguments = '"${launcherVbs.absolutePath}"'
                 ${'$'}s2.WorkingDirectory = "$workingDir"
                 ${'$'}s2.IconLocation = "shell32.dll,13"
                 ${'$'}s2.Save()
+
+                Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DaemonAI" -Value "wscript.exe `"${launcherVbs.absolutePath}`"" -Force
             """.trimIndent()
-            runPowerShell(psShortcut, wait = false)
-            "Acceso directo y auto-arranque actualizados."
+            runPowerShell(psStartup, wait = false)
+            "Auto-inicio al encender la PC registrado en Windows."
         } catch (e: Exception) { "" }
     }
 
@@ -954,8 +734,8 @@ class SystemScanner {
         return try {
             val osBean = ManagementFactory.getOperatingSystemMXBean() as com.sun.management.OperatingSystemMXBean
             val load = (osBean.cpuLoad * 100).toInt()
-            if (load in 1..100) load else Random.nextInt(8, 24)
-        } catch (e: Exception) { 14 }
+            if (load in 1..100) load else Random.nextInt(8, 22)
+        } catch (e: Exception) { 12 }
     }
 
     fun getRamUsagePercent(): Int {
@@ -964,7 +744,7 @@ class SystemScanner {
             val total = osBean.totalMemorySize.toDouble()
             val free = osBean.freeMemorySize.toDouble()
             (((total - free) / total) * 100).toInt().coerceIn(1, 99)
-        } catch (e: Exception) { 45 }
+        } catch (e: Exception) { 42 }
     }
 
     fun normalizeText(text: String): String {
@@ -977,17 +757,14 @@ class SystemScanner {
 }
 
 // ============================================================================
-// 3. CEREBRO CENTRAL DE DAEMON (J.A.R.V.I.S. CORE v7.0)
+// 2. CEREBRO DE DAEMON + ESCUCHA SIEMPRE ACTIVA CON WAKE WORD ("DAEMON")
 // ============================================================================
 @Service
 class DaemonBrain(
     private val systemScanner: SystemScanner
 ) {
-    private val brainFile = File("daemon_brain.json")
     private val factsFile = File("daemon_facts.txt")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
-    private val neuralNet = SynapticNeuralNetwork()
-    private val intents = mutableListOf(IntentNode()).apply { clear() }
 
     private val conversationHistory = mutableListOf(ChatMessage("", "")).apply { clear() }
     private val userFacts = mutableListOf("").apply { clear() }
@@ -1002,18 +779,129 @@ class DaemonBrain(
         .build()
 
     @Volatile var uiState: String = "IDLE"
-    @Volatile var lastConfidence: Int = 100
+    @Volatile var isSpeakingNow: Boolean = false
+    // Cuando le das clic al núcleo o dices "Daemon", se abre una ventana de 8 seg para hablar directo
+    @Volatile var directListenUntil: Long = 0L
+
     private var starkHud: StarkHologramHUD? = null
+
+    // Variaciones fonéticas que el micrófono de Windows detecta cuando dices "Daemon"
+    private val wakeWords = listOf("daemon", "daimon", "deimon", "daymon", "demon", "damon")
 
     init {
         loadUserFacts()
-        loadAndUpgradeNeuralDatabase()
         checkOllamaStatus()
         launchStarkHologramHUD()
+        startContinuousWakeWordEar()
         speakAndDisplay(
-            "PROTOCOLO STARK",
-            "Sistemas J.A.R.V.I.S. v7.0 en línea, Cristian. Modos de trabajo, control de Opera GX y puente dedicado de Spotify activos."
+            "NÚCLEO ACTIVO",
+            "Núcleo Daemon en línea, Cristian. Dime 'Daemon' seguido de tu orden en cualquier momento."
         )
+    }
+
+    // ========================================================================
+    // OÍDO CONTINUO EN SEGUNDO PLANO (SOLO REACCIONA SI DICES "DAEMON" O DAS CLIC)
+    // ========================================================================
+    private fun startContinuousWakeWordEar() {
+        if (!systemScanner.isWindows) return
+        thread(isDaemon = true, name = "Daemon-AlwaysOn-WakeWord-Ear") {
+            Thread.sleep(2500)
+            while (true) {
+                try {
+                    val psContinuousEar = """
+                        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+                        Add-Type -AssemblyName System.Speech
+                        ${'$'}recognizers = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
+                        if (${'$'}recognizers.Count -eq 0) { exit }
+                        ${'$'}esRec = ${'$'}recognizers | Where-Object { ${'$'}_.Culture.Name -like 'es*' } | Select-Object -First 1
+                        if (${'$'}null -eq ${'$'}esRec) { ${'$'}esRec = ${'$'}recognizers | Select-Object -First 1 }
+                        
+                        ${'$'}engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine(${'$'}esRec.Id)
+                        ${'$'}engine.SetInputToDefaultAudioDevice()
+                        
+                        ${'$'}choices = New-Object System.Speech.Recognition.Choices
+                        ${'$'}choices.Add(@(
+                            'daemon', 'oye daemon', 'hola daemon',
+                            'daemon pausa', 'daemon dale play', 'daemon play', 'daemon reproduce',
+                            'daemon siguiente cancion', 'daemon siguiente', 'daemon cambia de cancion',
+                            'daemon cancion anterior', 'daemon anterior',
+                            'daemon sube el volumen', 'daemon baja el volumen', 'daemon silencia',
+                            'daemon pausa el video', 'daemon dale play al video',
+                            'daemon vamos a trabajar', 'daemon modo trabajo',
+                            'daemon vamos a hacer tarea', 'daemon modo tarea',
+                            'daemon vamos a estudiar', 'daemon modo estudio',
+                            'daemon vamos a jugar', 'daemon modo gaming',
+                            'daemon pon mis me gusta', 'daemon abre spotify', 'daemon abre opera gx',
+                            'daemon abre visual', 'daemon abre notion', 'daemon abre el panel',
+                            'pausa', 'dale play', 'siguiente cancion', 'cancion anterior',
+                            'vamos a trabajar', 'vamos a hacer tarea', 'vamos a estudiar'
+                        ))
+                        ${'$'}gb = New-Object System.Speech.Recognition.GrammarBuilder(${'$'}choices)
+                        ${'$'}gb.Culture = ${'$'}esRec.Culture
+                        ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.Grammar(${'$'}gb)))
+                        ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
+                        
+                        while (${'$'}true) {
+                            ${'$'}res = ${'$'}engine.Recognize([TimeSpan]::FromSeconds(4))
+                            if (${'$'}null -ne ${'$'}res -and ${'$'}res.Confidence -gt 0.40) {
+                                Write-Output ("HEARD:" + ${'$'}res.Text)
+                                [Console]::Out.Flush()
+                            }
+                        }
+                    """.trimIndent()
+
+                    val utf16 = psContinuousEar.toByteArray(StandardCharsets.UTF_16LE)
+                    val b64 = Base64.getEncoder().encodeToString(utf16)
+                    val proc = ProcessBuilder(
+                        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64
+                    ).start()
+
+                    val reader = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8))
+                    var line: String?
+                    while (reader.readLine().also { line = it } != null) {
+                        val rawLine = line?.trim() ?: continue
+                        if (!rawLine.startsWith("HEARD:")) continue
+                        if (isSpeakingNow) continue // No escucharse a sí mismo mientras habla
+
+                        val heardText = rawLine.removePrefix("HEARD:").trim()
+                        val normalized = systemScanner.normalizeText(heardText)
+                        if (normalized.length < 3) continue
+
+                        val isDirectWindowActive = System.currentTimeMillis() < directListenUntil
+                        val hasWakeWord = wakeWords.any { w -> normalized.contains(w) }
+
+                        // REGLA DE ORO: Solo reaccionar si el usuario dijo "Daemon" o si dio clic en el núcleo
+                        if (hasWakeWord || isDirectWindowActive) {
+                            var cleanCommand = normalized
+                            for (w in wakeWords) {
+                                cleanCommand = cleanCommand.replace(Regex("""^(?:oye\s+|hola\s+)?$w\b\s*"""), "").trim()
+                            }
+
+                            // Si solo dijo "¡Oye Daemon!" o "Daemon", activamos escucha directa por 8 segundos
+                            if (cleanCommand.isBlank() || cleanCommand in setOf("oye", "hola", "estas ahi", "me escuchas")) {
+                                directListenUntil = System.currentTimeMillis() + 8000L
+                                uiState = "LISTENING"
+                                speakAndDisplay("DAEMON", "Sí, Cristian, te escucho.")
+                            } else {
+                                directListenUntil = 0L
+                                val reply = processThought(cleanCommand)
+                                speakAndDisplay(cleanCommand, reply)
+                            }
+                        }
+                    }
+                    proc.waitFor()
+                } catch (e: Exception) {
+                    Thread.sleep(3000)
+                }
+            }
+        }
+    }
+
+    // Se activa cuando das clic izquierdo en el núcleo chiquito para hablar directo
+    fun activateDirectVoiceListenWindow() {
+        directListenUntil = System.currentTimeMillis() + 8000L
+        uiState = "LISTENING"
+        starkHud?.setStatusText("TE ESCUCHO, CRISTIAN (HABLA AHORA)...")
     }
 
     private fun loadUserFacts() {
@@ -1055,58 +943,41 @@ class DaemonBrain(
         }
     }
 
-    private fun loadAndUpgradeNeuralDatabase() {
-        val masterKnowledge = buildComprehensiveKnowledgeBase()
-        val existingMap = linkedMapOf("init" to IntentNode()).apply { clear() }
-
-        if (brainFile.exists()) {
-            try {
-                val loadedArray = objectMapper.readValue(brainFile, Array<IntentNode>::class.java)
-                loadedArray.forEach { existingMap[it.tag] = it }
-            } catch (e: Exception) {}
-        }
-
-        for (node in masterKnowledge) {
-            val prev = existingMap[node.tag]
-            if (prev == null) {
-                existingMap[node.tag] = node
-            } else {
-                val mergedPatterns = (prev.patterns + node.patterns).distinct()
-                existingMap[node.tag] = prev.copy(patterns = mergedPatterns, responses = node.responses, action = node.action)
-            }
-        }
-
-        intents.clear()
-        intents.addAll(existingMap.values)
-        objectMapper.writeValue(brainFile, intents)
-        neuralNet.train(intents)
-    }
-
     // ========================================================================
-    // PROCESADOR CENTRAL DE ÓRDENES, MODOS, OPERA GX, VIDEO VS SPOTIFY Y CHAT
+    // PROCESADOR CENTRAL DE COMANDOS Y CONVERSACIÓN
     // ========================================================================
     fun processThought(rawInput: String): String {
         val input = rawInput.trim()
         if (input.isBlank()) return "Sin señal de entrada."
         uiState = "THINKING"
 
-        val normalized = systemScanner.normalizeText(input)
+        // Limpiar el nombre "daemon" si el usuario lo escribió al inicio
+        var normalized = systemScanner.normalizeText(input)
+        for (w in wakeWords) {
+            normalized = normalized.replace(Regex("""^(?:oye\s+|hola\s+)?$w\b\s*"""), "").trim()
+        }
 
-        // --------------------------------------------------------------------
-        // 1. ACTIVACIÓN DE "MODOS" / PROTOCOLOS ("vamos a trabajar", "modo gaming", etc.)
-        // --------------------------------------------------------------------
+        // 0. EXPANDIR O CONTRAER LA VENTANA DEL NÚCLEO POR VOZ
+        if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
+            starkHud?.setOrbMode(false)
+            return recordAndReturn(input, "Desplegando el panel holográfico completo, Cristian.")
+        }
+        if (normalized.contains("modo nucleo") || normalized.contains("minimiza el panel") || normalized.contains("hazte chiquito")) {
+            starkHud?.setOrbMode(true)
+            return recordAndReturn(input, "Contrayendo a modo núcleo flotante, Cristian.")
+        }
+
+        // 1. ACTIVACIÓN DE MODOS (TRABAJO, TAREA, ESTUDIO, GAMING, DESCANSO)
         for (mode in systemScanner.workspaceModes) {
             val matchedTrigger = mode.triggers.any { t ->
                 val normT = systemScanner.normalizeText(t)
                 normalized == normT || normalized.contains(normT)
             }
             if (matchedTrigger) {
-                lastConfidence = 100
                 return recordAndReturn(input, systemScanner.executeWorkspaceMode(mode))
             }
         }
 
-        // Crear un nuevo Modo personalizado por voz o texto ("crea modo diseño con figma, opera gx, spotify")
         val createModeRegex = Regex("""^(?:crea|crear|nuevo|guarda)\s+modo\s+(.+?)\s+con\s+(.+)$""")
         createModeRegex.find(normalized)?.let { m ->
             val modeName = m.groupValues[1].trim()
@@ -1114,216 +985,160 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.createCustomMode(modeName, apps))
         }
 
-        // --------------------------------------------------------------------
-        // 2. BÚSQUEDA EN OPERA GX, GOOGLE Y YOUTUBE
-        // --------------------------------------------------------------------
-        // Ej: "busca en youtube curso de vhdl" / "pon un video de ensamblador en youtube"
-        val ytSearchRegex = Regex("""^(?:daemon\s+|oye\s+)?(?:abre\s+opera\s+gx\s+y\s+|abre\s+youtube\s+y\s+)?(?:busca\s+en\s+youtube|buscar\s+en\s+youtube|pon\s+un\s+video\s+de|busca\s+un\s+video\s+de)\s+(.+)$""")
+        // 2. BÚSQUEDA DIRECTA EN OPERA GX Y YOUTUBE
+        val ytSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+youtube\s+y\s+)?(?:busca\s+en\s+youtube|buscar\s+en\s+youtube|pon\s+un\s+video\s+de|busca\s+un\s+video\s+de)\s+(.+)$""")
         ytSearchRegex.find(normalized)?.let { m ->
             val query = m.groupValues[1].replace("en opera gx", "").trim()
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.searchInOperaGX(query, "YOUTUBE"))
         }
 
-        // Ej: "busca en opera gx tal cosa" / "busca en opera tal cosa" / "busca en google tal cosa"
-        val operaSearchRegex = Regex("""^(?:daemon\s+|oye\s+)?(?:abre\s+opera\s+gx\s+y\s+|abre\s+opera\s+y\s+)?(?:busca\s+en\s+opera\s+gx|busca\s+en\s+opera|buscar\s+en\s+opera\s+gx|busca\s+en\s+google|busca\s+en\s+internet|investiga\s+en\s+opera(?:\s+gx)?|busca\s+en\s+el\s+navegador)\s+(.+)$""")
+        val operaSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+opera\s+y\s+)?(?:busca\s+en\s+opera\s+gx|busca\s+en\s+opera|buscar\s+en\s+opera\s+gx|busca\s+en\s+google|busca\s+en\s+internet|investiga\s+en\s+opera(?:\s+gx)?|busca\s+en\s+el\s+navegador)\s+(.+)$""")
         operaSearchRegex.find(normalized)?.let { m ->
             val query = m.groupValues[1].trim()
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.searchInOperaGX(query, "GOOGLE"))
         }
 
-        // Ej: "en opera gx busca tal cosa"
-        val operaSearchRegex2 = Regex("""^(?:en\s+opera\s+gx|en\s+opera)\s+(?:busca|buscar|investiga)\s+(.+)$""")
-        operaSearchRegex2.find(normalized)?.let { m ->
-            val query = m.groupValues[1].trim()
-            lastConfidence = 100
-            return recordAndReturn(input, systemScanner.searchInOperaGX(query, "GOOGLE"))
-        }
-
-        // --------------------------------------------------------------------
-        // 3. CONTROL DE VIDEO EN NAVEGADOR (SIN TOCAR SPOTIFY)
-        // --------------------------------------------------------------------
+        // 3. CONTROL EXCLUSIVO DE VIDEO (SIN TOCAR SPOTIFY)
         if (normalized.contains("video") || normalized.contains("youtube")) {
             if (normalized.contains("pausa") || normalized.contains("deten") || normalized.contains("play") || normalized.contains("reanuda") || normalized.contains("continua")) {
-                lastConfidence = 100
                 return recordAndReturn(input, systemScanner.controlBrowserVideo())
             }
         }
 
-        // --------------------------------------------------------------------
-        // 4. CONTROL EXACTO DE SPOTIFY (SEPARADO ENTRE PAUSA Y PLAY, CERO DOBLE DISPARO)
-        // --------------------------------------------------------------------
-        // A) ORDEN DE PAUSAR MÚSICA (Solo pausa, jamás le vuelve a dar play)
+        // 4. CONTROL EXACTO DE SPOTIFY (SIN DOBLE PULSO)
+        // A) PAUSA
         val isPauseOrder = normalized in setOf(
             "pausa", "pon pausa", "ponle pausa", "pausa spotify", "pausa la musica",
             "pausa la cancion", "deten la musica", "deten la cancion", "para la musica", "pausar"
         ) || (normalized.contains("pausa") && !normalized.contains("video"))
         if (isPauseOrder) {
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.controlSpotifyExact("PAUSE"))
         }
 
-        // B) ORDEN DE DAR PLAY / REANUDAR MÚSICA (Solo da play si estaba en pausa, jamás pausa)
+        // B) PLAY
         val isPlayOrder = normalized in setOf(
             "play", "dale play", "pon play", "ponle play", "dale play a spotify",
             "reanuda la musica", "reanuda la cancion", "reanuda spotify", "continua la musica",
             "dale play a la cancion", "dale play a la musica", "quita la pausa", "reproduce"
         )
         if (isPlayOrder) {
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.controlSpotifyExact("PLAY"))
         }
 
-        // C) SIGUIENTE Y ANTERIOR CANCIÓN
+        // C) SIGUIENTE CANCIÓN
         val isNextTrack = normalized in setOf("siguiente", "cambiale", "otra", "otra cancion", "siguiente cancion", "siguiente pista", "siguiente rola", "salta la cancion") ||
             normalized.contains("siguiente cancion") || normalized.contains("cambia de cancion") ||
             normalized.contains("cambia la cancion") || normalized.contains("cambiale a la cancion") ||
             normalized.contains("pasa a la siguiente") || normalized.contains("salta esta cancion") ||
             normalized.contains("adelanta la cancion") || normalized.contains("pon la que sigue")
         if (isNextTrack) {
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.controlSpotifyExact("NEXT"))
         }
 
+        // D) CANCIÓN ANTERIOR
         val isPrevTrack = normalized in setOf("anterior", "atras", "cancion anterior", "pista anterior", "rola anterior") ||
             normalized.contains("cancion anterior") || normalized.contains("regresa la cancion") ||
             normalized.contains("pista anterior") || normalized.contains("pon la anterior") ||
             normalized.contains("regresale a la cancion")
         if (isPrevTrack) {
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.controlSpotifyExact("PREV"))
         }
 
-        // D) VOLUMEN DEL SISTEMA
+        // E) VOLUMEN
         if (normalized.contains("sube el volumen") || normalized.contains("subele al volumen") || normalized.contains("subele a la musica") || normalized == "subele" || normalized.contains("mas volumen")) {
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.changeSystemVolume("UP"))
         }
         if (normalized.contains("baja el volumen") || normalized.contains("bajale al volumen") || normalized.contains("bajale a la musica") || normalized == "bajale" || normalized.contains("menos volumen")) {
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.changeSystemVolume("DOWN"))
         }
         if (normalized.contains("silencia") || normalized.contains("pon mute") || normalized == "mute" || normalized.contains("quita el sonido")) {
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.changeSystemVolume("MUTE"))
         }
 
-        // E) PLAYLISTS Y CANCIONES ESPECÍFICAS EN SPOTIFY
+        // F) MIS ME GUSTA, PLAYLISTS Y CANCIONES ESPECÍFICAS
+        if (normalized.contains("mis me gusta") || normalized.contains("canciones que me gustan")) {
+            return recordAndReturn(input, systemScanner.playLikedSongsInSpotify())
+        }
         if (normalized.startsWith("vincula playlist ") || normalized.startsWith("guarda playlist ")) {
             val name = input.substringAfter("playlist ").substringBefore(" con ").trim()
             val link = input.substringAfter(" con ").trim()
             return recordAndReturn(input, systemScanner.registerPlaylist(name, link))
         }
-        if (normalized.contains("playlist") || normalized.contains("lista de reproduccion") || normalized.contains("mis me gusta")) {
-            lastConfidence = 100
+        if (normalized.contains("playlist") || normalized.contains("lista de reproduccion")) {
             return recordAndReturn(input, systemScanner.playPlaylist(input, normalized))
         }
 
-        val songCommandRegex = Regex("""^(?:daemon\s+|oye\s+|por\s+favor\s+)?(?:abre\s+spotify\s+y\s+)?(?:reproduce|pon\s+la\s+cancion|pon\s+musica\s+de|pon\s+en\s+spotify|dale\s+play\s+a|toca|busca\s+en\s+spotify)\s+(.+)$""")
+        val songCommandRegex = Regex("""^(?:abre\s+spotify\s+y\s+)?(?:reproduce|pon\s+la\s+cancion|pon\s+musica\s+de|pon\s+en\s+spotify|dale\s+play\s+a|toca|busca\s+en\s+spotify)\s+(.+)$""")
         songCommandRegex.find(normalized)?.let { m ->
             val song = m.groupValues[1].replace("en spotify", "").trim()
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
         if (normalized.endsWith(" en spotify") && (normalized.startsWith("pon ") || normalized.startsWith("escuchar "))) {
             val song = normalized.removePrefix("pon ").removePrefix("escuchar ").removeSuffix(" en spotify").trim()
-            lastConfidence = 100
             return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
 
-        // --------------------------------------------------------------------
-        // 5. VENTANAS, APLICACIONES Y MEMORIA
-        // --------------------------------------------------------------------
-        if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando") || normalized.contains("como se llama esta cancion")) {
-            lastConfidence = 100
+        // 5. VENTANAS Y APLICACIONES
+        if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando")) {
             return recordAndReturn(input, systemScanner.getCurrentlyPlayingSpotify())
         }
-        if (normalized.contains("que ventanas estan abiertas") || normalized.contains("que programas estan corriendo") || normalized.contains("que aplicaciones tengo abiertas")) {
-            lastConfidence = 100
+        if (normalized.contains("que ventanas estan abiertas") || normalized.contains("que programas estan corriendo")) {
             return recordAndReturn(input, systemScanner.getOpenWindowsReport())
         }
-        if (normalized.contains("minimiza todo") || normalized.contains("muestra el escritorio") || normalized.contains("despeja la pantalla")) {
+        if (normalized.contains("minimiza todo") || normalized.contains("muestra el escritorio")) {
             systemScanner.minimizeAllWindows()
             return recordAndReturn(input, "Despejando el escritorio, Cristian.")
         }
 
-        if (normalized.matches(Regex("""^(?:daemon\s+)?(?:abre|abrir|inicia|ejecuta|lanza)\s+.+$"""))) {
-            lastConfidence = 100
+        if (normalized.matches(Regex("""^(?:abre|abrir|inicia|ejecuta|lanza)\s+.+$"""))) {
             return recordAndReturn(input, systemScanner.openAppByName(normalized))
         }
-        if (normalized.matches(Regex("""^(?:daemon\s+)?(?:cierra|cerrar|termina|mata)\s+.+$"""))) {
-            lastConfidence = 100
+        if (normalized.matches(Regex("""^(?:cierra|cerrar|termina|mata)\s+.+$"""))) {
             return recordAndReturn(input, systemScanner.closeAppByName(normalized))
         }
 
-        if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ") || normalized.startsWith("memoriza que ")) {
-            val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
+        if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ")) {
+            val fact = input.replace(Regex("""^(?:recuerda|aprende)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
             saveUserFact(fact)
-            lastConfidence = 100
             return recordAndReturn(input, "Integrado en mi memoria permanente, Cristian: '$fact'.")
         }
 
-        evaluateMathExpression(normalized)?.let { mathResult ->
-            lastConfidence = 100
-            return recordAndReturn(input, mathResult)
-        }
-
-        // --------------------------------------------------------------------
-        // 6. CÓRTEX CONVERSACIONAL (OLLAMA LOCAL + CLOUD FALLBACK)
-        // --------------------------------------------------------------------
+        // 6. CÓRTEX CONVERSACIONAL (OLLAMA LOCAL + FALLBACK CLOUD)
         if (!isOllamaOnline) checkOllamaStatus()
         if (isOllamaOnline) {
             generateOllamaConversationalResponse(input)?.let { reply ->
-                lastConfidence = 99
                 return recordAndReturn(input, reply)
             }
         }
 
         generateCloudConversationalResponse(input)?.let { reply ->
-            lastConfidence = 98
             return recordAndReturn(input, reply)
         }
 
-        val prediction = neuralNet.predict(input)
-        val matchedIntent = prediction.node
-        val confidence = prediction.confidence
-        lastConfidence = (confidence * 100).toInt().coerceIn(0, 100)
-
-        if (matchedIntent != null && confidence >= 0.32) {
-            val resp = when (matchedIntent.action) {
-                "CHECK_TIME" -> {
-                    val now = LocalDateTime.now()
-                    "Son las ${now.format(DateTimeFormatter.ofPattern("HH:mm:ss"))} del ${now.format(DateTimeFormatter.ofPattern("dd/MM/yyyy"))}, Cristian."
-                }
-                "CHECK_WEATHER" -> fetchLiveWeather()
-                else -> matchedIntent.responses.random()
-            }
-            return recordAndReturn(input, resp)
-        }
-
-        return recordAndReturn(input, "En línea, Cristian. ¿Me repites la instrucción?")
+        return recordAndReturn(input, "En línea, Cristian. ¿Qué orden ejecutamos?")
     }
 
     private fun buildSystemPrompt(): String {
         val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
-        val factsContext = if (userFacts.isEmpty()) "" else "Datos permanentes sobre Cristian:\n" + userFacts.joinToString("\n") { "- $it" }
+        val factsContext = if (userFacts.isEmpty()) "" else "Datos sobre Cristian:\n" + userFacts.joinToString("\n") { "- $it" }
         return """
-            Eres Daemon (v7.0), el sistema operativo de inteligencia artificial estilo J.A.R.V.I.S. creado por Cristian Alexis.
+            Eres Daemon (v8.0), el asistente de inteligencia artificial estilo J.A.R.V.I.S. creado por Cristian Alexis.
             Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
             
             Directrices:
-            1. Habla en español con personalidad leal, aguda, brillante y fluida (como J.A.R.V.I.S. con Tony Stark).
+            1. Habla siempre en español de forma inteligente, leal y fluida.
             2. Sé conciso (1 a 2 párrafos cortos).
-            3. Si durante la conversación Cristian te pide ejecutar una acción en su PC, añade al final una etiqueta exacta:
+            3. Si Cristian te pide ejecutar una acción en su PC durante la charla, añade al final una etiqueta exacta:
                [ACTION:MODE_WORK]
+               [ACTION:MODE_HOMEWORK]
                [ACTION:MODE_STUDY]
-               [ACTION:MODE_GAMING]
+               [ACTION:PLAY_LIKED]
                [ACTION:PLAY_SONG:nombre]
                [ACTION:PAUSE_MUSIC]
                [ACTION:PLAY_MUSIC]
                [ACTION:NEXT_TRACK]
+               [ACTION:PREV_TRACK]
                [ACTION:PAUSE_VIDEO]
                [ACTION:SEARCH_OPERA:consulta]
                [ACTION:OPEN_APP:nombre]
@@ -1347,7 +1162,7 @@ class DaemonBrain(
                 model = ollamaModel,
                 messages = buildMessageHistory(userInput),
                 stream = false,
-                options = OllamaOptions(temperature = 0.7, num_predict = 260)
+                options = OllamaOptions(temperature = 0.7, num_predict = 250)
             )
             val jsonBody = objectMapper.writeValueAsString(payload)
             val req = HttpRequest.newBuilder()
@@ -1382,7 +1197,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkHUD/7.0")
+                .header("User-Agent", "DaemonStarkCore/8.0")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -1404,12 +1219,14 @@ class DaemonBrain(
             val param = match.groupValues[2].trim()
             when (actionType) {
                 "MODE_WORK" -> systemScanner.workspaceModes.firstOrNull { it.id == "TRABAJO" }?.let { systemScanner.executeWorkspaceMode(it) }
+                "MODE_HOMEWORK" -> systemScanner.workspaceModes.firstOrNull { it.id == "TAREA" }?.let { systemScanner.executeWorkspaceMode(it) }
                 "MODE_STUDY" -> systemScanner.workspaceModes.firstOrNull { it.id == "ESTUDIO" }?.let { systemScanner.executeWorkspaceMode(it) }
-                "MODE_GAMING" -> systemScanner.workspaceModes.firstOrNull { it.id == "GAMING" }?.let { systemScanner.executeWorkspaceMode(it) }
+                "PLAY_LIKED" -> systemScanner.playLikedSongsInSpotify()
                 "PLAY_SONG" -> systemScanner.playSongInSpotify(param)
                 "PAUSE_MUSIC" -> systemScanner.controlSpotifyExact("PAUSE")
                 "PLAY_MUSIC" -> systemScanner.controlSpotifyExact("PLAY")
                 "NEXT_TRACK" -> systemScanner.controlSpotifyExact("NEXT")
+                "PREV_TRACK" -> systemScanner.controlSpotifyExact("PREV")
                 "PAUSE_VIDEO" -> systemScanner.controlBrowserVideo()
                 "SEARCH_OPERA" -> systemScanner.searchInOperaGX(param, "GOOGLE")
                 "OPEN_APP" -> systemScanner.openAppByName(systemScanner.normalizeText(param))
@@ -1429,46 +1246,15 @@ class DaemonBrain(
         return daemonReply
     }
 
-    private fun evaluateMathExpression(normalized: String): String? {
-        val cleaned = normalized.replace("por", "*").replace("entre", "/").replace("mas", "+").replace("menos", "-")
-        val mathRegex = Regex("""^(?:cuanto es|calcula|resuelve)\s+(-?\d+(?:\.\d+)?)\s*([\+\-\*\/])\s*(-?\d+(?:\.\d+)?)$""")
-        val m = mathRegex.find(cleaned) ?: return null
-        val a = m.groupValues[1].toDoubleOrNull() ?: return null
-        val op = m.groupValues[2]
-        val b = m.groupValues[3].toDoubleOrNull() ?: return null
-        val res = when (op) {
-            "+" -> a + b
-            "-" -> a - b
-            "*" -> a * b
-            "/" -> if (b != 0.0) a / b else return "División por cero indeterminada."
-            else -> return null
-        }
-        val formatted = if (res % 1.0 == 0.0) res.toLong().toString() else "%.4f".format(res)
-        return "El resultado de $a $op $b es $formatted, Cristian."
-    }
-
-    private fun fetchLiveWeather(): String {
-        return try {
-            val url = "https://api.open-meteo.com/v1/forecast?latitude=19.60&longitude=-99.05¤t_weather=true"
-            val req = HttpRequest.newBuilder().uri(URI.create(url)).GET().build()
-            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-            val currentBlock = res.body().substringAfter("\"current_weather\":", "")
-            val temp = Regex(""""temperature"\s*:\s*(-?\d+(\.\d+)?)""").find(currentBlock)?.groupValues?.get(1) ?: "--"
-            val wind = Regex(""""windspeed"\s*:\s*(\d+(\.\d+)?)""").find(currentBlock)?.groupValues?.get(1) ?: "--"
-            "Temperatura exterior: $temp °C con vientos de $wind km/h, Cristian."
-        } catch (e: Exception) {
-            "Sensor meteorológico sin enlace en este momento."
-        }
-    }
-
     fun speakAndDisplay(userText: String, reply: String) {
         starkHud?.updateHologram(userText, reply)
         if (!systemScanner.isWindows) return
         thread {
             try {
+                isSpeakingNow = true
                 uiState = "SPEAKING"
                 val cleanSpeech = reply
-                    .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en el holograma.")
+                    .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en pantalla.")
                     .replace(Regex("[#*`_~>\\-•]"), "")
                     .replace("\n", ". ")
                     .trim()
@@ -1488,60 +1274,8 @@ class DaemonBrain(
                 }
             } catch (e: Exception) {
             } finally {
-                uiState = "IDLE"
-            }
-        }
-    }
-
-    fun triggerSingleVoiceListen() {
-        if (!systemScanner.isWindows) return
-        thread {
-            try {
-                uiState = "LISTENING"
-                starkHud?.setStatusText("ESCUCHANDO CANAL DE VOZ // HABLA AHORA...")
-
-                val psScript = """
-                    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-                    Add-Type -AssemblyName System.Speech
-                    ${'$'}recognizers = [System.Speech.Recognition.SpeechRecognitionEngine]::InstalledRecognizers()
-                    if (${'$'}recognizers.Count -eq 0) {
-                        Write-Output "ERR_NO_RECOGNIZER"
-                        exit
-                    }
-                    ${'$'}esRec = ${'$'}recognizers | Where-Object { ${'$'}_.Culture.Name -like 'es*' } | Select-Object -First 1
-                    if (${'$'}null -eq ${'$'}esRec) { ${'$'}esRec = ${'$'}recognizers | Select-Object -First 1 }
-                    
-                    ${'$'}engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine(${'$'}esRec.Id)
-                    ${'$'}engine.SetInputToDefaultAudioDevice()
-                    ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
-                    
-                    ${'$'}result = ${'$'}engine.Recognize([TimeSpan]::FromSeconds(6))
-                    if (${'$'}null -ne ${'$'}result) {
-                        Write-Output ${'$'}result.Text
-                    } else {
-                        Write-Output "ERR_TIMEOUT"
-                    }
-                """.trimIndent()
-
-                val output = systemScanner.runPowerShell(psScript, wait = true)
-
-                when {
-                    output == "ERR_NO_RECOGNIZER" -> {
-                        uiState = "IDLE"
-                        starkHud?.updateHologram("SISTEMA DE VOZ", "Instala el paquete de voz en Español en Configuración de Windows.")
-                    }
-                    output == "ERR_TIMEOUT" || output.isBlank() -> {
-                        uiState = "IDLE"
-                        starkHud?.setStatusText("STANDBY // ESPERANDO INSTRUCCIONES")
-                    }
-                    else -> {
-                        val reply = processThought(output)
-                        speakAndDisplay(output, reply)
-                    }
-                }
-            } catch (e: Exception) {
-                uiState = "IDLE"
-                starkHud?.setStatusText("ERROR DE AUDIO: ${e.message}")
+                isSpeakingNow = false
+                uiState = if (System.currentTimeMillis() < directListenUntil) "LISTENING" else "IDLE"
             }
         }
     }
@@ -1557,30 +1291,27 @@ class DaemonBrain(
             }
         } catch (e: Exception) {}
     }
-
-    private fun buildComprehensiveKnowledgeBase(): List<IntentNode> = listOf(
-        IntentNode("saludo", listOf("hola", "buenos dias", "buenas tardes", "buenas noches", "que tal daemon"), listOf("Sistemas al cien por ciento, Cristian. ¿Activamos el protocolo de trabajo o qué ejecutamos hoy?")),
-        IntentNode("identidad", listOf("quien eres", "como te llamas", "que eres"), listOf("Soy Daemon v7.0, tu asistente holográfico estilo J.A.R.V.I.S. con control sobre tus modos de trabajo, Opera GX y Spotify.")),
-        IntentNode("hora_fecha", listOf("que hora es", "dime la hora", "fecha de hoy"), emptyList(), "CHECK_TIME"),
-        IntentNode("clima_actual", listOf("como esta el clima", "que temperatura hace"), emptyList(), "CHECK_WEATHER")
-    )
 }
 
 // ============================================================================
-// 4. HOLOGRAMA TÁCTICO TONY STARK (CHASIS POLIGONAL + TELEMETRÍA + MODO ORBE)
+// 3. INTERFAZ FLOTANTE DE NÚCLEO (INICIA EN MODO NÚCLEO CHIQUITO + ALWAYS ON TOP)
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
     private val scanner: SystemScanner
-) : JFrame("DAEMON // STARK HUD v7.0") {
+) : JFrame("DAEMON CORE") {
 
-    private var dragOffset = Point(0, 0)
-    private var isMiniOrbMode = false
+    private var pressPoint = Point(0, 0)
+    private var startDragScreen = Point(0, 0)
+    private var wasDragged = false
+
+    // Inicia PRINCIPALMENTE en Modo Núcleo Chiquito (true por defecto)
+    private var isMiniOrbMode = true
     private val fullWidth = 680
     private val fullHeight = 520
-    private val orbSize = 130
+    private val orbSize = 110
 
-    private val statusLabel = JLabel("SYSTEM ONLINE // STARK HUD MARK VII")
+    private val statusLabel = JLabel("ONLINE // DI 'DAEMON' PARA HABLAR")
     private val outputArea = JTextArea()
     private val inputField = JTextField()
     private val hudCanvas = HolographicChassisPanel()
@@ -1588,27 +1319,31 @@ class StarkHologramHUD(
 
     init {
         isUndecorated = true
-        background = Color(0, 0, 0, 0) // Transparencia real sobre el escritorio
-        setSize(fullWidth, fullHeight)
-        isAlwaysOnTop = false
-        location = Point(80, 70)
+        type = Window.Type.UTILITY // Evita que estorbe en Alt+Tab cuando está como núcleo
+        background = Color(0, 0, 0, 0)
+        isAlwaysOnTop = true // SIEMPRE ARRIBA de todas las ventanas y pestañas
+
+        // Posicionar el núcleo chiquito en la esquina superior derecha del monitor
+        val screenBounds = Toolkit.getDefaultToolkit().screenSize
+        val initialX = (screenBounds.width - orbSize - 35).coerceAtLeast(20)
+        val initialY = 35
 
         hudCanvas.layout = BorderLayout()
         hudCanvas.border = EmptyBorder(16, 22, 18, 22)
 
-        // 1. CABECERA POLIGONAL STARK INDUSTRIES
+        // 1. CABECERA DEL PANEL COMPLETO
         val headerBar = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = EmptyBorder(2, 8, 6, 8)
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON CORE MK-VII").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON CORE v8.0").apply {
                     foreground = Color(0, 242, 255)
                     font = Font("Consolas", Font.BOLD, 15)
                 }
                 statusLabel.apply {
-                    foreground = Color(255, 195, 0) // Stark Gold
+                    foreground = Color(255, 195, 0)
                     font = Font("Consolas", Font.BOLD, 10)
                 }
                 add(mainTitle)
@@ -1617,11 +1352,9 @@ class StarkHologramHUD(
 
             val rightControls = JPanel(FlowLayout(FlowLayout.RIGHT, 6, 0)).apply {
                 isOpaque = false
-                val orbBtn = createHoloButton("◉ ORBE", Color(255, 185, 0), 68) { toggleMiniOrbMode() }
-                val minBtn = createHoloButton("—", Color(0, 225, 255), 28) { state = Frame.ICONIFIED }
+                val orbBtn = createHoloButton("◉ MODO NÚCLEO", Color(255, 185, 0), 108) { setOrbMode(true) }
                 val closeBtn = createHoloButton("✕", Color(255, 70, 90), 28) { System.exit(0) }
                 add(orbBtn)
-                add(minBtn)
                 add(closeBtn)
             }
 
@@ -1629,66 +1362,48 @@ class StarkHologramHUD(
             add(rightControls, BorderLayout.EAST)
         }
 
-        // 2. ZONA CENTRAL: TELEMETRÍA IZQUIERDA + REACTOR CENTRAL + PROTOCOLOS DERECHA
+        // 2. ALAS LATERALES DEL PANEL COMPLETO (MODOS Y CONTROLES DE SPOTIFY)
         val centerDeck = JPanel(BorderLayout(10, 0)).apply {
             isOpaque = false
 
-            // Ala Izquierda: Botones Tácticos de MODOS ("Trabajo", "Estudio", "Gaming", "Relax")
             val leftWing = JPanel(GridLayout(5, 1, 0, 7)).apply {
                 isOpaque = false
-                preferredSize = Dimension(145, 220)
+                preferredSize = Dimension(150, 220)
                 border = EmptyBorder(12, 2, 12, 2)
 
-                val lbl = JLabel("◢ PROTOCOLOS").apply {
+                val lbl = JLabel("◢ MODOS").apply {
                     foreground = Color(0, 230, 255)
                     font = Font("Consolas", Font.BOLD, 11)
                 }
                 add(lbl)
-                add(createHoloButton("⚡ MODO TRABAJO", Color(0, 235, 255), 140) {
-                    runQuickCommand("vamos a trabajar")
-                })
-                add(createHoloButton("📘 MODO ESTUDIO", Color(16, 225, 160), 140) {
-                    runQuickCommand("vamos a estudiar")
-                })
-                add(createHoloButton("🎮 MODO GAMING", Color(255, 185, 0), 140) {
-                    runQuickCommand("vamos a jugar")
-                })
-                add(createHoloButton("🌙 MODO RELAX", Color(160, 140, 255), 140) {
-                    runQuickCommand("vamos a descansar")
-                })
+                add(createHoloButton("⚡ MODO TRABAJO", Color(0, 235, 255), 145) { runQuickCommand("vamos a trabajar") })
+                add(createHoloButton("📝 MODO TAREA", Color(16, 235, 160), 145) { runQuickCommand("vamos a hacer tarea") })
+                add(createHoloButton("📘 MODO ESTUDIO", Color(120, 180, 255), 145) { runQuickCommand("vamos a estudiar") })
+                add(createHoloButton("🎮 MODO GAMING", Color(255, 185, 0), 145) { runQuickCommand("vamos a jugar") })
             }
 
-            // Ala Derecha: Controles Dedicados de Spotify & Video
             val rightWing = JPanel(GridLayout(5, 1, 0, 7)).apply {
                 isOpaque = false
-                preferredSize = Dimension(145, 220)
+                preferredSize = Dimension(150, 220)
                 border = EmptyBorder(12, 2, 12, 2)
 
-                val lbl = JLabel("◣ AUDIO & OPERA").apply {
+                val lbl = JLabel("◣ SPOTIFY & VIDEO").apply {
                     foreground = Color(255, 195, 0)
                     font = Font("Consolas", Font.BOLD, 11)
                     horizontalAlignment = SwingConstants.RIGHT
                 }
                 add(lbl)
-                add(createHoloButton("▶ PLAY SPOTIFY", Color(16, 235, 160), 140) {
-                    runQuickCommand("dale play")
-                })
-                add(createHoloButton("⏸ PAUSA SPOTIFY", Color(255, 185, 0), 140) {
-                    runQuickCommand("pausa la musica")
-                })
-                add(createHoloButton("⏭ SIGUIENTE", Color(0, 225, 255), 140) {
-                    runQuickCommand("siguiente cancion")
-                })
-                add(createHoloButton("🎬 PAUSA VIDEO", Color(255, 110, 130), 140) {
-                    runQuickCommand("pausa el video")
-                })
+                add(createHoloButton("▶ PLAY SPOTIFY", Color(16, 235, 160), 145) { runQuickCommand("dale play") })
+                add(createHoloButton("⏸ PAUSA SPOTIFY", Color(255, 185, 0), 145) { runQuickCommand("pausa") })
+                add(createHoloButton("⏭ SIGUIENTE", Color(0, 225, 255), 145) { runQuickCommand("siguiente cancion") })
+                add(createHoloButton("⏮ ANTERIOR", Color(160, 140, 255), 145) { runQuickCommand("cancion anterior") })
             }
 
             add(leftWing, BorderLayout.WEST)
             add(rightWing, BorderLayout.EAST)
         }
 
-        // 3. CONSOLA HOLOGRÁFICA INFERIOR
+        // 3. CONSOLA INFERIOR DEL PANEL COMPLETO
         val bottomDeck = JPanel(BorderLayout(0, 8)).apply {
             isOpaque = false
             border = EmptyBorder(4, 6, 2, 6)
@@ -1721,8 +1436,8 @@ class StarkHologramHUD(
             val commandRow = JPanel(BorderLayout(8, 0)).apply {
                 isOpaque = false
 
-                val micBtn = createHoloButton("🎤 VOZ", Color(16, 235, 160), 86) {
-                    brain.triggerSingleVoiceListen()
+                val micBtn = createHoloButton("🎤 HABLAR", Color(16, 235, 160), 90) {
+                    brain.activateDirectVoiceListenWindow()
                 }
 
                 inputField.apply {
@@ -1758,41 +1473,95 @@ class StarkHologramHUD(
         hudCanvas.add(fullHudContent, BorderLayout.CENTER)
         contentPane = hudCanvas
 
-        // Arrastrar el holograma desde cualquier punto o expandir si está en Modo Orbe
-        val dragListener = object : MouseAdapter() {
+        // Configurar estado inicial en MODO NÚCLEO CHIQUITO
+        setLocation(initialX, initialY)
+        applyOrbWindowGeometry()
+
+        // Interacción únicamente al hacer clic o arrastrar (Cero interrupción al pasar el mouse)
+        hudCanvas.addMouseListener(object : MouseAdapter() {
             override fun mousePressed(e: MouseEvent) {
-                dragOffset = e.point
+                pressPoint = e.point
+                startDragScreen = e.locationOnScreen
+                wasDragged = false
             }
-            override fun mouseClicked(e: MouseEvent) {
-                if (isMiniOrbMode && e.clickCount == 1) {
-                    toggleMiniOrbMode()
-                } else if (!isMiniOrbMode && e.y in 90..310 && e.x in 190..490) {
-                    brain.triggerSingleVoiceListen()
+
+            override fun mouseReleased(e: MouseEvent) {
+                if (wasDragged) return
+                if (SwingUtilities.isRightMouseButton(e) || e.clickCount == 2) {
+                    // Clic derecho o doble clic: alterna entre Núcleo Chiquito y Panel Completo
+                    setOrbMode(!isMiniOrbMode)
+                } else if (SwingUtilities.isLeftMouseButton(e)) {
+                    // Clic izquierdo simple: activa escucha de voz inmediata
+                    if (isMiniOrbMode || (e.y in 90..310 && e.x in 190..490)) {
+                        brain.activateDirectVoiceListenWindow()
+                    }
                 }
-            }
-        }
-        hudCanvas.addMouseListener(dragListener)
-        hudCanvas.addMouseMotionListener(object : MouseMotionAdapter() {
-            override fun mouseDragged(e: MouseEvent) {
-                val curr = e.locationOnScreen
-                setLocation(curr.x - dragOffset.x, curr.y - dragOffset.y)
             }
         })
 
-        javax.swing.Timer(16) { hudCanvas.repaint() }.start()
+        hudCanvas.addMouseMotionListener(object : MouseMotionAdapter() {
+            override fun mouseDragged(e: MouseEvent) {
+                val curr = e.locationOnScreen
+                if (abs(curr.x - startDragScreen.x) > 4 || abs(curr.y - startDragScreen.y) > 4) {
+                    wasDragged = true
+                    setLocation(curr.x - pressPoint.x, curr.y - pressPoint.y)
+                }
+            }
+        })
+
+        // Animación 60 FPS + refuerzo AlwaysOnTop para que ninguna ventana lo tape jamás
+        var topMostCounter = 0
+        javax.swing.Timer(16) {
+            if (System.currentTimeMillis() < brain.directListenUntil && brain.uiState == "IDLE") {
+                brain.uiState = "LISTENING"
+            } else if (System.currentTimeMillis() >= brain.directListenUntil && brain.uiState == "LISTENING" && !brain.isSpeakingNow) {
+                brain.uiState = "IDLE"
+            }
+            topMostCounter++
+            if (topMostCounter >= 120) {
+                topMostCounter = 0
+                if (!isAlwaysOnTop) isAlwaysOnTop = true
+            }
+            hudCanvas.repaint()
+        }.start()
     }
 
-    private fun toggleMiniOrbMode() {
-        isMiniOrbMode = !isMiniOrbMode
+    // Cambia entre Modo Núcleo Chiquito (110x110 circular, no roba foco) y Panel Completo
+    fun setOrbMode(mini: Boolean) {
+        SwingUtilities.invokeLater {
+            val screenBounds = Toolkit.getDefaultToolkit().screenSize
+            isMiniOrbMode = mini
+            applyOrbWindowGeometry()
+            if (!mini) {
+                // Asegurar que el panel expandido quede dentro de la pantalla
+                val newX = location.x.coerceIn(10, (screenBounds.width - fullWidth - 10).coerceAtLeast(10))
+                val newY = location.y.coerceIn(10, (screenBounds.height - fullHeight - 40).coerceAtLeast(10))
+                setLocation(newX, newY)
+                toFront()
+                inputField.requestFocusInWindow()
+            }
+            revalidate()
+            repaint()
+        }
+    }
+
+    private fun applyOrbWindowGeometry() {
         if (isMiniOrbMode) {
             fullHudContent.isVisible = false
+            focusableWindowState = false // No roba foco de teclado ni mouse mientras trabajas o juegas
             setSize(orbSize, orbSize)
+            // Recorte circular exacto: las esquinas alrededor del círculo dejan pasar los clics del mouse
+            try {
+                shape = Ellipse2D.Double(4.0, 4.0, orbSize - 8.0, orbSize - 8.0)
+            } catch (e: Exception) {}
         } else {
+            try {
+                shape = null
+            } catch (e: Exception) {}
             setSize(fullWidth, fullHeight)
+            focusableWindowState = true
             fullHudContent.isVisible = true
         }
-        revalidate()
-        repaint()
     }
 
     private fun runQuickCommand(cmd: String) {
@@ -1843,7 +1612,6 @@ class StarkHologramHUD(
                 val h = height.toDouble()
                 val cut = 7.0
 
-                // Polígono biselado estilo casco de Iron Man
                 val poly = GeneralPath().apply {
                     moveTo(cut, 0.0)
                     lineTo(w - 1, 0.0)
@@ -1869,19 +1637,16 @@ class StarkHologramHUD(
         }
     }
 
-    // ========================================================================
-    // LIENZO POLIGONAL HOLOGRÁFICO STARK INDUSTRIES (CERO CAJA RECTANGULAR)
-    // ========================================================================
     inner class HolographicChassisPanel : JPanel() {
         private var t = 0.0
         private var cpuGauge = 15
         private var ramGauge = 45
         private var lastTelemetryTick = 0L
 
-        private val sphereNodes = List(110) { i ->
+        private val sphereNodes = List(105) { i ->
             val golden = (1 + sqrt(5.0)) / 2
             val theta = 2 * PI * i / golden
-            val phi = acos(1 - 2 * (i + 0.5) / 110)
+            val phi = acos(1 - 2 * (i + 0.5) / 105)
             Triple(theta, phi, 56.0 + (i % 4) * 5.5)
         }
 
@@ -1894,47 +1659,48 @@ class StarkHologramHUD(
             val g2 = g as Graphics2D
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
 
-            val now = System.currentTimeMillis()
-            if (now - lastTelemetryTick > 1500) {
-                cpuGauge = scanner.getCpuLoadPercent()
-                ramGauge = scanner.getRamUsagePercent()
-                lastTelemetryTick = now
-            }
-
             val mainColor = when (brain.uiState) {
-                "LISTENING" -> Color(16, 245, 160)
-                "THINKING" -> Color(255, 185, 0)
-                "SPEAKING" -> Color(0, 255, 255)
+                "LISTENING" -> Color(16, 245, 160) // Verde Esmeralda cuando te escucha
+                "THINKING" -> Color(255, 185, 0)   // Dorado cuando procesa
+                "SPEAKING" -> Color(0, 255, 255)   // Cian brillante cuando habla
                 else -> Color(0, 215, 255)
             }
             val goldColor = Color(255, 190, 0)
 
             val speed = when (brain.uiState) {
                 "THINKING" -> 0.065
-                "SPEAKING" -> 0.04
-                "LISTENING" -> 0.035
+                "SPEAKING" -> 0.042
+                "LISTENING" -> 0.038
                 else -> 0.015
             }
             t += speed
             val pulse = if (brain.uiState == "SPEAKING" || brain.uiState == "LISTENING") {
-                1.0 + abs(sin(t * 4.5)) * 0.15
+                1.0 + abs(sin(t * 4.5)) * 0.14
             } else {
                 1.0 + sin(t * 2.0) * 0.03
             }
 
-            // Si está en MODO ORBE FLOTANTE (130x130), dibujar únicamente el Reactor Arc flotante
+            // DIBUJO EN MODO NÚCLEO CHIQUITO (110x110 px)
             if (isMiniOrbMode) {
-                drawFloatingArcReactor(g2, width / 2.0, height / 2.0, 0.52, mainColor, goldColor, pulse)
-                g2.font = Font("Consolas", Font.BOLD, 9)
-                g2.color = Color.WHITE
-                g2.drawString("J.A.R.V.I.S.", 34, height - 6)
+                val cx = width / 2.0
+                val cy = height / 2.0
+                // Fondo circular oscuro semitransparente para alto contraste sobre cualquier ventana
+                g2.color = Color(4, 10, 22, 215)
+                g2.fill(Ellipse2D.Double(6.0, 6.0, width - 12.0, height - 12.0))
+                drawFloatingArcReactor(g2, cx, cy, 0.44, mainColor, goldColor, pulse)
                 return
+            }
+
+            // DIBUJO EN MODO PANEL COMPLETO (680x520 px)
+            val now = System.currentTimeMillis()
+            if (now - lastTelemetryTick > 1800) {
+                cpuGauge = scanner.getCpuLoadPercent()
+                ramGauge = scanner.getRamUsagePercent()
+                lastTelemetryTick = now
             }
 
             val w = width.toDouble()
             val h = height.toDouble()
-
-            // 1. CHASIS OCTAGONAL SCI-FI BISELADO (No es un cuadro estándar)
             val cut = 28.0
             val hudFrame = GeneralPath().apply {
                 moveTo(cut, 2.0)
@@ -1948,23 +1714,19 @@ class StarkHologramHUD(
                 closePath()
             }
 
-            // Fondo translúcido espacial
-            g2.color = Color(4, 10, 20, 232)
+            g2.color = Color(4, 10, 20, 236)
             g2.fill(hudFrame)
 
-            // Rejilla táctica interna
             g2.color = Color(0, 220, 255, 10)
             var gx = 30
             while (gx < w - 30) { g2.drawLine(gx, 20, gx, (h - 20).toInt()); gx += 32 }
             var gy = 20
             while (gy < h - 20) { g2.drawLine(30, gy, (w - 30).toInt(), gy); gy += 32 }
 
-            // Borde del chasis holográfico
             g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 120)
             g2.stroke = BasicStroke(1.5f)
             g2.draw(hudFrame)
 
-            // Esquinas reforzadas en Oro Stark y Cian
             g2.color = goldColor
             g2.stroke = BasicStroke(2.8f)
             g2.drawLine(2, cut.toInt(), cut.toInt(), 2)
@@ -1972,23 +1734,20 @@ class StarkHologramHUD(
             g2.drawLine(2, (h - cut).toInt(), cut.toInt(), (h - 2).toInt())
             g2.drawLine((w - cut).toInt(), (h - 2).toInt(), (w - 2).toInt(), (h - cut).toInt())
 
-            // 2. REACTOR ARC CENTRAL HOLOGRÁFICO
             val cx = w / 2.0
             val cy = 195.0
             drawFloatingArcReactor(g2, cx, cy, 1.0, mainColor, goldColor, pulse)
 
-            // 3. TELEMETRÍA SUPERIOR E INFERIOR DEL REACTOR
             g2.font = Font("Consolas", Font.BOLD, 10)
             g2.color = Color(0, 235, 255, 200)
             g2.drawString("CPU: $cpuGauge%", 185, 76)
             g2.drawString("RAM: $ramGauge%", 445, 76)
 
             g2.color = goldColor
-            val modeText = "MODO ACTIVO // ${scanner.activeModeName}"
+            val modeText = "MODO // ${scanner.activeModeName}"
             val fm = g2.fontMetrics
             g2.drawString(modeText, (cx - fm.stringWidth(modeText) / 2).toInt(), 76)
 
-            // Ticker de Spotify en vivo
             g2.color = Color(16, 240, 165, 220)
             val spText = "♫ SPOTIFY: ${scanner.currentSpotifyTrack}"
             g2.drawString(spText, (cx - fm.stringWidth(spText) / 2).toInt(), 328)
@@ -2003,30 +1762,26 @@ class StarkHologramHUD(
             goldColor: Color,
             pulse: Double
         ) {
-            // Resplandor del Reactor Arc
             for (r in 110 downTo 20 step 22) {
                 val rad = r * scale * pulse
-                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 16)
+                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 18)
                 g2.fill(Ellipse2D.Double(cx - rad, cy - rad, rad * 2, rad * 2))
             }
 
-            // Anillo exterior segmentado Stark (Gira a la derecha)
             val rOuter = 108.0 * scale
-            g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 150)
+            g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 165)
             g2.stroke = BasicStroke((2.4 * scale).toFloat())
             for (a in 0 until 360 step 45) {
                 g2.draw(Arc2D.Double(cx - rOuter, cy - rOuter, rOuter * 2, rOuter * 2, a + t * 28, 28.0, Arc2D.OPEN))
             }
 
-            // Segundo anillo en Oro Stark (Gira a la izquierda)
             val rGold = 94.0 * scale
-            g2.color = Color(goldColor.red, goldColor.green, goldColor.blue, 140)
+            g2.color = Color(goldColor.red, goldColor.green, goldColor.blue, 150)
             g2.stroke = BasicStroke((1.6 * scale).toFloat())
             for (a in 0 until 360 step 90) {
                 g2.draw(Arc2D.Double(cx - rGold, cy - rGold, rGold * 2, rGold * 2, a - t * 40, 50.0, Arc2D.OPEN))
             }
 
-            // Analizador de espectro radial
             val numBars = 48
             g2.stroke = BasicStroke((1.6 * scale).toFloat())
             for (i in 0 until numBars) {
@@ -2038,14 +1793,13 @@ class StarkHologramHUD(
                 }
                 val rIn = 72.0 * scale * pulse
                 val rOut = rIn + amp
-                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 165)
+                g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, 175)
                 g2.drawLine(
                     (cx + cos(a) * rIn).toInt(), (cy + sin(a) * rIn).toInt(),
                     (cx + cos(a) * rOut).toInt(), (cy + sin(a) * rOut).toInt()
                 )
             }
 
-            // Red sináptica 3D central
             val proj = sphereNodes.map { (theta, phi, baseR) ->
                 val r = baseR * scale * pulse
                 val rotT = theta + t
@@ -2064,7 +1818,7 @@ class StarkHologramHUD(
                     val dy = proj[i][1] - proj[j][1]
                     val dist = sqrt(dx * dx + dy * dy)
                     if (dist < 25 * scale * pulse) {
-                        val alpha = ((1.0 - dist / (25 * scale * pulse)) * 130).toInt().coerceIn(10, 255)
+                        val alpha = ((1.0 - dist / (25 * scale * pulse)) * 135).toInt().coerceIn(10, 255)
                         g2.color = Color(mainColor.red, mainColor.green, mainColor.blue, alpha)
                         g2.drawLine(proj[i][0].toInt(), proj[i][1].toInt(), proj[j][0].toInt(), proj[j][1].toInt())
                     }
@@ -2072,7 +1826,7 @@ class StarkHologramHUD(
             }
 
             proj.forEachIndexed { idx, p ->
-                val alpha = ((p[2] + 85) / 170 * 240).toInt().coerceIn(45, 255)
+                val alpha = ((p[2] + 85) / 170 * 245).toInt().coerceIn(45, 255)
                 g2.color = if (idx % 5 == 0) Color(255, 255, 255, alpha) else Color(mainColor.red, mainColor.green, mainColor.blue, alpha)
                 val dotSize = 3.8 * scale
                 g2.fill(Ellipse2D.Double(p[0] - dotSize / 2, p[1] - dotSize / 2, dotSize, dotSize))

@@ -1,0 +1,31 @@
+[ {
+  "tag" : "saludo",
+  "patterns" : [ "hola", "buenos dias", "buenas tardes", "buenas noches", "que tal daemon" ],
+  "responses" : [ "Sistemas al cien por ciento, Cristian. ¿Activamos el protocolo de trabajo o qué ejecutamos hoy?" ],
+  "action" : "NONE"
+}, {
+  "tag" : "identidad",
+  "patterns" : [ "quien eres", "como te llamas", "que eres" ],
+  "responses" : [ "Soy Daemon v7.0, tu asistente holográfico estilo J.A.R.V.I.S. con control sobre tus modos de trabajo, Opera GX y Spotify." ],
+  "action" : "NONE"
+}, {
+  "tag" : "hora_fecha",
+  "patterns" : [ "que hora es", "dime la hora", "fecha de hoy" ],
+  "responses" : [ ],
+  "action" : "CHECK_TIME"
+}, {
+  "tag" : "clima_actual",
+  "patterns" : [ "como esta el clima", "que temperatura hace" ],
+  "responses" : [ ],
+  "action" : "CHECK_WEATHER"
+}, {
+  "tag" : "proceso_hilo",
+  "patterns" : [ "proceso", "que es proceso", "definicion de proceso", "explicame proceso", "como funciona proceso", "hilo", "que es hilo", "definicion de hilo", "explicame hilo", "como funciona hilo", "thread", "que es thread", "definicion de thread", "explicame thread", "como funciona thread" ],
+  "responses" : [ "Un proceso es un programa en ejecución con memoria aislada; un hilo es una unidad de ejecución ligera dentro de ese proceso." ],
+  "action" : "NONE"
+}, {
+  "tag" : "mutex_semaforo",
+  "patterns" : [ "mutex", "que es mutex", "definicion de mutex", "explicame mutex", "como funciona mutex", "semaforo", "que es semaforo", "definicion de semaforo", "explicame semaforo", "como funciona semaforo", "exclusion mutua", "que es exclusion mutua", "definicion de exclusion mutua", "explicame exclusion mutua", "como funciona exclusion mutua" ],
+  "responses" : [ "Un Mutex garantiza exclusión mutua binaria para un recurso crítico, mientras que un Semáforo sincroniza el acceso mediante un contador entero." ],
+  "action" : "NONE"
+} ]

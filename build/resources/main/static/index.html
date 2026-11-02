@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DAEMON // CLOUD NEURAL INTERFACE</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+    <style>
+        body {
+            background-color: #020611;
+            background-image: radial-gradient(circle at 50% 35%, rgba(0, 225, 255, 0.14) 0%, #020611 70%);
+            font-family: 'JetBrains Mono', monospace;
+            overflow: hidden;
+        }
+        .font-hud { font-family: 'Orbitron', sans-serif; }
+        .glass-panel {
+            background: rgba(6, 16, 34, 0.78);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(0, 230, 255, 0.35);
+            box-shadow: 0 0 30px rgba(0, 225, 255, 0.12);
+        }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: rgba(0, 230, 255, 0.4); border-radius: 4px; }
+    </style>
+</head>
+<body class="h-screen w-screen flex flex-col justify-between text-cyan-100 select-none">
+
+    <!-- CANVAS DEL REACTOR EN FONDO -->
+    <canvas id="reactor-canvas" class="fixed inset-0 w-full h-full z-0 pointer-events-none"></canvas>
+
+    <!-- CABECERA -->
+    <header class="relative z-10 flex justify-between items-center px-5 py-3 border-b border-cyan-500/20 bg-slate-950/60 backdrop-blur-md">
+        <div class="flex items-center space-x-3">
+            <span id="status-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_10px_#10b981]"></span>
+            <div>
+                <h1 class="font-hud text-xs sm:text-sm font-bold tracking-[0.2em] text-cyan-300">DAEMON // CLOUD CORTEX v6.0</h1>
+                <p id="status-text" class="text-[10px] tracking-widest text-emerald-400">GLOBAL CLOUD ACCESS // READY</p>
+            </div>
+        </div>
+        <button id="tts-btn" class="border border-cyan-500/40 bg-cyan-950/40 hover:bg-cyan-900/60 text-cyan-300 px-3 py-1 rounded text-[10px] font-hud tracking-wider cursor-pointer">
+            🔊 VOZ: ON
+        </button>
+    </header>
+
+    <!-- HISTORIAL DE CONVERSACIÓN TIPO CHAT HOLOGRÁFICO -->
+    <main id="chat-stream" class="relative z-10 flex-1 max-w-2xl w-[94%] mx-auto my-3 overflow-y-auto space-y-3 p-3 select-text">
+        <div class="glass-panel rounded-xl p-3.5 text-xs sm:text-sm text-cyan-100 border-l-4 border-l-cyan-400">
+            <div class="font-hud text-[10px] text-cyan-400 tracking-widest mb-1">DAEMON // CORE</div>
+            Enlace en la nube establecido. Puedes conversar libremente conmigo de cualquier tema o pedirme que controle Spotify y las aplicaciones del sistema.
+        </div>
+    </main>
+
+    <!-- BARRA DE ENTRADA -->
+    <footer class="relative z-10 pb-5 px-4 max-w-2xl w-full mx-auto">
+        <form id="chat-form" class="glass-panel rounded-full flex items-center px-3 py-1.5 space-x-2">
+            <input
+                id="chat-input"
+                type="text"
+                placeholder="Conversa con Daemon o pide una canción..."
+                autocomplete="off"
+                class="flex-1 bg-transparent text-xs sm:text-sm text-cyan-100 placeholder-cyan-600 focus:outline-none px-3 py-1.5"
+            />
+            <button type="submit" class="font-hud text-[10px] tracking-widest bg-cyan-500/25 hover:bg-cyan-500/45 border border-cyan-400/50 text-cyan-200 px-4 py-2 rounded-full transition cursor-pointer">
+                ENVIAR
+            </button>
+        </form>
+    </footer>
+
+    <script>
+        // ID de sesión único por cada dispositivo o persona que entre a tu link
+        const sessionId = localStorage.getItem('daemon_sid') || ('usr_' + Math.random().toString(36).substring(2, 10));
+        localStorage.setItem('daemon_sid', sessionId);
+
+        let ttsEnabled = true;
+        let coreState = 'IDLE';
+
+        document.getElementById('tts-btn').addEventListener('click', (e) => {
+            ttsEnabled = !ttsEnabled;
+            e.target.textContent = ttsEnabled ? '🔊 VOZ: ON' : '🔇 VOZ: OFF';
+            if (!ttsEnabled) window.speechSynthesis.cancel();
+        });
+
+        function speakText(text) {
+            if (!ttsEnabled || !('speechSynthesis' in window)) return;
+            window.speechSynthesis.cancel();
+            const clean = text.replace(/[#*`_~>-]/g, '').trim();
+            const u = new SpeechSynthesisUtterance(clean);
+            u.lang = 'es-MX';
+            u.rate = 1.05;
+            u.onstart = () => coreState = 'SPEAKING';
+            u.onend = () => coreState = 'IDLE';
+            window.speechSynthesis.speak(u);
+        }
+
+        const chatStream = document.getElementById('chat-stream');
+        const chatForm = document.getElementById('chat-form');
+        const chatInput = document.getElementById('chat-input');
+        const statusText = document.getElementById('status-text');
+
+        function appendBubble(role, text) {
+            const div = document.createElement('div');
+            if (role === 'USER') {
+                div.className = 'glass-panel rounded-xl p-3 text-xs sm:text-sm text-emerald-100 ml-auto max-w-[85%] border-r-4 border-r-emerald-400';
+                div.innerHTML = `<div class="font-hud text-[9px] text-emerald-400 tracking-widest mb-1 text-right">TÚ</div><div>${text}</div>`;
+            } else {
+                div.className = 'glass-panel rounded-xl p-3.5 text-xs sm:text-sm text-cyan-50 mr-auto max-w-[92%] border-l-4 border-l-cyan-400 prose prose-invert';
+                div.innerHTML = `<div class="font-hud text-[9px] text-cyan-400 tracking-widest mb-1">DAEMON // CORTEX</div><div>${marked.parse(text)}</div>`;
+            }
+            chatStream.appendChild(div);
+            chatStream.scrollTop = chatStream.scrollHeight;
+        }
+
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const prompt = chatInput.value.trim();
+            if (!prompt) return;
+            chatInput.value = '';
+
+            appendBubble('USER', prompt);
+            coreState = 'THINKING';
+            statusText.textContent = 'PROCESSING IN CLOUD CORTEX...';
+
+            try {
+                const res = await fetch('/api/daemon/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt, sessionId, fromBrowser: true })
+                });
+
+                const ms = Math.round(performance.now() - t0);
+                pingVal.textContent = `${ms} ms`;
+
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+                const reply = await res.text();
+                appendBubble('DAEMON', reply);
+                statusText.textContent = 'GLOBAL CLOUD ACCESS // READY';
+                coreState = 'IDLE';
+                speakText(reply);
+            } catch (err) {
+                appendBubble('DAEMON', 'Error de conexión con el servidor Daemon.');
+                coreState = 'IDLE';
+            }
+        });
+
+        // Animación ligera del reactor de fondo
+        const canvas = document.getElementById('reactor-canvas');
+        const ctx = canvas.getContext('2d');
+        let w, h, t = 0;
+        function resize() { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function draw() {
+            ctx.clearRect(0, 0, w, h);
+            t += coreState === 'THINKING' ? 0.05 : 0.015;
+            const cx = w / 2, cy = h / 2;
+            ctx.strokeStyle = coreState === 'THINKING' ? 'rgba(255,180,0,0.22)' : 'rgba(0,225,255,0.16)';
+            ctx.lineWidth = 1.5;
+            for (let r = 90; r <= 210; r += 40) {
+                ctx.beginPath();
+                ctx.arc(cx, cy, r + Math.sin(t * 2) * 6, t, t + Math.PI * 1.4);
+                ctx.stroke();
+            }
+            requestAnimationFrame(draw);
+        }
+        draw();
+    </script>
+</body>
+</html>
