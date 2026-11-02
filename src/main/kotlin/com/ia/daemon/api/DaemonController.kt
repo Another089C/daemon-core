@@ -20,6 +20,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.text.Normalizer
 import java.time.Duration
 import java.time.LocalDateTime
@@ -32,7 +33,7 @@ import kotlin.concurrent.thread
 import kotlin.math.*
 
 // ============================================================================
-// MODELOS DE DATOS DE CUENTAS, ROLES Y BÓVEDA EN LA NUBE
+// MODELOS DE DATOS DE CUENTAS, OTA AUTO-UPDATER Y BÓVEDA EN LA NUBE
 // ============================================================================
 data class ChatRequest(
     val prompt: String = "",
@@ -65,8 +66,8 @@ data class ChatMessage(
 
 data class UserAccount(
     val username: String = "",
-    var password: String = "",
-    var role: String = "USER", // "ADMIN" (Cristian) o "USER"
+    var passwordHash: String = "",
+    var role: String = "USER", // Solo "cristian" tiene "ADMIN"
     val personalFacts: MutableList<String> = mutableListOf(),
     val personalKnowledge: MutableList<IntentNode> = mutableListOf(),
     val personalModes: MutableList<WorkspaceMode> = mutableListOf(),
@@ -80,10 +81,21 @@ data class CloudVaultState(
     val accounts: MutableList<UserAccount> = mutableListOf()
 )
 
-data class LocalDeviceConfig(
-    var cloudDatabaseUrl: String = "",
-    var currentUsername: String = "cristian",
-    var currentPassword: String = "admin2026"
+// Este archivo viaja en el repositorio para que NINGUNA PC tenga que configurar URLs manualmente
+data class OtaManifest(
+    var appVersion: Int = 120,
+    var versionName: String = "12.0.0",
+    var githubRawBaseUrl: String = "",
+    var sharedCloudDbUrl: String = "",
+    var jarRelativePath: String = "build/libs/daemon-0.0.1-SNAPSHOT.jar",
+    var publishedAt: Long = System.currentTimeMillis()
+)
+
+// Este archivo vive SOLO en la PC física (C:\Users\Nombre\.daemon_session.json) y NUNCA se sube a GitHub
+data class LocalMachineSession(
+    var loggedUsername: String = "invitado",
+    var loggedPasswordHash: String = "",
+    var installedAppVersion: Int = 120
 )
 
 data class OllamaOptions(
@@ -106,47 +118,103 @@ data class CloudChatPayload(
 )
 
 // ============================================================================
-// 1. SERVICIO DE BÓVEDA EN LA NUBE MULTI-DISPOSITIVO + CUENTA DE ADMINISTRADOR
+// 1. SERVICIO DE SEGURIDAD, CUENTAS CLOUD Y AUTO-ACTUALIZADOR OTA (GITHUB + DB)
 // ============================================================================
 @Service
 class CloudVaultService {
 
     private val vaultCacheFile = File("daemon_cloud_vault.json")
-    private val configFile = File("daemon_device_config.json")
+    private val otaManifestFile = File("daemon_ota_manifest.json")
+    // Sesión privada guardada en el directorio personal del sistema operativo (fuera del repo)
+    private val localSessionFile = File(System.getProperty("user.home"), ".daemon_session.json")
+
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
 
     private val httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(5))
+        .connectTimeout(Duration.ofSeconds(6))
         .followRedirects(HttpClient.Redirect.NORMAL)
         .build()
 
-    var deviceConfig = LocalDeviceConfig()
+    var otaManifest = OtaManifest()
+    var localSession = LocalMachineSession()
     var vault = CloudVaultState()
 
-    @Volatile var cloudSyncStatus: String = "LOCAL CACHE"
+    @Volatile var cloudSyncStatus: String = "CLOUD READY"
+    @Volatile var otaStatusText: String = "v12.0.0 ACTUALIZADO"
+    var onSessionOrVaultChanged: (() -> Unit)? = null
 
     init {
-        loadDeviceConfig()
+        loadOrDetectOtaManifest()
+        loadPrivateMachineSession()
         loadOrInitializeVault()
-        startBackgroundCloudSync()
+        startAutomaticOtaAndCloudDaemon()
     }
 
-    private fun loadDeviceConfig() {
-        val envUrl = System.getenv("DAEMON_CLOUD_DB_URL") ?: ""
-        if (configFile.exists()) {
+    fun sha256(input: String): String {
+        val bytes = MessageDigest.getInstance("SHA-256").digest(input.trim().toByteArray(StandardCharsets.UTF_8))
+        return bytes.joinToString("") { "%02x".format(it) }
+    }
+
+    // Detecta automáticamente tu repositorio de GitHub desde .git/config para que nunca tengas que escribirlo a mano
+    private fun loadOrDetectOtaManifest() {
+        if (otaManifestFile.exists()) {
             try {
-                deviceConfig = objectMapper.readValue(configFile, LocalDeviceConfig::class.java)
+                otaManifest = objectMapper.readValue(otaManifestFile, OtaManifest::class.java)
             } catch (e: Exception) {}
         }
-        if (envUrl.isNotBlank() && deviceConfig.cloudDatabaseUrl.isBlank()) {
-            deviceConfig.cloudDatabaseUrl = envUrl
+
+        if (otaManifest.githubRawBaseUrl.isBlank()) {
+            val detectedRaw = detectGitHubRawBaseUrl()
+            if (detectedRaw != null) {
+                otaManifest.githubRawBaseUrl = detectedRaw
+                saveOtaManifest()
+            }
         }
-        saveDeviceConfig()
     }
 
-    fun saveDeviceConfig() {
+    private fun detectGitHubRawBaseUrl(): String? {
+        return try {
+            val gitConfig = sequenceOf(
+                File(".git/config"),
+                File("../.git/config")
+            ).firstOrNull { it.exists() } ?: return null
+
+            val content = gitConfig.readText(StandardCharsets.UTF_8)
+            val m = Regex("""github\.com[:/]([^/\s]+)/([^/\s\.]+?)(?:\.git)?\s""").find(content + " ")
+                ?: return null
+            val owner = m.groupValues[1].trim()
+            val repo = m.groupValues[2].trim()
+            "https://raw.githubusercontent.com/$owner/$repo/main"
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun saveOtaManifest() {
         try {
-            objectMapper.writeValue(configFile, deviceConfig)
+            objectMapper.writeValue(otaManifestFile, otaManifest)
+        } catch (e: Exception) {}
+    }
+
+    private fun loadPrivateMachineSession() {
+        if (localSessionFile.exists()) {
+            try {
+                localSession = objectMapper.readValue(localSessionFile, LocalMachineSession::class.java)
+            } catch (e: Exception) {}
+        } else {
+            // Por seguridad, cualquier PC nueva inicia como "invitado" (SIN acceso a Admin)
+            localSession = LocalMachineSession(
+                loggedUsername = "invitado",
+                loggedPasswordHash = sha256("invitado"),
+                installedAppVersion = otaManifest.appVersion
+            )
+            savePrivateMachineSession()
+        }
+    }
+
+    fun savePrivateMachineSession() {
+        try {
+            objectMapper.writeValue(localSessionFile, localSession)
         } catch (e: Exception) {}
     }
 
@@ -157,35 +225,56 @@ class CloudVaultService {
             } catch (e: Exception) {}
         }
 
-        // Garantizar que la Base de Conocimientos Global tenga los nodos maestros
         if (vault.globalKnowledge.isEmpty()) {
             vault.globalKnowledge.addAll(buildMasterGlobalKnowledge())
         }
 
-        // Garantizar que SIEMPRE exista tu Cuenta Maestra de Administrador ("cristian")
-        val adminExists = vault.accounts.any { it.username.equals("cristian", true) }
-        if (!adminExists) {
-            val adminAccount = UserAccount(
-                username = "cristian",
-                password = deviceConfig.currentPassword.ifBlank { "admin2026" },
-                role = "ADMIN",
-                personalFacts = mutableListOf(
-                    "Es Cristian Alexis, creador y Administrador Maestro de Daemon.",
-                    "Estudia Ingeniería en Sistemas Computacionales en la ESCOM del IPN."
-                ),
-                personalKnowledge = mutableListOf(),
-                personalModes = buildDefaultModesForUser("Cristian"),
-                recentHistory = mutableListOf(),
-                updatedAt = System.currentTimeMillis()
+        // 1. Asegurar cuenta maestra de Cristian (ÚNICO ADMIN, clave por defecto: admin2026)
+        val adminHash = sha256("admin2026")
+        val existingAdmin = vault.accounts.firstOrNull { it.username.equals("cristian", true) }
+        if (existingAdmin == null) {
+            vault.accounts.add(
+                UserAccount(
+                    username = "cristian",
+                    passwordHash = adminHash,
+                    role = "ADMIN",
+                    personalFacts = mutableListOf(
+                        "Es Cristian Alexis, creador y Administrador Maestro de Daemon.",
+                        "Estudia Ingeniería en Sistemas Computacionales en la ESCOM del IPN."
+                    ),
+                    personalKnowledge = mutableListOf(),
+                    personalModes = buildDefaultModesForUser("Cristian"),
+                    recentHistory = mutableListOf(),
+                    updatedAt = System.currentTimeMillis()
+                )
             )
-            vault.accounts.add(adminAccount)
         } else {
-            // Asegurar que cristian siempre conserve el rol ADMIN
-            vault.accounts.firstOrNull { it.username.equals("cristian", true) }?.role = "ADMIN"
+            existingAdmin.role = "ADMIN"
+            if (existingAdmin.passwordHash.isBlank()) existingAdmin.passwordHash = adminHash
+        }
+
+        // 2. Asegurar cuenta pública predeterminada ("invitado") para PCs nuevas
+        if (vault.accounts.none { it.username.equals("invitado", true) }) {
+            vault.accounts.add(
+                UserAccount(
+                    username = "invitado",
+                    passwordHash = sha256("invitado"),
+                    role = "USER",
+                    personalFacts = mutableListOf("Sesión estándar de usuario en Daemon."),
+                    personalKnowledge = mutableListOf(),
+                    personalModes = buildDefaultModesForUser("Usuario"),
+                    recentHistory = mutableListOf(),
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+        }
+
+        // Ninguna cuenta que no sea "cristian" puede tener rol ADMIN
+        vault.accounts.forEach { acc ->
+            if (!acc.username.equals("cristian", true)) acc.role = "USER"
         }
 
         saveLocalVaultCache()
-        pullFromCloudNow()
     }
 
     fun saveLocalVaultCache() {
@@ -196,10 +285,161 @@ class CloudVaultService {
     }
 
     // ========================================================================
-    // SINCRONIZACIÓN REAL EN LA NUBE (FIREBASE REALTIME DB / REST CLOUD SERVER)
+    // MOTOR AUTOMÁTICO OTA (ACTUALIZA LA BASE DE DATOS Y EL .JAR EN TODAS LAS PCS)
     // ========================================================================
-    private fun resolveCloudRestUrl(): String? {
-        val raw = deviceConfig.cloudDatabaseUrl.trim()
+    private fun startAutomaticOtaAndCloudDaemon() {
+        thread(isDaemon = true, name = "Daemon-OTA-AutoUpdater") {
+            Thread.sleep(2000)
+            checkForUpdatesAndSyncNow(silent = true)
+            while (true) {
+                Thread.sleep(35000) // Verifica actualizaciones cada 35 segundos en segundo plano
+                checkForUpdatesAndSyncNow(silent = true)
+            }
+        }
+    }
+
+    fun checkForUpdatesAndSyncNow(silent: Boolean = false): String {
+        var statusMsg = "Sincronización al día (v${otaManifest.versionName})."
+        try {
+            // 1. Sincronizar desde la Base de Datos en Tiempo Real (si el Admin configuró una URL en el manifiesto)
+            pullFromRealtimeCloudDb()
+
+            // 2. Revisar en GitHub si el Administrador subió una nueva base de datos o nueva versión del programa (.jar)
+            val rawBase = otaManifest.githubRawBaseUrl.trimEnd('/')
+            if (rawBase.isNotBlank()) {
+                val manifestUrl = "$rawBase/daemon_ota_manifest.json?t=${System.currentTimeMillis()}"
+                val req = HttpRequest.newBuilder().uri(URI.create(manifestUrl)).timeout(Duration.ofSeconds(5)).GET().build()
+                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+
+                if (res.statusCode() == 200 && res.body().contains("appVersion")) {
+                    val remoteManifest = objectMapper.readValue(res.body(), OtaManifest::class.java)
+
+                    // Si el Admin actualizó la URL de la base de datos en tiempo real, adoptarla automáticamente
+                    if (remoteManifest.sharedCloudDbUrl.isNotBlank() && remoteManifest.sharedCloudDbUrl != otaManifest.sharedCloudDbUrl) {
+                        otaManifest.sharedCloudDbUrl = remoteManifest.sharedCloudDbUrl
+                        saveOtaManifest()
+                        pullFromRealtimeCloudDb()
+                    }
+
+                    // Descargar siempre la bóveda global actualizada desde el repositorio
+                    pullVaultFromGitHubRaw(rawBase)
+
+                    // ¿Hay una versión más nueva del ejecutable (.jar) subida por Cristian?
+                    if (remoteManifest.appVersion > otaManifest.appVersion) {
+                        otaStatusText = "⬇ DESCARGANDO UPDATE v${remoteManifest.versionName}..."
+                        onSessionOrVaultChanged?.invoke()
+                        val updated = downloadAndApplyNewJarUpdate(rawBase, remoteManifest)
+                        if (updated) {
+                            return "Actualización v${remoteManifest.versionName} descargada. Reiniciando Daemon..."
+                        }
+                    } else {
+                        otaStatusText = "v${otaManifest.versionName} AL DÍA ✓"
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (!silent) statusMsg = "Modo local activo (sin conexión al servidor OTA)."
+        }
+        onSessionOrVaultChanged?.invoke()
+        return statusMsg
+    }
+
+    private fun pullVaultFromGitHubRaw(rawBase: String) {
+        try {
+            val vaultUrl = "$rawBase/daemon_cloud_vault.json?t=${System.currentTimeMillis()}"
+            val req = HttpRequest.newBuilder().uri(URI.create(vaultUrl)).timeout(Duration.ofSeconds(5)).GET().build()
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() == 200 && res.body().contains("globalKnowledge")) {
+                val remoteVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
+                mergeCloudVault(remoteVault)
+                cloudSyncStatus = "CLOUD SYNCED ☁"
+            }
+        } catch (e: Exception) {}
+    }
+
+    // Descarga el nuevo .jar en segundo plano, libera el candado del SO, reemplaza el binario y reinicia Daemon
+    private fun downloadAndApplyNewJarUpdate(rawBase: String, remoteManifest: OtaManifest): Boolean {
+        return try {
+            val jarUrl = "$rawBase/${remoteManifest.jarRelativePath.trimStart('/')}?t=${System.currentTimeMillis()}"
+            val workingDir = File(System.getProperty("user.dir"))
+
+            // Detectar cuál es el archivo .jar que está corriendo actualmente
+            val currentJar = File(workingDir, remoteManifest.jarRelativePath).let {
+                if (it.exists()) it else File(workingDir, "daemon.jar")
+            }
+            val tempJar = File(workingDir, "daemon_update_temp.jar")
+
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create(jarUrl))
+                .timeout(Duration.ofSeconds(60))
+                .GET()
+                .build()
+            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofByteArray())
+
+            // Verificar que el archivo descargado sea un ejecutable .jar válido (> 100 KB)
+            if (res.statusCode() == 200 && res.body().size > 100000) {
+                tempJar.writeBytes(res.body())
+
+                otaManifest = remoteManifest
+                saveOtaManifest()
+                localSession.installedAppVersion = remoteManifest.appVersion
+                savePrivateMachineSession()
+
+                val isWin = System.getProperty("os.name").lowercase().contains("win")
+                val javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + (if (isWin) "javaw.exe" else "java")
+
+                if (isWin) {
+                    // En Windows: Script Swapper que espera a que se cierre el proceso actual, reemplaza el .jar y lo relanza
+                    val updaterBat = File(workingDir, "daemon_swapper.bat")
+                    val batContent = """
+                        @echo off
+                        timeout /t 2 /nobreak >nul
+                        move /y "${tempJar.absolutePath}" "${currentJar.absolutePath}" >nul
+                        start "" "$javaBin" -Xms32m -Xmx128m -XX:+UseSerialGC -jar "${currentJar.absolutePath}"
+                        del "%~f0"
+                    """.trimIndent()
+                    updaterBat.writeText(batContent, StandardCharsets.ISO_8859_1)
+
+                    // Ejecutar el swapper de forma 100% invisible (sin ventana negra)
+                    val vbsSwapper = File(workingDir, "run_swapper.vbs")
+                    vbsSwapper.writeText(
+                        "CreateObject(\"WScript.Shell\").Run \"\"\"${updaterBat.absolutePath}\"\"\", 0, False",
+                        StandardCharsets.ISO_8859_1
+                    )
+                    ProcessBuilder("wscript.exe", vbsSwapper.absolutePath).directory(workingDir).start()
+                } else {
+                    // En macOS / Linux: Script Swapper en Bash
+                    val updaterSh = File(workingDir, "daemon_swapper.sh")
+                    val shContent = """
+                        #!/bin/bash
+                        sleep 2
+                        mv -f "${tempJar.absolutePath}" "${currentJar.absolutePath}"
+                        "$javaBin" -Xms32m -Xmx128m -XX:+UseSerialGC -jar "${currentJar.absolutePath}" &
+                        rm -- "$0"
+                    """.trimIndent()
+                    updaterSh.writeText(shContent, StandardCharsets.UTF_8)
+                    updaterSh.setExecutable(true)
+                    ProcessBuilder("/bin/bash", updaterSh.absolutePath).directory(workingDir).start()
+                }
+
+                // Cerrar la instancia vieja inmediatamente para que el Swapper reemplace el archivo y abra la nueva
+                Thread.sleep(300)
+                System.exit(0)
+                true
+            } else {
+                otaManifest = remoteManifest
+                saveOtaManifest()
+                otaStatusText = "v${otaManifest.versionName} SYNC ✓"
+                false
+            }
+        } catch (e: Exception) {
+            println("[DAEMON OTA ERROR] ${e.message}")
+            false
+        }
+    }
+
+    private fun resolveRealtimeCloudUrl(): String? {
+        val raw = otaManifest.sharedCloudDbUrl.trim()
         if (raw.isBlank()) return null
         return when {
             raw.contains("firebaseio.com") || raw.contains("firebasedatabase.app") -> {
@@ -215,7 +455,7 @@ class CloudVaultService {
 
     fun pushToCloudAsync() {
         saveLocalVaultCache()
-        val url = resolveCloudRestUrl() ?: return
+        val url = resolveRealtimeCloudUrl() ?: return
         thread(isDaemon = true) {
             try {
                 val json = objectMapper.writeValueAsString(vault)
@@ -226,42 +466,34 @@ class CloudVaultService {
                     .PUT(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
                     .build()
                 val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-                cloudSyncStatus = if (res.statusCode() in 200..299) "CLOUD SYNCED ☁" else "CLOUD ERR ${res.statusCode()}"
-            } catch (e: Exception) {
-                cloudSyncStatus = "OFFLINE CACHE"
-            }
+                if (res.statusCode() in 200..299) {
+                    cloudSyncStatus = "LIVE CLOUD ☁"
+                }
+            } catch (e: Exception) {}
         }
     }
 
-    fun pullFromCloudNow(): Boolean {
-        val url = resolveCloudRestUrl() ?: return false
+    fun pullFromRealtimeCloudDb(): Boolean {
+        val url = resolveRealtimeCloudUrl() ?: return false
         return try {
-            val req = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(5))
-                .GET()
-                .build()
+            val req = HttpRequest.newBuilder().uri(URI.create(url)).timeout(Duration.ofSeconds(5)).GET().build()
             val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
             if (res.statusCode() == 200 && res.body().isNotBlank() && res.body().trim() != "null") {
                 val remoteVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
                 mergeCloudVault(remoteVault)
-                cloudSyncStatus = "CLOUD SYNCED ☁"
+                cloudSyncStatus = "LIVE CLOUD ☁"
                 true
             } else {
-                // Si la nube está vacía por primera vez, subimos nuestra bóveda inicial
                 pushToCloudAsync()
                 true
             }
         } catch (e: Exception) {
-            cloudSyncStatus = "OFFLINE CACHE"
             false
         }
     }
 
-    // Fusiona inteligentemente las cuentas y conocimientos de la nube con el dispositivo actual
     @Synchronized
     fun mergeCloudVault(remote: CloudVaultState) {
-        // 1. Fusionar conocimientos globales del Administrador
         for (rNode in remote.globalKnowledge) {
             val idx = vault.globalKnowledge.indexOfFirst { it.tag.equals(rNode.tag, true) }
             if (idx < 0) {
@@ -271,10 +503,10 @@ class CloudVaultService {
             }
         }
 
-        // 2. Fusionar cuentas de usuario (gana la versión más reciente de cada usuario)
         for (rAcc in remote.accounts) {
             val localIdx = vault.accounts.indexOfFirst { it.username.equals(rAcc.username, true) }
             if (localIdx < 0) {
+                rAcc.role = if (rAcc.username.equals("cristian", true)) "ADMIN" else "USER"
                 vault.accounts.add(rAcc)
             } else {
                 val localAcc = vault.accounts[localIdx]
@@ -282,7 +514,7 @@ class CloudVaultService {
                     val mergedFacts = (localAcc.personalFacts + rAcc.personalFacts).distinct().toMutableList()
                     val mergedKnow = (localAcc.personalKnowledge + rAcc.personalKnowledge).distinctBy { it.tag }.toMutableList()
                     vault.accounts[localIdx] = rAcc.copy(
-                        role = if (rAcc.username.equals("cristian", true)) "ADMIN" else rAcc.role,
+                        role = if (rAcc.username.equals("cristian", true)) "ADMIN" else "USER",
                         personalFacts = mergedFacts,
                         personalKnowledge = mergedKnow
                     )
@@ -292,72 +524,82 @@ class CloudVaultService {
         objectMapper.writeValue(vaultCacheFile, vault)
     }
 
-    private fun startBackgroundCloudSync() {
-        thread(isDaemon = true, name = "Daemon-Cloud-Vault-Sync") {
-            while (true) {
-                try {
-                    if (deviceConfig.cloudDatabaseUrl.isNotBlank()) {
-                        pullFromCloudNow()
-                    }
-                } catch (e: Exception) {}
-                Thread.sleep(15000) // Sincronización silenciosa cada 15 segundos
-            }
-        }
-    }
-
     // ========================================================================
-    // GESTIÓN DE CUENTAS Y PRIVILEGIOS DE ADMINISTRADOR
+    // AUTENTICACIÓN ESTRICTA (SOLO CRISTIAN PUEDE SER ADMIN)
     // ========================================================================
     fun getCurrentAccount(): UserAccount {
-        return vault.accounts.firstOrNull { it.username.equals(deviceConfig.currentUsername, true) }
-            ?: vault.accounts.first()
+        val acc = vault.accounts.firstOrNull { it.username.equals(localSession.loggedUsername, true) }
+        if (acc != null && acc.passwordHash == localSession.loggedPasswordHash) {
+            return acc
+        }
+        // Si la sesión no es válida, regresa a "invitado" (SIN permisos de Admin)
+        return vault.accounts.firstOrNull { it.username.equals("invitado", true) } ?: vault.accounts.last()
     }
 
-    fun isAdminLoggedIn(): Boolean = getCurrentAccount().role.equals("ADMIN", true)
+    fun isAdminLoggedIn(): Boolean {
+        val acc = getCurrentAccount()
+        return acc.username.equals("cristian", true) && acc.role == "ADMIN"
+    }
 
-    fun loginOrSwitchUser(username: String, password: String): String {
-        pullFromCloudNow()
+    fun loginUser(username: String, plainPassword: String): Pair<Boolean, String> {
+        pullFromRealtimeCloudDb()
         val cleanUser = username.trim().lowercase()
         val acc = vault.accounts.firstOrNull { it.username.equals(cleanUser, true) }
-            ?: return "El usuario '$cleanUser' no existe en la nube de Daemon. Puedes crearlo con: 'registrar usuario $cleanUser clave <tu_clave>'."
+            ?: return Pair(false, "La cuenta '$cleanUser' no existe. Usa el botón CREAR CUENTA.")
 
-        if (acc.password != password.trim()) {
-            return "Contraseña incorrecta para la cuenta '$cleanUser'."
+        val inputHash = sha256(plainPassword)
+        if (acc.passwordHash != inputHash && acc.passwordHash != plainPassword.trim()) {
+            return Pair(false, "Clave de acceso incorrecta para '$cleanUser'.")
         }
 
-        deviceConfig.currentUsername = acc.username
-        deviceConfig.currentPassword = acc.password
-        saveDeviceConfig()
+        // Actualizar a hash seguro si estaba en texto plano
+        acc.passwordHash = inputHash
+        localSession.loggedUsername = acc.username
+        localSession.loggedPasswordHash = inputHash
+        savePrivateMachineSession()
+        onSessionOrVaultChanged?.invoke()
 
-        val badge = if (acc.role == "ADMIN") "👑 ADMINISTRADOR MAESTRO" else "👤 USUARIO ESTÁNDAR"
-        return "Sesión iniciada en la nube como '${acc.username.uppercase()}' [$badge]. Se cargaron ${acc.personalFacts.size} recuerdos personales y ${acc.personalKnowledge.size} nodos propios."
+        val badge = if (acc.role == "ADMIN") "👑 ADMINISTRADOR MAESTRO" else "👤 CUENTA CLOUD"
+        return Pair(true, "Bienvenido, ${acc.username.uppercase()} [$badge]. Memoria sincronizada (${acc.personalFacts.size} recuerdos).")
     }
 
-    fun registerNewUser(username: String, password: String, role: String = "USER"): String {
-        pullFromCloudNow()
-        val cleanUser = username.trim().lowercase().replace(Regex("[^a-z0-9_]"), "")
-        if (cleanUser.length < 3) return "El nombre de usuario debe tener al menos 3 caracteres."
-        if (vault.accounts.any { it.username.equals(cleanUser, true) }) {
-            return "El usuario '$cleanUser' ya está registrado en la nube."
-        }
+    fun logoutToGuest(): String {
+        localSession.loggedUsername = "invitado"
+        localSession.loggedPasswordHash = sha256("invitado")
+        savePrivateMachineSession()
+        onSessionOrVaultChanged?.invoke()
+        return "Sesión cerrada. Modo Invitado activo (Panel de Administrador bloqueado y oculto)."
+    }
 
+    fun registerNewUser(username: String, plainPassword: String): Pair<Boolean, String> {
+        pullFromRealtimeCloudDb()
+        val cleanUser = username.trim().lowercase().replace(Regex("[^a-z0-9_]"), "")
+        if (cleanUser.length < 3) return Pair(false, "El usuario debe tener mínimo 3 letras o números.")
+        if (cleanUser == "cristian") return Pair(false, "El usuario 'cristian' está reservado para el Administrador.")
+        if (vault.accounts.any { it.username.equals(cleanUser, true) }) {
+            return Pair(false, "El usuario '$cleanUser' ya existe. Inicia sesión con tu clave.")
+        }
+        if (plainPassword.trim().length < 3) return Pair(false, "La clave debe tener al menos 3 caracteres.")
+
+        val passHash = sha256(plainPassword)
         val newAcc = UserAccount(
             username = cleanUser,
-            password = password.trim().ifBlank { "1234" },
-            role = if (cleanUser == "cristian") "ADMIN" else role,
-            personalFacts = mutableListOf("Usuario registrado en Daemon Cloud: $cleanUser"),
+            passwordHash = passHash,
+            role = "USER", // Los usuarios registrados NUNCA son ADMIN
+            personalFacts = mutableListOf("Cuenta personal en la nube de $cleanUser."),
             personalKnowledge = mutableListOf(),
             personalModes = buildDefaultModesForUser(cleanUser),
             recentHistory = mutableListOf(),
             updatedAt = System.currentTimeMillis()
         )
         vault.accounts.add(newAcc)
-        deviceConfig.currentUsername = newAcc.username
-        deviceConfig.currentPassword = newAcc.password
-        saveDeviceConfig()
+        localSession.loggedUsername = newAcc.username
+        localSession.loggedPasswordHash = passHash
+        savePrivateMachineSession()
         pushToCloudAsync()
+        onSessionOrVaultChanged?.invoke()
 
-        return "Cuenta en la nube creada e iniciada para '${newAcc.username.uppercase()}'. Todo lo que platiques o le enseñes estará disponible en cualquiera de tus dispositivos."
+        return Pair(true, "Cuenta '${newAcc.username.uppercase()}' creada y sincronizada en la nube.")
     }
 
     fun addPersonalFactToCurrentUser(fact: String): String {
@@ -367,7 +609,7 @@ class CloudVaultService {
             acc.updatedAt = System.currentTimeMillis()
             pushToCloudAsync()
         }
-        return "Guardado en la memoria en la nube de '${acc.username.uppercase()}': '$fact'. Disponible en todos tus dispositivos."
+        return "Guardado en la nube de '${acc.username.uppercase()}': '$fact'."
     }
 
     fun addPersonalKnowledgeToCurrentUser(tag: String, patterns: List<String>, response: String): String {
@@ -376,75 +618,92 @@ class CloudVaultService {
         acc.personalKnowledge.add(IntentNode(tag = tag, patterns = patterns, responses = listOf(response)))
         acc.updatedAt = System.currentTimeMillis()
         pushToCloudAsync()
-        return "Conocimiento guardado en la cuenta personal de '${acc.username.uppercase()}' (${patterns.size} patrones)."
+        return "Conocimiento guardado en la cuenta de '${acc.username.uppercase()}'."
     }
 
-    // --- FUNCIONES EXCLUSIVAS DE ADMINISTRADOR (CRISTIAN) ---
+    // ========================================================================
+    // ACCIONES EXCLUSIVAS DEL ADMINISTRADOR (PUBLICAR UPDATES OTA Y CONOCIMIENTO)
+    // ========================================================================
     fun adminAddGlobalKnowledge(tag: String, patterns: List<String>, response: String): String {
-        if (!isAdminLoggedIn()) {
-            return "⛔ Acceso denegado. Solo la cuenta de Administrador (Cristian) puede modificar la Base de Conocimiento Global."
-        }
+        if (!isAdminLoggedIn()) return "⛔ Acceso denegado. Exclusivo para el Administrador (Cristian)."
         vault.globalKnowledge.removeIf { it.tag.equals(tag, true) }
         vault.globalKnowledge.add(IntentNode(tag = tag, patterns = patterns, responses = listOf(response)))
         pushToCloudAsync()
-        return "👑 [ADMIN] Nodo global '$tag' agregado a la nube. Ahora está activo para todas las cuentas y dispositivos."
+        return "👑 [ADMIN] Conocimiento global '$tag' inyectado. Se distribuirá automáticamente a todos los dispositivos."
     }
 
-    fun adminDeleteGlobalKnowledge(targetTag: String): String {
-        if (!isAdminLoggedIn()) {
-            return "⛔ Acceso denegado. Requiere permisos de Administrador."
+    fun adminConfigureCloudAndRepo(cloudDbUrl: String, githubRawUrl: String): String {
+        if (!isAdminLoggedIn()) return "⛔ Acceso denegado."
+        if (cloudDbUrl.isNotBlank()) otaManifest.sharedCloudDbUrl = cloudDbUrl.trim()
+        if (githubRawUrl.isNotBlank()) otaManifest.githubRawBaseUrl = githubRawUrl.trim().trimEnd('/')
+        saveOtaManifest()
+        pullFromRealtimeCloudDb()
+        pushToCloudAsync()
+        return "👑 [ADMIN] Enlaces maestros guardados en daemon_ota_manifest.json. Ninguna otra PC tendrá que configurarlos manualmente."
+    }
+
+    // Compila los cambios de código (.kt -> .jar), incrementa la versión OTA y la publica en GitHub para todas las PCs
+    fun adminPublishOtaUpdateToAllDevices(): String {
+        if (!isAdminLoggedIn()) return "⛔ Solo Cristian puede publicar actualizaciones globales."
+
+        otaManifest.appVersion += 1
+        val major = otaManifest.appVersion / 10
+        val minor = otaManifest.appVersion % 10
+        otaManifest.versionName = "12.$major.$minor"
+        otaManifest.publishedAt = System.currentTimeMillis()
+
+        saveOtaManifest()
+        saveLocalVaultCache()
+        pushToCloudAsync()
+
+        otaStatusText = "⚙ COMPILANDO UPDATE v${otaManifest.versionName}..."
+        onSessionOrVaultChanged?.invoke()
+
+        thread {
+            try {
+                val workingDir = File(System.getProperty("user.dir"))
+                val isWin = System.getProperty("os.name").lowercase().contains("win")
+
+                // 1. Si estamos en la PC de desarrollo de Cristian (existe gradlew), compilar el nuevo .jar con los cambios de código
+                val gradleWrapper = File(workingDir, if (isWin) "gradlew.bat" else "gradlew")
+                if (gradleWrapper.exists()) {
+                    val buildCmd = if (isWin) listOf("cmd", "/c", "gradlew.bat", "bootJar") else listOf("./gradlew", "bootJar")
+                    ProcessBuilder(buildCmd).directory(workingDir).start().waitFor()
+                }
+
+                // 2. Copiar también una copia limpia en la raíz como daemon.jar para instalaciones portables
+                val builtJar = File(workingDir, otaManifest.jarRelativePath)
+                if (builtJar.exists()) {
+                    builtJar.copyTo(File(workingDir, "daemon.jar"), overwrite = true)
+                }
+
+                // 3. Subir el manifiesto con la nueva versión, la base de datos y el nuevo ejecutable .jar a GitHub
+                otaStatusText = "☁ SUBIENDO UPDATE v${otaManifest.versionName}..."
+                onSessionOrVaultChanged?.invoke()
+
+                ProcessBuilder("git", "add", "daemon_ota_manifest.json", "daemon_cloud_vault.json")
+                    .directory(workingDir).start().waitFor()
+                ProcessBuilder("git", "add", "-f", otaManifest.jarRelativePath, "daemon.jar")
+                    .directory(workingDir).start().waitFor()
+                ProcessBuilder("git", "commit", "-m", "ota: release automatico v${otaManifest.versionName}")
+                    .directory(workingDir).start().waitFor()
+                ProcessBuilder("git", "push", "origin", "main")
+                    .directory(workingDir).start().waitFor()
+
+                otaStatusText = "PUBLICADO v${otaManifest.versionName} 🚀"
+                onSessionOrVaultChanged?.invoke()
+            } catch (e: Exception) {
+                otaStatusText = "ERROR AL SUBIR OTA"
+                onSessionOrVaultChanged?.invoke()
+            }
         }
-        val removed = vault.globalKnowledge.removeIf { it.tag.contains(targetTag, true) }
-        pushToCloudAsync()
-        return if (removed) "👑 [ADMIN] Nodo global '$targetTag' eliminado de la nube."
-        else "👑 [ADMIN] No se encontró un nodo global con el identificador '$targetTag'."
+
+        return "👑 [DESPLIEGUE OTA v${otaManifest.versionName}] Compilando tu código nuevo y subiendo el binario actualizado a GitHub. En unos segundos todas las PCs conectadas se descargarán e instalarán la versión ${otaManifest.versionName} solas."
     }
 
-    fun adminListUsers(): String {
-        if (!isAdminLoggedIn()) return "⛔ Comando exclusivo para la cuenta de Administrador."
-        val summary = vault.accounts.joinToString("\n") { acc ->
-            "• ${acc.username.uppercase()} [${acc.role}] -> ${acc.personalFacts.size} recuerdos | ${acc.personalKnowledge.size} nodos"
-        }
-        return "👑 [PANEL DE ADMINISTRADOR // USUARIOS EN LA NUBE (${vault.accounts.size})]\n$summary"
-    }
-
-    fun adminDeleteUser(targetUser: String): String {
-        if (!isAdminLoggedIn()) return "⛔ Comando exclusivo para el Administrador."
-        val clean = targetUser.trim().lowercase()
-        if (clean == "cristian") return "👑 No puedes eliminar la cuenta maestra del creador."
-        val removed = vault.accounts.removeIf { it.username.equals(clean, true) }
-        pushToCloudAsync()
-        return if (removed) "👑 [ADMIN] Cuenta '$clean' eliminada de la nube." else "No se encontró el usuario '$clean'."
-    }
-
-    fun adminSetUserRole(targetUser: String, newRole: String): String {
-        if (!isAdminLoggedIn()) return "⛔ Comando exclusivo para el Administrador."
-        val acc = vault.accounts.firstOrNull { it.username.equals(targetUser.trim(), true) }
-            ?: return "No existe el usuario '$targetUser'."
-        acc.role = newRole.uppercase()
-        acc.updatedAt = System.currentTimeMillis()
-        pushToCloudAsync()
-        return "👑 [ADMIN] El rol de '${acc.username.uppercase()}' fue actualizado a ${acc.role}."
-    }
-
-    fun adminSetCloudDatabaseUrl(newUrl: String): String {
-        if (!isAdminLoggedIn()) return "⛔ Solo el Administrador puede cambiar el servidor de base de datos en la nube."
-        deviceConfig.cloudDatabaseUrl = newUrl.trim()
-        saveDeviceConfig()
-        val ok = pullFromCloudNow()
-        pushToCloudAsync()
-        return if (ok) {
-            "👑 [ADMIN] Base de datos en la nube conectada y sincronizada en: ${deviceConfig.cloudDatabaseUrl}"
-        } else {
-            "👑 [ADMIN] URL guardada (${deviceConfig.cloudDatabaseUrl}). Se sincronizará en cuanto haya conexión."
-        }
-    }
-
-    // Busca una respuesta primero en la base personal del usuario activo y luego en la base Global del Admin
     fun findKnowledgeMatch(normalizedInput: String): String? {
         val currentAcc = getCurrentAccount()
         val allNodes = currentAcc.personalKnowledge + vault.globalKnowledge
-
         for (node in allNodes) {
             for (pat in node.patterns) {
                 val normPat = normalizeSimple(pat)
@@ -472,7 +731,7 @@ class CloudVaultService {
             appsToOpen = listOf("vscode", "notion", "opera gx"),
             appsToClose = emptyList(),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Trabajo activo para $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+            greeting = "Modo Trabajo activo, $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
         ),
         WorkspaceMode(
             id = "TAREA",
@@ -481,7 +740,7 @@ class CloudVaultService {
             appsToOpen = listOf("vscode", "notion", "opera gx"),
             appsToClose = listOf("discord", "steam"),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Tarea activo para $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+            greeting = "Modo Tarea activo, $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
         ),
         WorkspaceMode(
             id = "ESTUDIO",
@@ -490,7 +749,7 @@ class CloudVaultService {
             appsToOpen = listOf("notion", "opera gx", "vscode"),
             appsToClose = listOf("discord", "steam"),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Estudio activo para $userLabel. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+            greeting = "Modo Estudio activo, $userLabel. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
         ),
         WorkspaceMode(
             id = "GAMING",
@@ -499,7 +758,7 @@ class CloudVaultService {
             appsToOpen = listOf("discord"),
             appsToClose = listOf("vscode", "notion"),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Gaming activo para $userLabel. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+            greeting = "Modo Gaming activo, $userLabel. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
         )
     )
 
@@ -507,22 +766,17 @@ class CloudVaultService {
         IntentNode(
             tag = "global_identidad",
             patterns = listOf("quien eres", "que es daemon", "como funcionas"),
-            responses = listOf("Soy Daemon v11.0, un sistema operativo de inteligencia artificial con memoria sincronizada en la nube por cuenta de usuario y administrado por Cristian Alexis.")
+            responses = listOf("Soy Daemon v12.0, un sistema operativo de inteligencia artificial con auto-actualización OTA en la nube y memoria por cuenta de usuario, creado por Cristian Alexis.")
         ),
         IntentNode(
             tag = "global_proceso_hilo",
             patterns = listOf("que es un proceso", "diferencia entre proceso e hilo", "que es un thread"),
-            responses = listOf("Un proceso es un programa en ejecución con su propio espacio de memoria aislado; un hilo (thread) es una unidad ligera de ejecución que comparte la memoria de ese proceso.")
+            responses = listOf("Un proceso es un programa en ejecución con su propio espacio de memoria aislado; un hilo (thread) es una unidad ligera de ejecución dentro de ese proceso.")
         ),
         IntentNode(
             tag = "global_mutex_semaforo",
             patterns = listOf("que es un mutex", "diferencia entre mutex y semaforo"),
             responses = listOf("Un Mutex es un cerrojo binario de exclusión mutua para proteger secciones críticas, mientras que un Semáforo emplea un contador entero para sincronizar múltiples hilos o procesos.")
-        ),
-        IntentNode(
-            tag = "global_fpga_vhdl",
-            patterns = listOf("que es una fpga", "que es vhdl"),
-            responses = listOf("Una FPGA es un circuito integrado de hardware digital reconfigurable que se programa mediante lenguajes de descripción de hardware como VHDL para sintetizar lógica paralela real.")
         )
     )
 }
@@ -547,8 +801,8 @@ class SystemScanner(
 
     @Volatile var activeModeName: String = "NÚCLEO ACTIVO"
     @Volatile var currentSpotifyTrack: String = "ACTIVO"
-    @Volatile var cachedCpuLoad: Int = 4
-    @Volatile var cachedRamMb: Int = 54
+    @Volatile var cachedCpuLoad: Int = 3
+    @Volatile var cachedRamMb: Int = 52
     @Volatile var isFullPanelVisible: Boolean = false
     @Volatile private var lastMediaActionTimestamp: Long = 0L
 
@@ -691,7 +945,6 @@ class SystemScanner(
         }
     }
 
-    // Si la aplicación ya está abierta, solo la amplía y pone al frente sin abrir nuevas pestañas
     fun openOrFocusApp(normalizedCommand: String): String {
         val requestedApp = normalizedCommand
             .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
@@ -1495,7 +1748,7 @@ class SystemScanner(
 }
 
 // ============================================================================
-// 3. CEREBRO DE DAEMON CON MEMORIA POR USUARIO EN LA NUBE + COMANDOS ADMIN
+// 3. CEREBRO DE DAEMON + PROCESAMIENTO DE COMANDOS Y CUENTAS
 // ============================================================================
 @Service
 class DaemonBrain(
@@ -1526,8 +1779,8 @@ class DaemonBrain(
         startContinuousWakeWordEar()
         val acc = cloudVault.getCurrentAccount()
         speakAndDisplay(
-            "NÚCLEO CLOUD v11.0",
-            "Daemon en línea sobre ${systemScanner.getOSLabel()}. Sesión activa: ${acc.username.uppercase()} (${acc.role})."
+            "NÚCLEO OTA v12.0",
+            "Daemon activo sobre ${systemScanner.getOSLabel()}. Cuenta actual: ${acc.username.uppercase()}."
         )
     }
 
@@ -1659,9 +1912,6 @@ class DaemonBrain(
         }
     }
 
-    // ========================================================================
-    // PROCESADOR CENTRAL (CUENTAS, ADMIN, MODOS POR USUARIO, SPOTIFY Y CHAT)
-    // ========================================================================
     fun processThought(rawInput: String): String {
         val input = rawInput.trim()
         if (input.isBlank()) return "Sin señal de entrada."
@@ -1672,72 +1922,32 @@ class DaemonBrain(
             normalized = normalized.replace(Regex("""^(?:oye\s+|hola\s+)?$w\b\s*"""), "").trim()
         }
 
-        // --------------------------------------------------------------------
-        // A) GESTIÓN DE CUENTAS Y SESIONES EN LA NUBE
-        // --------------------------------------------------------------------
-        // Ej: "iniciar sesion como cristian clave admin2026"
-        val loginRegex = Regex("""^(?:iniciar\s+sesion|inicia\s+sesion|login|cambiar\s+a\s+usuario|entrar\s+como)\s+(?:como\s+)?([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
+        // 1. INICIAR SESIÓN / REGISTRAR / CERRAR SESIÓN POR COMANDO
+        val loginRegex = Regex("""^(?:iniciar\s+sesion|inicia\s+sesion|login|entrar\s+como)\s+(?:como\s+)?([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
         loginRegex.find(input)?.let { m ->
-            val reply = cloudVault.loginOrSwitchUser(m.groupValues[1], m.groupValues[2])
-            starkHud?.refreshAccountBadges()
-            return reply
+            val res = cloudVault.loginUser(m.groupValues[1], m.groupValues[2])
+            return res.second
         }
 
-        // Ej: "registrar usuario mich clave 1234"
-        val registerRegex = Regex("""^(?:registrar\s+usuario|crear\s+cuenta|nuevo\s+usuario|registra\s+a)\s+([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
+        val registerRegex = Regex("""^(?:registrar\s+usuario|crear\s+cuenta|nuevo\s+usuario)\s+([a-zA-Z0-9_]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
         registerRegex.find(input)?.let { m ->
-            val reply = cloudVault.registerNewUser(m.groupValues[1], m.groupValues[2])
-            starkHud?.refreshAccountBadges()
-            return reply
+            val res = cloudVault.registerNewUser(m.groupValues[1], m.groupValues[2])
+            return res.second
         }
 
-        if (normalized in setOf("quien soy", "que cuenta esta activa", "mi cuenta", "estado de mi cuenta")) {
-            val acc = cloudVault.getCurrentAccount()
-            return "Estás conectado con la cuenta '${acc.username.uppercase()}' (Rol: ${acc.role}). Tienes ${acc.personalFacts.size} recuerdos personales y ${acc.personalKnowledge.size} conocimientos propios sincronizados en la nube (${cloudVault.cloudSyncStatus})."
+        if (normalized in setOf("cerrar sesion", "cierra sesion", "salir de mi cuenta", "logout")) {
+            return cloudVault.logoutToGuest()
         }
 
-        if (normalized.contains("sincronizar nube") || normalized.contains("sincroniza ahora") || normalized == "sync") {
-            val ok = cloudVault.pullFromCloudNow()
-            cloudVault.pushToCloudAsync()
-            return if (ok) "Sincronización con la nube completada exitosamente."
-            else "Memoria guardada en caché local. Configura la URL de tu nube desde el botón [👑 ADMIN] para sincronizar entre dispositivos."
+        if (normalized in setOf("buscar actualizaciones", "actualiza daemon", "sincronizar nube", "sync")) {
+            return cloudVault.checkForUpdatesAndSyncNow(silent = false)
         }
 
-        // --------------------------------------------------------------------
-        // B) COMANDOS EXCLUSIVOS DE LA CUENTA DE ADMINISTRADOR (CRISTIAN)
-        // --------------------------------------------------------------------
-        if (input.lowercase().startsWith("admin global:") || input.lowercase().startsWith("admin entrena:")) {
-            val body = input.substringAfter(":")
-            if (body.contains("=")) {
-                val patterns = body.substringBefore("=").split("/").map { it.trim() }.filter { it.isNotBlank() }
-                val response = body.substringAfter("=").trim()
-                val tag = "global_" + (System.currentTimeMillis() % 100000)
-                return cloudVault.adminAddGlobalKnowledge(tag, patterns, response)
-            }
+        if (normalized in setOf("publicar actualizacion", "subir update", "admin publicar update")) {
+            return cloudVault.adminPublishOtaUpdateToAllDevices()
         }
 
-        if (normalized.startsWith("admin lista de usuarios") || normalized == "admin usuarios") {
-            return cloudVault.adminListUsers()
-        }
-
-        if (normalized.startsWith("admin elimina usuario ")) {
-            val target = normalized.removePrefix("admin elimina usuario ").trim()
-            return cloudVault.adminDeleteUser(target)
-        }
-
-        if (normalized.startsWith("admin haz administrador a ")) {
-            val target = normalized.removePrefix("admin haz administrador a ").trim()
-            return cloudVault.adminSetUserRole(target, "ADMIN")
-        }
-
-        if (input.lowercase().startsWith("admin nube ") || input.lowercase().startsWith("conecta nube ")) {
-            val url = input.substringAfter("nube ").trim()
-            return cloudVault.adminSetCloudDatabaseUrl(url)
-        }
-
-        // --------------------------------------------------------------------
-        // C) APRENDIZAJE PERSONAL EN LA NUBE (LIGADO A LA CUENTA ACTIVA)
-        // --------------------------------------------------------------------
+        // 2. APRENDIZAJE PERSONAL EN LA NUBE (LIGADO A LA CUENTA ACTIVA)
         if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ") || normalized.startsWith("memoriza que ")) {
             val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
             return recordAndReturn(input, cloudVault.addPersonalFactToCurrentUser(fact))
@@ -1753,9 +1963,7 @@ class DaemonBrain(
             }
         }
 
-        // --------------------------------------------------------------------
-        // D) MODOS DE TRABAJO DEL USUARIO ACTIVO
-        // --------------------------------------------------------------------
+        // 3. MODOS DE TRABAJO DEL USUARIO ACTIVO
         val currentAcc = cloudVault.getCurrentAccount()
         val activeModes = if (currentAcc.personalModes.isNotEmpty()) currentAcc.personalModes else cloudVault.buildDefaultModesForUser(currentAcc.username)
 
@@ -1776,9 +1984,7 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.createCustomModeForCurrentUser(modeName, apps))
         }
 
-        // --------------------------------------------------------------------
-        // E) CONTROL DE VENTANAS, OPERA GX, VIDEO Y SPOTIFY
-        // --------------------------------------------------------------------
+        // 4. CONTROL DE VENTANAS, OPERA GX, VIDEO Y SPOTIFY
         if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
             starkHud?.setOrbMode(false)
             return recordAndReturn(input, "Desplegando el panel completo.")
@@ -1890,16 +2096,12 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.closeAppByName(normalized))
         }
 
-        // --------------------------------------------------------------------
-        // F) BASE DE CONOCIMIENTO EN LA NUBE (PERSONAL DEL USUARIO + GLOBAL ADMIN)
-        // --------------------------------------------------------------------
+        // 5. BASE DE CONOCIMIENTO EN LA NUBE (PERSONAL + GLOBAL DEL ADMIN)
         cloudVault.findKnowledgeMatch(normalized)?.let { exactNodeReply ->
             return recordAndReturn(input, exactNodeReply)
         }
 
-        // --------------------------------------------------------------------
-        // G) CÓRTEX CONVERSACIONAL CON LA MEMORIA EN LA NUBE DEL USUARIO ACTIVO
-        // --------------------------------------------------------------------
+        // 6. CÓRTEX CONVERSACIONAL CON LA MEMORIA EN LA NUBE DEL USUARIO ACTIVO
         if (isOllamaOnline) {
             generateOllamaConversationalResponse(input)?.let { reply ->
                 return recordAndReturn(input, reply)
@@ -1917,12 +2119,12 @@ class DaemonBrain(
         val acc = cloudVault.getCurrentAccount()
         val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
         val factsContext = if (acc.personalFacts.isEmpty()) "" else "Memoria en la nube de ${acc.username}:\n" + acc.personalFacts.joinToString("\n") { "- $it" }
-        val globalContext = if (cloudVault.vault.globalKnowledge.isEmpty()) "" else "Base de conocimiento global del Administrador:\n" +
+        val globalContext = if (cloudVault.vault.globalKnowledge.isEmpty()) "" else "Base de conocimiento global:\n" +
             cloudVault.vault.globalKnowledge.take(15).joinToString("\n") { "- ${it.tag}: ${it.responses.firstOrNull() ?: ""}" }
 
         return """
-            Eres Daemon (v11.0), un asistente de inteligencia artificial estilo J.A.R.V.I.S. con memoria en la nube multi-dispositivo, creado y administrado por Cristian Alexis.
-            Actualmente estás atendiendo a la cuenta: ${acc.username.uppercase()} (Rol: ${acc.role}) en un dispositivo ${systemScanner.getOSLabel()}.
+            Eres Daemon (v12.0), un asistente de inteligencia artificial estilo J.A.R.V.I.S. con auto-actualización OTA y memoria en la nube, creado por Cristian Alexis.
+            Estás atendiendo a la cuenta: ${acc.username.uppercase()} (Rol: ${acc.role}) en un dispositivo ${systemScanner.getOSLabel()}.
             Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
             $factsContext
             $globalContext
@@ -1999,7 +2201,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkCloud/11.0")
+                .header("User-Agent", "DaemonStarkOTA/12.0")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -2039,7 +2241,6 @@ class DaemonBrain(
         return llmReply.replace(actionRegex, "").trim()
     }
 
-    // Guarda la conversación en la cuenta del usuario activo y la sincroniza en la nube
     private fun recordAndReturn(userPrompt: String, daemonReply: String): String {
         val acc = cloudVault.getCurrentAccount()
         synchronized(acc.recentHistory) {
@@ -2062,7 +2263,7 @@ class DaemonBrain(
                 uiState = "SPEAKING"
                 val cleanSpeech = reply
                     .replace(Regex("```[\\s\\S]*?```"), "He proyectado el código en pantalla.")
-                    .replace(Regex("[#*`_~>\\-•👑⛔☁👤]"), "")
+                    .replace(Regex("[#*`_~>\\-•👑⛔☁👤🚀✓⬇]"), "")
                     .replace("\n", ". ")
                     .trim()
 
@@ -2111,7 +2312,7 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 4. INTERFAZ HOLOGRÁFICA CON SELECTOR DE CUENTA EN LA NUBE Y CONSOLA ADMIN
+// 4. INTERFAZ PRINCIPAL + VENTANAS HOLOGRÁFICAS ANIMADAS (CUENTAS Y ADMIN)
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
@@ -2124,17 +2325,24 @@ class StarkHologramHUD(
     private var wasDragged = false
 
     private var isMiniOrbMode = true
-    private val fullWidth = 700
-    private val fullHeight = 530
+    private val fullWidth = 710
+    private val fullHeight = 535
     private val orbSize = 104
 
-    private val bgSpaceDark = Color(4, 10, 20)
+    val bgSpaceDark = Color(4, 10, 20)
+    val neonCyan = Color(0, 242, 255)
+    val starkGold = Color(255, 195, 0)
+    val neonEmerald = Color(16, 235, 160)
+    val neonCrimson = Color(255, 70, 95)
+
     private val statusLabel = JLabel("ONLINE // CLIC DERECHO PARA EXPANDIR")
-    private val accountBadgeLabel = JLabel("")
     private val outputArea = JTextArea()
     private val inputField = JTextField()
     private val hudCanvas = HolographicChassisPanel()
     private val fullHudContent = JPanel(BorderLayout(12, 8))
+
+    // El botón ADMIN permanece OCULTO para todos los usuarios excepto cuando Cristian inicia sesión
+    private lateinit var adminHoloBtn: JComponent
 
     init {
         isUndecorated = true
@@ -2156,21 +2364,19 @@ class StarkHologramHUD(
         hudCanvas.isOpaque = true
         hudCanvas.background = bgSpaceDark
 
-        refreshAccountBadges()
-
-        // 1. CABECERA CON BOTÓN DE CUENTA EN LA NUBE Y CONSOLA DE ADMINISTRADOR
+        // 1. CABECERA POLIGONAL CON VISIBILIDAD ESTRICTA DE ADMIN
         val headerBar = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = EmptyBorder(2, 6, 6, 6)
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON CLOUD v11.0").apply {
-                    foreground = Color(0, 242, 255)
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON OTA v12.0").apply {
+                    foreground = neonCyan
                     font = Font("Monospaced", Font.BOLD, 13)
                 }
                 statusLabel.apply {
-                    foreground = Color(255, 195, 0)
+                    foreground = starkGold
                     font = Font("Monospaced", Font.BOLD, 10)
                 }
                 add(mainTitle)
@@ -2179,18 +2385,30 @@ class StarkHologramHUD(
 
             val rightControls = JPanel(FlowLayout(FlowLayout.RIGHT, 5, 0)).apply {
                 isOpaque = false
-                val accountBtn = createHoloButton("👤 CUENTA", Color(16, 235, 160), 82) { openAccountSwitcherDialog() }
-                val adminBtn = createHoloButton("👑 ADMIN", Color(255, 185, 0), 78) { openAdminConsoleDialog() }
-                val orbBtn = createHoloButton("◉ NÚCLEO", Color(0, 225, 255), 82) { setOrbMode(true) }
-                val closeBtn = createHoloButton("✕", Color(255, 70, 90), 28) { System.exit(0) }
+                val accountBtn = createHoloButton("👤 CUENTA", neonEmerald, 86) { openAnimatedAccountHoloModal() }
+                adminHoloBtn = createHoloButton("👑 ADMIN", starkGold, 82) { openAnimatedAdminHoloModal() }
+                val orbBtn = createHoloButton("◉ NÚCLEO", neonCyan, 82) { setOrbMode(true) }
+                val closeBtn = createHoloButton("✕", neonCrimson, 28) { System.exit(0) }
+
+                // Solo visible si la sesión verificada en esta PC es "cristian"
+                adminHoloBtn.isVisible = cloudVault.isAdminLoggedIn()
+
                 add(accountBtn)
-                add(adminBtn)
+                add(adminHoloBtn)
                 add(orbBtn)
                 add(closeBtn)
             }
 
             add(leftTitle, BorderLayout.WEST)
             add(rightControls, BorderLayout.EAST)
+        }
+
+        cloudVault.onSessionOrVaultChanged = {
+            SwingUtilities.invokeLater {
+                adminHoloBtn.isVisible = cloudVault.isAdminLoggedIn()
+                headerBar.revalidate()
+                hudCanvas.repaint()
+            }
         }
 
         // 2. ALAS LATERALES DEL PANEL COMPLETO
@@ -2203,14 +2421,14 @@ class StarkHologramHUD(
                 border = EmptyBorder(12, 2, 12, 2)
 
                 val lbl = JLabel("◢ MODOS DE CUENTA").apply {
-                    foreground = Color(0, 230, 255)
+                    foreground = neonCyan
                     font = Font("Monospaced", Font.BOLD, 11)
                 }
                 add(lbl)
-                add(createHoloButton("⚡ MODO TRABAJO", Color(0, 235, 255), 145) { runQuickCommand("vamos a trabajar") })
-                add(createHoloButton("📝 MODO TAREA", Color(16, 235, 160), 145) { runQuickCommand("vamos a hacer tarea") })
+                add(createHoloButton("⚡ MODO TRABAJO", neonCyan, 145) { runQuickCommand("vamos a trabajar") })
+                add(createHoloButton("📝 MODO TAREA", neonEmerald, 145) { runQuickCommand("vamos a hacer tarea") })
                 add(createHoloButton("📘 MODO ESTUDIO", Color(120, 180, 255), 145) { runQuickCommand("vamos a estudiar") })
-                add(createHoloButton("🎮 MODO GAMING", Color(255, 185, 0), 145) { runQuickCommand("vamos a jugar") })
+                add(createHoloButton("🎮 MODO GAMING", starkGold, 145) { runQuickCommand("vamos a jugar") })
             }
 
             val rightWing = JPanel(GridLayout(5, 1, 0, 7)).apply {
@@ -2218,16 +2436,16 @@ class StarkHologramHUD(
                 preferredSize = Dimension(150, 220)
                 border = EmptyBorder(12, 2, 12, 2)
 
-                val lbl = JLabel("◣ SPOTIFY & CLOUD").apply {
-                    foreground = Color(255, 195, 0)
+                val lbl = JLabel("◣ SPOTIFY & OTA").apply {
+                    foreground = starkGold
                     font = Font("Monospaced", Font.BOLD, 11)
                     horizontalAlignment = SwingConstants.RIGHT
                 }
                 add(lbl)
-                add(createHoloButton("▶ PLAY SPOTIFY", Color(16, 235, 160), 145) { runQuickCommand("dale play") })
-                add(createHoloButton("⏸ PAUSA SPOTIFY", Color(255, 185, 0), 145) { runQuickCommand("pausa") })
-                add(createHoloButton("⏭ SIGUIENTE", Color(0, 225, 255), 145) { runQuickCommand("siguiente cancion") })
-                add(createHoloButton("☁ SYNC AHORA", Color(160, 140, 255), 145) { runQuickCommand("sincronizar nube") })
+                add(createHoloButton("▶ PLAY SPOTIFY", neonEmerald, 145) { runQuickCommand("dale play") })
+                add(createHoloButton("⏸ PAUSA SPOTIFY", starkGold, 145) { runQuickCommand("pausa") })
+                add(createHoloButton("⏭ SIGUIENTE", neonCyan, 145) { runQuickCommand("siguiente cancion") })
+                add(createHoloButton("🔄 BUSCAR UPDATE", Color(160, 140, 255), 145) { runQuickCommand("buscar actualizaciones") })
             }
 
             add(leftWing, BorderLayout.WEST)
@@ -2270,15 +2488,15 @@ class StarkHologramHUD(
             val commandRow = JPanel(BorderLayout(8, 0)).apply {
                 isOpaque = false
 
-                val micBtn = createHoloButton("🎤 HABLAR", Color(16, 235, 160), 90) {
+                val micBtn = createHoloButton("🎤 HABLAR", neonEmerald, 90) {
                     brain.activateDirectVoiceListenWindow()
                 }
 
                 inputField.apply {
                     isOpaque = true
                     background = Color(8, 20, 38)
-                    foreground = Color(0, 245, 255)
-                    caretColor = Color(255, 195, 0)
+                    foreground = neonCyan
+                    caretColor = starkGold
                     font = Font("Monospaced", Font.PLAIN, 13)
                     border = BorderFactory.createCompoundBorder(
                         BorderFactory.createLineBorder(Color(0, 200, 240), 1),
@@ -2287,7 +2505,7 @@ class StarkHologramHUD(
                     addActionListener { submitCommand() }
                 }
 
-                val sendBtn = createHoloButton("⚡ EJECUTAR", Color(0, 225, 255), 104) {
+                val sendBtn = createHoloButton("⚡ EJECUTAR", neonCyan, 104) {
                     submitCommand()
                 }
 
@@ -2323,7 +2541,7 @@ class StarkHologramHUD(
                 if (SwingUtilities.isRightMouseButton(e) || e.clickCount == 2) {
                     setOrbMode(!isMiniOrbMode)
                 } else if (SwingUtilities.isLeftMouseButton(e)) {
-                    if (isMiniOrbMode || (e.y in 90..310 && e.x in 190..510)) {
+                    if (isMiniOrbMode || (e.y in 90..310 && e.x in 190..520)) {
                         brain.activateDirectVoiceListenWindow()
                     }
                 }
@@ -2350,98 +2568,354 @@ class StarkHologramHUD(
             if (isMiniOrbMode) {
                 hudCanvas.repaint()
             } else {
-                hudCanvas.repaint(180, 62, 340, 275)
+                hudCanvas.repaint(180, 62, 350, 275)
             }
         }.start()
     }
 
-    fun refreshAccountBadges() {
-        val acc = cloudVault.getCurrentAccount()
-        val roleIcon = if (acc.role == "ADMIN") "👑 ADMIN" else "👤 USER"
-        accountBadgeLabel.text = "${acc.username.uppercase()} [$roleIcon]"
-        hudCanvas.repaint()
-    }
-
-    // Ventana rápida para Iniciar Sesión, Cambiar de Cuenta o Registrar Nuevo Usuario en la Nube
-    private fun openAccountSwitcherDialog() {
-        val acc = cloudVault.getCurrentAccount()
-        val options = arrayOf("Iniciar Sesión / Cambiar Cuenta", "Registrar Nueva Cuenta", "Cancelar")
-        val choice = JOptionPane.showOptionDialog(
-            this,
-            "Cuenta activa en este dispositivo: ${acc.username.uppercase()} (${acc.role})\nEstado de Nube: ${cloudVault.cloudSyncStatus}\nRecuerdos sincronizados: ${acc.personalFacts.size}",
-            "DAEMON CLOUD // CUENTA DE USUARIO",
-            JOptionPane.DEFAULT_OPTION,
-            JOptionPane.INFORMATION_MESSAGE,
-            null,
-            options,
-            options[0]
+    // ========================================================================
+    // VENTANA HOLOGRÁFICA ANIMADA 1: PORTAL DE CUENTAS E IDENTIDAD STARK
+    // ========================================================================
+    private fun openAnimatedAccountHoloModal() {
+        val modal = StarkAnimatedHoloModal(
+            parent = this,
+            title = "◢ STARK IDENTITY // PORTAL DE CUENTAS CLOUD",
+            subtitle = "AUTENTICACIÓN BIOMÉTRICA Y SINCRONIZACIÓN MULTI-DISPOSITIVO",
+            accentColor = neonCyan,
+            widthPx = 500,
+            heightPx = 410
         )
 
-        if (choice == 0) {
-            val user = JOptionPane.showInputDialog(this, "Nombre de usuario:", acc.username) ?: return
-            val pass = JOptionPane.showInputDialog(this, "Contraseña / PIN para '$user':") ?: return
-            val msg = cloudVault.loginOrSwitchUser(user, pass)
-            refreshAccountBadges()
-            brain.speakAndDisplay("CAMBIO DE CUENTA", msg)
-        } else if (choice == 1) {
-            val user = JOptionPane.showInputDialog(this, "Nuevo nombre de usuario:") ?: return
-            val pass = JOptionPane.showInputDialog(this, " Define una contraseña / PIN:") ?: return
-            val msg = cloudVault.registerNewUser(user, pass)
-            refreshAccountBadges()
-            brain.speakAndDisplay("NUEVA CUENTA", msg)
+        val currentAcc = cloudVault.getCurrentAccount()
+        val body = JPanel(GridLayout(6, 1, 0, 8)).apply {
+            isOpaque = false
+            border = EmptyBorder(8, 18, 8, 18)
         }
-    }
 
-    // Consola exclusiva para la Cuenta de Administrador de Cristian
-    private fun openAdminConsoleDialog() {
-        if (!cloudVault.isAdminLoggedIn()) {
-            val pass = JOptionPane.showInputDialog(this, "🔒 Ingresa la clave de Administrador Maestro (cristian):") ?: return
-            val loginRes = cloudVault.loginOrSwitchUser("cristian", pass)
-            refreshAccountBadges()
-            if (!cloudVault.isAdminLoggedIn()) {
-                brain.speakAndDisplay("ADMIN", loginRes)
-                return
+        val badgePanel = JPanel(GridLayout(2, 1)).apply {
+            isOpaque = true
+            background = Color(7, 19, 36)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(neonEmerald, 1),
+                EmptyBorder(6, 12, 6, 12)
+            )
+            val l1 = JLabel("SESIÓN ACTIVA: ${currentAcc.username.uppercase()} [${currentAcc.role}]").apply {
+                foreground = neonEmerald
+                font = Font("Monospaced", Font.BOLD, 12)
             }
+            val l2 = JLabel("RECUERDOS EN LA NUBE: ${currentAcc.personalFacts.size}  |  ESTADO: ${cloudVault.cloudSyncStatus}").apply {
+                foreground = Color(180, 235, 255)
+                font = Font("Monospaced", Font.PLAIN, 10)
+            }
+            add(l1)
+            add(l2)
         }
 
-        val options = arrayOf(
-            "1. Conectar URL de Base de Datos Cloud",
-            "2. Agregar Conocimiento Global (Todos los Usuarios)",
-            "3. Ver Lista de Usuarios en la Nube",
-            "4. Cerrar"
-        )
-        val sel = JOptionPane.showOptionDialog(
-            this,
-            "👑 CONSOLA MAESTRA DE ADMINISTRADOR (CRISTIAN)\nURL Cloud actual: ${cloudVault.deviceConfig.cloudDatabaseUrl.ifBlank { "Modo Caché Local (Sin URL externa)" }}\nNodos Globales: ${cloudVault.vault.globalKnowledge.size} | Cuentas Registradas: ${cloudVault.vault.accounts.size}",
-            "👑 DAEMON // ADMIN CORE",
-            JOptionPane.DEFAULT_OPTION,
-            JOptionPane.WARNING_MESSAGE,
-            null,
-            options,
-            options[0]
+        val userField = createStarkTextField(if (currentAcc.username == "invitado") "" else currentAcc.username)
+        val passField = createStarkPasswordField()
+
+        val feedbackLabel = JLabel("Ingresa tus credenciales para sincronizar tu cuenta o regístrate.").apply {
+            foreground = starkGold
+            font = Font("Monospaced", Font.BOLD, 11)
+        }
+
+        val actionsRow = JPanel(FlowLayout(FlowLayout.CENTER, 10, 2)).apply {
+            isOpaque = false
+            val loginBtn = createHoloButton("⚡ INICIAR SESIÓN", neonCyan, 142) {
+                val u = userField.text.trim()
+                val p = String(passField.password)
+                val (ok, msg) = cloudVault.loginUser(u, p)
+                feedbackLabel.foreground = if (ok) neonEmerald else neonCrimson
+                feedbackLabel.text = msg.take(64)
+                brain.speakAndDisplay("CUENTA CLOUD", msg)
+                if (ok) {
+                    adminHoloBtn.isVisible = cloudVault.isAdminLoggedIn()
+                    modal.dispose()
+                }
+            }
+            val regBtn = createHoloButton("✨ CREAR CUENTA", neonEmerald, 138) {
+                val u = userField.text.trim()
+                val p = String(passField.password)
+                val (ok, msg) = cloudVault.registerNewUser(u, p)
+                feedbackLabel.foreground = if (ok) neonEmerald else neonCrimson
+                feedbackLabel.text = msg.take(64)
+                brain.speakAndDisplay("NUEVA CUENTA", msg)
+                if (ok) modal.dispose()
+            }
+            val logoutBtn = createHoloButton("🚪 SALIR", neonCrimson, 86) {
+                val msg = cloudVault.logoutToGuest()
+                adminHoloBtn.isVisible = false
+                brain.speakAndDisplay("SESIÓN CERRADA", msg)
+                modal.dispose()
+            }
+            add(loginBtn)
+            add(regBtn)
+            add(logoutBtn)
+        }
+
+        body.add(badgePanel)
+        body.add(createLabeledInputBox("IDENTIFICADOR DE USUARIO (EJ: CRISTIAN / USUARIO):", userField, neonCyan))
+        body.add(createLabeledInputBox("CLAVE CRIPTOGRÁFICA DE ACCESO (SHA-256):", passField, neonCyan))
+        body.add(feedbackLabel)
+        body.add(actionsRow)
+
+        modal.setBodyContent(body)
+        modal.isVisible = true
+    }
+
+    // ========================================================================
+    // VENTANA HOLOGRÁFICA ANIMADA 2: CENTRO DE MANDO ADMIN (EXCLUSIVO CRISTIAN)
+    // ========================================================================
+    private fun openAnimatedAdminHoloModal() {
+        if (!cloudVault.isAdminLoggedIn()) {
+            brain.speakAndDisplay("SEGURIDAD", "Acceso restringido. Inicia sesión como Administrador primero.")
+            return
+        }
+
+        val modal = StarkAnimatedHoloModal(
+            parent = this,
+            title = "👑 STARK COMMAND CENTER // ADMINISTRADOR MAESTRO",
+            subtitle = "CONTROL GLOBAL DE CONOCIMIENTO Y DESPLIEGUE OTA (v${cloudVault.otaManifest.versionName})",
+            accentColor = starkGold,
+            widthPx = 610,
+            heightPx = 490
         )
 
-        when (sel) {
-            0 -> {
-                val url = JOptionPane.showInputDialog(
-                    this,
-                    "Pega la URL de tu Firebase Realtime Database o Servidor Daemon Cloud\n(Ej: https://tu-daemon-default-rtdb.firebaseio.com):",
-                    cloudVault.deviceConfig.cloudDatabaseUrl
-                ) ?: return
-                val msg = cloudVault.adminSetCloudDatabaseUrl(url)
+        val container = JPanel(BorderLayout(10, 10)).apply {
+            isOpaque = false
+            border = EmptyBorder(6, 18, 10, 18)
+        }
+
+        // Panel Superior: Inyección de Conocimiento Global + Configuración OTA
+        val formsGrid = JPanel(GridLayout(4, 1, 0, 7)).apply {
+            isOpaque = false
+        }
+
+        val patternsField = createStarkTextField("que es daemon / quien creo a daemon")
+        val responseField = createStarkTextField("Daemon es un sistema operativo de IA creado por Cristian Alexis.")
+        val cloudUrlField = createStarkTextField(cloudVault.otaManifest.sharedCloudDbUrl)
+        val repoRawField = createStarkTextField(cloudVault.otaManifest.githubRawBaseUrl)
+
+        formsGrid.add(createLabeledInputBox("1. PATRONES GLOBALES (SEPARADOS POR '/'):", patternsField, starkGold))
+        formsGrid.add(createLabeledInputBox("2. RESPUESTA OFICIAL PARA TODOS LOS USUARIOS:", responseField, starkGold))
+        formsGrid.add(createLabeledInputBox("3. URL FIREBASE / CLOUD DB COMPARTIDA (OPCIONAL):", cloudUrlField, neonCyan))
+        formsGrid.add(createLabeledInputBox("4. REPOSITORIO OTA RAW (AUTO-DETECTADO DE TU GITHUB):", repoRawField, neonCyan))
+
+        // Monitor en vivo de cuentas registradas y nodos globales
+        val telemetryArea = JTextArea().apply {
+            isOpaque = true
+            background = Color(6, 15, 28)
+            foreground = neonEmerald
+            font = Font("Monospaced", Font.PLAIN, 11)
+            isEditable = false
+            border = EmptyBorder(6, 10, 6, 10)
+            rows = 4
+            val usersList = cloudVault.vault.accounts.joinToString(" | ") { "${it.username.uppercase()}(${it.role})" }
+            text = "NODOS GLOBALES ACTIVOS: ${cloudVault.vault.globalKnowledge.size}  |  VERSIÓN OTA: v${cloudVault.otaManifest.versionName}\nCUENTAS EN LA BÓVEDA: $usersList"
+        }
+
+        // Botonera de Acciones Maestras del Administrador
+        val adminBtns = JPanel(FlowLayout(FlowLayout.CENTER, 8, 4)).apply {
+            isOpaque = false
+
+            val addKnowBtn = createHoloButton("🧠 INYECTAR NODO GLOBAL", neonEmerald, 178) {
+                val pats = patternsField.text.split("/").map { it.trim() }.filter { it.isNotBlank() }
+                val resp = responseField.text.trim()
+                if (pats.isNotEmpty() && resp.isNotBlank()) {
+                    val tag = "global_" + (System.currentTimeMillis() % 100000)
+                    val msg = cloudVault.adminAddGlobalKnowledge(tag, pats, resp)
+                    telemetryArea.text = "$msg\nTotal de nodos globales: ${cloudVault.vault.globalKnowledge.size}"
+                    brain.speakAndDisplay("ADMIN GLOBAL", msg)
+                }
+            }
+
+            val saveLinksBtn = createHoloButton("☁ GUARDAR LINKS CLOUD", neonCyan, 172) {
+                val msg = cloudVault.adminConfigureCloudAndRepo(cloudUrlField.text, repoRawField.text)
+                telemetryArea.text = msg
                 brain.speakAndDisplay("ADMIN CLOUD", msg)
             }
-            1 -> {
-                val patternsRaw = JOptionPane.showInputDialog(this, "Escribe las formas de preguntarlo separadas por '/' (Ej: que es escom / donde estudia cristian):") ?: return
-                val answer = JOptionPane.showInputDialog(this, "Escribe la respuesta oficial que aprenderán todos los dispositivos:") ?: return
-                val tag = "global_" + (System.currentTimeMillis() % 100000)
-                val msg = cloudVault.adminAddGlobalKnowledge(tag, patternsRaw.split("/").map { it.trim() }, answer)
-                brain.speakAndDisplay("ADMIN GLOBAL", msg)
+
+            val publishOtaBtn = createHoloButton("🚀 PUBLICAR UPDATE OTA A TODOS", starkGold, 215) {
+                cloudVault.adminConfigureCloudAndRepo(cloudUrlField.text, repoRawField.text)
+                val msg = cloudVault.adminPublishOtaUpdateToAllDevices()
+                telemetryArea.text = msg
+                brain.speakAndDisplay("DESPLIEGUE OTA", msg)
             }
-            2 -> {
-                val report = cloudVault.adminListUsers()
-                updateHologram("ADMIN USUARIOS", report)
+
+            add(addKnowBtn)
+            add(saveLinksBtn)
+            add(publishOtaBtn)
+        }
+
+        container.add(formsGrid, BorderLayout.NORTH)
+        container.add(JScrollPane(telemetryArea).apply {
+            border = BorderFactory.createLineBorder(starkGold, 1)
+        }, BorderLayout.CENTER)
+        container.add(adminBtns, BorderLayout.SOUTH)
+
+        modal.setBodyContent(container)
+        modal.isVisible = true
+    }
+
+    private fun createLabeledInputBox(labelTitle: String, field: JComponent, accent: Color): JPanel {
+        return JPanel(BorderLayout(0, 2)).apply {
+            isOpaque = false
+            val lbl = JLabel(labelTitle).apply {
+                foreground = accent
+                font = Font("Monospaced", Font.BOLD, 10)
             }
+            add(lbl, BorderLayout.NORTH)
+            add(field, BorderLayout.CENTER)
+        }
+    }
+
+    private fun createStarkTextField(initialText: String = ""): JTextField {
+        return JTextField(initialText).apply {
+            isOpaque = true
+            background = Color(8, 20, 38)
+            foreground = neonCyan
+            caretColor = starkGold
+            font = Font("Monospaced", Font.PLAIN, 12)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color(0, 195, 240), 1),
+                EmptyBorder(5, 8, 5, 8)
+            )
+        }
+    }
+
+    private fun createStarkPasswordField(): JPasswordField {
+        return JPasswordField().apply {
+            isOpaque = true
+            background = Color(8, 20, 38)
+            foreground = starkGold
+            caretColor = neonCyan
+            font = Font("Monospaced", Font.BOLD, 13)
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(Color(0, 195, 240), 1),
+                EmptyBorder(5, 8, 5, 8)
+            )
+        }
+    }
+
+    // ========================================================================
+    // MOTOR DE SUB-VENTANAS HOLOGRÁFICAS CON ESCÁNER LÁSER Y ANILLOS ANIMADOS
+    // ========================================================================
+    inner class StarkAnimatedHoloModal(
+        parent: JFrame,
+        private val title: String,
+        private val subtitle: String,
+        private val accentColor: Color,
+        widthPx: Int,
+        heightPx: Int
+    ) : JDialog(parent, false) {
+
+        private var dragPt = Point(0, 0)
+        private var animTick = 0.0
+        private val rootCanvas = object : JPanel(BorderLayout()) {
+            override fun paintComponent(g: Graphics) {
+                super.paintComponent(g)
+                val g2 = g as Graphics2D
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+
+                val w = width
+                val h = height
+                val cut = 22
+
+                // Rejilla táctica sutil
+                g2.color = Color(0, 40, 65)
+                var gx = 24
+                while (gx < w - 24) { g2.drawLine(gx, 16, gx, h - 16); gx += 32 }
+                var gy = 16
+                while (gy < h - 16) { g2.drawLine(24, gy, w - 24, gy); gy += 32 }
+
+                // Línea de escaneo láser animada que recorre el holograma
+                val scanY = ((sin(animTick) + 1.0) * 0.5 * (h - 30) + 15).toInt()
+                g2.color = Color(accentColor.red / 4, accentColor.green / 4, accentColor.blue / 4)
+                g2.drawLine(10, scanY, w - 10, scanY)
+
+                // Anillo de telemetría giratorio en la esquina superior derecha
+                val rx = w - 75
+                val ry = 14
+                g2.color = accentColor
+                g2.stroke = BasicStroke(1.5f)
+                val a1 = (animTick * 45).toInt()
+                g2.drawArc(rx, ry, 26, 26, a1, 110)
+                g2.drawArc(rx, ry, 26, 26, a1 + 180, 110)
+
+                // Borde exterior y esquinas biseladas Stark
+                g2.color = Color(accentColor.red / 2, accentColor.green / 2, accentColor.blue / 2)
+                g2.stroke = BasicStroke(1.4f)
+                g2.drawRect(2, 2, w - 5, h - 5)
+
+                g2.color = accentColor
+                g2.stroke = BasicStroke(2.6f)
+                g2.drawLine(2, 2, 2 + cut, 2)
+                g2.drawLine(2, 2, 2, 2 + cut)
+                g2.drawLine(w - 3 - cut, 2, w - 3, 2)
+                g2.drawLine(w - 3, 2, w - 3, 2 + cut)
+                g2.drawLine(2, h - 3 - cut, 2, h - 3)
+                g2.drawLine(2, h - 3, 2 + cut, h - 3)
+                g2.drawLine(w - 3 - cut, h - 3, w - 3, h - 3)
+                g2.drawLine(w - 3, h - 3 - cut, w - 3, h - 3)
+            }
+        }
+
+        private val animTimer = javax.swing.Timer(40) {
+            animTick += 0.08
+            rootCanvas.repaint()
+        }
+
+        init {
+            isUndecorated = true
+            isAlwaysOnTop = true
+            setSize(widthPx, heightPx)
+            setLocationRelativeTo(parent)
+            rootPane.putClientProperty("Window.shadow", false)
+
+            rootCanvas.isOpaque = true
+            rootCanvas.background = Color(4, 11, 22)
+            rootCanvas.border = EmptyBorder(14, 16, 14, 16)
+
+            val topHeader = JPanel(BorderLayout()).apply {
+                isOpaque = false
+                border = EmptyBorder(2, 8, 8, 8)
+                val titleStack = JPanel(GridLayout(2, 1)).apply {
+                    isOpaque = false
+                    add(JLabel(title).apply {
+                        foreground = accentColor
+                        font = Font("Monospaced", Font.BOLD, 13)
+                    })
+                    add(JLabel(subtitle).apply {
+                        foreground = Color(160, 225, 245)
+                        font = Font("Monospaced", Font.PLAIN, 9)
+                    })
+                }
+                val closeBtn = createHoloButton("✕", neonCrimson, 28) {
+                    animTimer.stop()
+                    dispose()
+                }
+                add(titleStack, BorderLayout.WEST)
+                add(closeBtn, BorderLayout.EAST)
+            }
+
+            rootCanvas.add(topHeader, BorderLayout.NORTH)
+            contentPane = rootCanvas
+
+            rootCanvas.addMouseListener(object : MouseAdapter() {
+                override fun mousePressed(e: MouseEvent) { dragPt = e.point }
+            })
+            rootCanvas.addMouseMotionListener(object : MouseMotionAdapter() {
+                override fun mouseDragged(e: MouseEvent) {
+                    val sc = e.locationOnScreen
+                    setLocation(sc.x - dragPt.x, sc.y - dragPt.y)
+                }
+            })
+
+            animTimer.start()
+        }
+
+        fun setBodyContent(panel: JComponent) {
+            rootCanvas.add(panel, BorderLayout.CENTER)
         }
     }
 
@@ -2502,7 +2976,7 @@ class StarkHologramHUD(
         }
     }
 
-    private fun createHoloButton(label: String, accent: Color, widthPx: Int, onClick: () -> Unit): JComponent {
+    fun createHoloButton(label: String, accent: Color, widthPx: Int, onClick: () -> Unit): JComponent {
         return object : JPanel(true) {
             private var hovered = false
             private val fillIdle = Color(7, 18, 34)
@@ -2587,10 +3061,6 @@ class StarkHologramHUD(
         private val strokePlexusOrb = BasicStroke(0.5f)
         private val telemetryFont = Font("Monospaced", Font.BOLD, 10)
 
-        private val colorGold = Color(255, 190, 0)
-        private val colorTelemetryCyan = Color(0, 235, 255)
-        private val colorSpotifyGreen = Color(16, 240, 165)
-
         init {
             val golden = (1.0 + sqrt(5.0)) / 2.0
             for (i in 0 until nodeCount) {
@@ -2606,8 +3076,8 @@ class StarkHologramHUD(
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
 
             val mainColor = when (brain.uiState) {
-                "LISTENING" -> Color(16, 245, 160)
-                "THINKING" -> Color(255, 185, 0)
+                "LISTENING" -> neonEmerald
+                "THINKING" -> starkGold
                 "SPEAKING" -> Color(0, 255, 255)
                 else -> Color(0, 215, 255)
             }
@@ -2644,7 +3114,7 @@ class StarkHologramHUD(
             g2.stroke = strokeBorder
             g2.drawRect(2, 2, width - 5, height - 5)
 
-            g2.color = colorGold
+            g2.color = starkGold
             g2.stroke = strokeCorner
             g2.drawLine(2, 2, 2 + cut, 2)
             g2.drawLine(2, 2, 2, 2 + cut)
@@ -2660,17 +3130,17 @@ class StarkHologramHUD(
             drawFloatingArcReactor(g2, cx, cy, 1.0, mainColor, dimMainColor, glowColor, pulse, false)
 
             g2.font = telemetryFont
-            g2.color = colorTelemetryCyan
+            g2.color = neonCyan
             g2.drawString("CPU:${scanner.cachedCpuLoad}% RAM:${scanner.cachedRamMb}MB", 184, 76)
-            g2.drawString(cloudVault.cloudSyncStatus, 418, 76)
+            g2.drawString(cloudVault.otaStatusText, 412, 76)
 
             val acc = cloudVault.getCurrentAccount()
-            g2.color = colorGold
-            val userBadge = "USER // ${acc.username.uppercase()} [${acc.role}]"
+            g2.color = if (acc.role == "ADMIN") starkGold else neonEmerald
+            val userBadge = "CUENTA // ${acc.username.uppercase()} [${acc.role}]"
             val fm = g2.fontMetrics
             g2.drawString(userBadge, (cx - fm.stringWidth(userBadge) / 2).toInt(), 92)
 
-            g2.color = colorSpotifyGreen
+            g2.color = neonEmerald
             val spText = "♫ SPOTIFY: ${scanner.currentSpotifyTrack}"
             g2.drawString(spText, (cx - fm.stringWidth(spText) / 2).toInt(), 328)
         }
@@ -2699,7 +3169,7 @@ class StarkHologramHUD(
             }
 
             val rGold = (92.0 * scale).toInt()
-            g2.color = colorGold
+            g2.color = starkGold
             g2.stroke = if (isOrb) strokeGoldOrb else strokeGoldFull
             val baseAngle2 = (-t * 38.0).toInt()
             for (a in 0 until 360 step 90) {
@@ -2766,9 +3236,6 @@ class StarkHologramHUD(
     }
 }
 
-// ============================================================================
-// 5. ENDPOINTS REST PARA SINCRONIZAR DISPOSITIVOS Y BÓVEDA EN LA NUBE
-// ============================================================================
 @RestController
 @RequestMapping("/api/daemon")
 @CrossOrigin(origins = ["*"])
@@ -2779,14 +3246,13 @@ class DaemonController(
     @PostMapping("/chat")
     fun chat(@RequestBody request: ChatRequest): String {
         if (request.username.isNotBlank() && request.password.isNotBlank()) {
-            cloudVault.loginOrSwitchUser(request.username, request.password)
+            cloudVault.loginUser(request.username, request.password)
         }
         val reply = brain.processThought(request.prompt)
         brain.speakAndDisplay(request.prompt, reply)
         return reply
     }
 
-    // Si alojas Daemon en un servidor (o conectas tu Mac a tu PC), este endpoint sirve de Bóveda Cloud maestra
     @GetMapping("/cloud-vault")
     fun getVault(): CloudVaultState = cloudVault.vault
 

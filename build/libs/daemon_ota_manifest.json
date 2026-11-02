@@ -1,0 +1,8 @@
+{
+  "appVersion" : 120,
+  "versionName" : "12.0.0",
+  "githubRawBaseUrl" : "",
+  "sharedCloudDbUrl" : "https://daemon-cloud-36618-default-rtdb.firebaseio.com/",
+  "jarRelativePath" : "build/libs/daemon-0.0.1-SNAPSHOT.jar",
+  "publishedAt" : 1793657141417
+}
