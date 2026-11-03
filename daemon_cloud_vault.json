@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793680024916,
+  "lastUpdated" : 1793680039659,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -116,8 +116,14 @@
     }, {
       "role" : "assistant",
       "content" : "Ampliando ventana activa de OPERA GX."
+    }, {
+      "role" : "user",
+      "content" : "vete a la pestaña de instagram"
+    }, {
+      "role" : "assistant",
+      "content" : "La pestaña de Instagram ya está abierta."
     } ],
-    "updatedAt" : 1793680024916
+    "updatedAt" : 1793680039659
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
