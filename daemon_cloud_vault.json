@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793680969591,
+  "lastUpdated" : 1793680977594,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "abre instagram en esa pestaña"
-    }, {
-      "role" : "assistant",
-      "content" : "No encontré la aplicación 'instagram en esa pestana' en este equipo."
-    }, {
-      "role" : "user",
       "content" : "abre instagram en opera gx"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "No encontré la aplicación 'chat de emiliano' en este equipo."
+    }, {
+      "role" : "user",
+      "content" : "amplia opera"
+    }, {
+      "role" : "assistant",
+      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
     } ],
-    "updatedAt" : 1793680969591
+    "updatedAt" : 1793680977594
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
