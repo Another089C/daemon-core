@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793660206363,
+  "lastUpdated" : 1793668183422,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -20,6 +20,10 @@
     "username" : "cristian",
     "passwordHash" : "6051fc84a7a0d74c225fb18a496b09952da5642e60723ecae543298edd7d82d6",
     "role" : "ADMIN",
+    "calendarProvider" : "BOTH",
+    "googleAccountEmail" : "",
+    "googleWebhookOrToken" : "",
+    "appleAccountEmail" : "",
     "personalFacts" : [ "Es Cristian Alexis, creador y Administrador Maestro de Daemon.", "Estudia Ingeniería en Sistemas Computacionales en la ESCOM del IPN." ],
     "personalKnowledge" : [ ],
     "personalModes" : [ {
@@ -55,12 +59,17 @@
       "spotifyPlaylist" : "mis me gusta",
       "greeting" : "Modo Gaming activo, Cristian. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
     } ],
+    "calendarEvents" : [ ],
     "recentHistory" : [ ],
-    "updatedAt" : 1793658424231
+    "updatedAt" : 1793667358222
   }, {
     "username" : "invitado",
     "passwordHash" : "75cee5b221098c39dc19feca49b7b7cfe46405057d0361b18726990a5f91bf25",
     "role" : "USER",
+    "calendarProvider" : "BOTH",
+    "googleAccountEmail" : "",
+    "googleWebhookOrToken" : "",
+    "appleAccountEmail" : "",
     "personalFacts" : [ "Sesión estándar de usuario en Daemon." ],
     "personalKnowledge" : [ ],
     "personalModes" : [ {
@@ -96,12 +105,17 @@
       "spotifyPlaylist" : "mis me gusta",
       "greeting" : "Modo Gaming activo, Usuario. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
     } ],
+    "calendarEvents" : [ ],
     "recentHistory" : [ ],
     "updatedAt" : 1793660445010
   }, {
     "username" : "cristianuser",
     "passwordHash" : "9162dedf2f66de62e5992c06f8e0109ab94a9a7d4907d58ff0f3f2f0c27790c3",
     "role" : "USER",
+    "calendarProvider" : "BOTH",
+    "googleAccountEmail" : "",
+    "googleWebhookOrToken" : "",
+    "appleAccountEmail" : "",
     "personalFacts" : [ "Cuenta personal en la nube de cristianuser." ],
     "personalKnowledge" : [ ],
     "personalModes" : [ {
@@ -137,6 +151,7 @@
       "spotifyPlaylist" : "mis me gusta",
       "greeting" : "Modo Gaming activo, cristianuser. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
     } ],
+    "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
       "content" : "dale play"
@@ -179,6 +194,10 @@
     "username" : "prueba1",
     "passwordHash" : "ef994e7262a78b97c039adf58214ee7df1076824a7e47538948ba61ae02b05c7",
     "role" : "USER",
+    "calendarProvider" : "BOTH",
+    "googleAccountEmail" : "",
+    "googleWebhookOrToken" : "",
+    "appleAccountEmail" : "",
     "personalFacts" : [ "Cuenta personal en la nube de prueba1." ],
     "personalKnowledge" : [ ],
     "personalModes" : [ {
@@ -214,7 +233,14 @@
       "spotifyPlaylist" : "mis me gusta",
       "greeting" : "Modo Gaming activo, prueba1. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
     } ],
-    "recentHistory" : [ ],
-    "updatedAt" : 1793661024908
+    "calendarEvents" : [ ],
+    "recentHistory" : [ {
+      "role" : "user",
+      "content" : "abre opera"
+    }, {
+      "role" : "assistant",
+      "content" : "Ampliando ventana activa de OPERA GX."
+    } ],
+    "updatedAt" : 1793668183422
   } ]
 }
