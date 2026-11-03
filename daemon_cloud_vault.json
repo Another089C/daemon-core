@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793681175263,
+  "lastUpdated" : 1793681179817,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "hola, me gusta mich"
-    }, {
-      "role" : "assistant",
-      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
-    }, {
-      "role" : "user",
       "content" : "cierra todo"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
+    }, {
+      "role" : "user",
+      "content" : "apaga el ordenador"
+    }, {
+      "role" : "assistant",
+      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
     } ],
-    "updatedAt" : 1793681175263
+    "updatedAt" : 1793681179817
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
