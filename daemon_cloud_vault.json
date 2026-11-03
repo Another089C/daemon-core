@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793681163540,
+  "lastUpdated" : 1793681167701,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -112,12 +112,6 @@
       "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
     }, {
       "role" : "user",
-      "content" : "quien es itzel?"
-    }, {
-      "role" : "assistant",
-      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
-    }, {
-      "role" : "user",
       "content" : "hola, me gusta mich"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "Aplicación visual cerrada."
+    }, {
+      "role" : "user",
+      "content" : "cierra spotify"
+    }, {
+      "role" : "assistant",
+      "content" : "Aplicación spotify cerrada."
     } ],
-    "updatedAt" : 1793681163540
+    "updatedAt" : 1793681167701
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
