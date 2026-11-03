@@ -1,9 +1,9 @@
 {
-  "lastUpdated" : 1793679207076,
+  "lastUpdated" : 1793679448315,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
-    "responses" : [ "Soy Daemon v12.0, un sistema operativo de inteligencia artificial con auto-actualización OTA en la nube y memoria por cuenta de usuario, creado por Cristian Alexis." ],
+    "responses" : [ "Soy Daemon v14.0, un sistema operativo de inteligencia artificial con control total de aplicaciones, inicio de sesión con Google y Apple y actualización OTA por Git, creado por Cristian Alexis." ],
     "action" : "NONE"
   }, {
     "tag" : "global_proceso_hilo",
@@ -18,12 +18,11 @@
   } ],
   "accounts" : [ {
     "username" : "cristian",
+    "email" : "cristian@gmail.com",
     "passwordHash" : "6051fc84a7a0d74c225fb18a496b09952da5642e60723ecae543298edd7d82d6",
     "role" : "ADMIN",
-    "calendarProvider" : "BOTH",
-    "googleAccountEmail" : "",
-    "googleWebhookOrToken" : "",
-    "appleAccountEmail" : "",
+    "accountProvider" : "GOOGLE",
+    "googleWebhookUrl" : "",
     "personalFacts" : [ "Es Cristian Alexis, creador y Administrador Maestro de Daemon.", "Estudia Ingeniería en Sistemas Computacionales en la ESCOM del IPN." ],
     "personalKnowledge" : [ ],
     "personalModes" : [ {
@@ -61,15 +60,14 @@
     } ],
     "calendarEvents" : [ ],
     "recentHistory" : [ ],
-    "updatedAt" : 1793667358222
+    "updatedAt" : 1793679395083
   }, {
     "username" : "invitado",
+    "email" : "",
     "passwordHash" : "75cee5b221098c39dc19feca49b7b7cfe46405057d0361b18726990a5f91bf25",
     "role" : "USER",
-    "calendarProvider" : "BOTH",
-    "googleAccountEmail" : "",
-    "googleWebhookOrToken" : "",
-    "appleAccountEmail" : "",
+    "accountProvider" : "GOOGLE",
+    "googleWebhookUrl" : "",
     "personalFacts" : [ "Sesión estándar de usuario en Daemon." ],
     "personalKnowledge" : [ ],
     "personalModes" : [ {
@@ -107,16 +105,15 @@
     } ],
     "calendarEvents" : [ ],
     "recentHistory" : [ ],
-    "updatedAt" : 1793660445010
+    "updatedAt" : 1793679395084
   }, {
-    "username" : "cristianuser",
-    "passwordHash" : "9162dedf2f66de62e5992c06f8e0109ab94a9a7d4907d58ff0f3f2f0c27790c3",
+    "username" : "ccristinorocha7",
+    "email" : "ccristinorocha7@gmail.com",
+    "passwordHash" : "eefe0efca3328e64c37cd9438bfe610583280c8fc7af73115629a39059504f2a",
     "role" : "USER",
-    "calendarProvider" : "BOTH",
-    "googleAccountEmail" : "",
-    "googleWebhookOrToken" : "",
-    "appleAccountEmail" : "",
-    "personalFacts" : [ "Cuenta personal en la nube de cristianuser." ],
+    "accountProvider" : "GOOGLE",
+    "googleWebhookUrl" : "",
+    "personalFacts" : [ "Cuenta vinculada a ccristinorocha7@gmail.com (GOOGLE)." ],
     "personalKnowledge" : [ ],
     "personalModes" : [ {
       "id" : "TRABAJO",
@@ -125,7 +122,7 @@
       "appsToOpen" : [ "vscode", "notion", "opera gx" ],
       "appsToClose" : [ ],
       "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Trabajo activo, cristianuser. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+      "greeting" : "Modo Trabajo activo, ccristinorocha7. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
     }, {
       "id" : "TAREA",
       "name" : "PROTOCOLO TAREA",
@@ -133,7 +130,7 @@
       "appsToOpen" : [ "vscode", "notion", "opera gx" ],
       "appsToClose" : [ "discord", "steam" ],
       "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Tarea activo, cristianuser. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+      "greeting" : "Modo Tarea activo, ccristinorocha7. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
     }, {
       "id" : "ESTUDIO",
       "name" : "PROTOCOLO ESTUDIO",
@@ -141,7 +138,7 @@
       "appsToOpen" : [ "notion", "opera gx", "vscode" ],
       "appsToClose" : [ "discord", "steam" ],
       "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Estudio activo, cristianuser. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+      "greeting" : "Modo Estudio activo, ccristinorocha7. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
     }, {
       "id" : "GAMING",
       "name" : "PROTOCOLO GAMING",
@@ -149,116 +146,10 @@
       "appsToOpen" : [ "discord" ],
       "appsToClose" : [ "vscode", "notion" ],
       "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Gaming activo, cristianuser. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+      "greeting" : "Modo Gaming activo, ccristinorocha7. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
     } ],
     "calendarEvents" : [ ],
-    "recentHistory" : [ {
-      "role" : "user",
-      "content" : "dale play"
-    }, {
-      "role" : "assistant",
-      "content" : "Reanudando reproducción en Spotify."
-    }, {
-      "role" : "user",
-      "content" : "dale play"
-    }, {
-      "role" : "assistant",
-      "content" : "Reanudando reproducción en Spotify."
-    }, {
-      "role" : "user",
-      "content" : "siguiente cancion"
-    }, {
-      "role" : "assistant",
-      "content" : "Siguiente canción en Spotify."
-    }, {
-      "role" : "user",
-      "content" : "anterior"
-    }, {
-      "role" : "assistant",
-      "content" : "Canción anterior en Spotify."
-    }, {
-      "role" : "user",
-      "content" : "anterior"
-    }, {
-      "role" : "assistant",
-      "content" : "Canción anterior en Spotify."
-    }, {
-      "role" : "user",
-      "content" : "siguiente"
-    }, {
-      "role" : "assistant",
-      "content" : "Siguiente canción en Spotify."
-    } ],
-    "updatedAt" : 1793657896242
-  }, {
-    "username" : "prueba1",
-    "passwordHash" : "ef994e7262a78b97c039adf58214ee7df1076824a7e47538948ba61ae02b05c7",
-    "role" : "USER",
-    "calendarProvider" : "BOTH",
-    "googleAccountEmail" : "",
-    "googleWebhookOrToken" : "",
-    "appleAccountEmail" : "",
-    "personalFacts" : [ "Cuenta personal en la nube de prueba1." ],
-    "personalKnowledge" : [ ],
-    "personalModes" : [ {
-      "id" : "TRABAJO",
-      "name" : "PROTOCOLO TRABAJO",
-      "triggers" : [ "vamos a trabajar", "modo trabajo", "protocolo trabajo", "hora de trabajar", "vamos a programar" ],
-      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
-      "appsToClose" : [ ],
-      "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Trabajo activo, prueba1. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
-    }, {
-      "id" : "TAREA",
-      "name" : "PROTOCOLO TAREA",
-      "triggers" : [ "vamos a hacer tarea", "modo tarea", "protocolo tarea", "hora de hacer tarea", "tengo tarea" ],
-      "appsToOpen" : [ "vscode", "notion", "opera gx" ],
-      "appsToClose" : [ "discord", "steam" ],
-      "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Tarea activo, prueba1. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
-    }, {
-      "id" : "ESTUDIO",
-      "name" : "PROTOCOLO ESTUDIO",
-      "triggers" : [ "vamos a estudiar", "modo estudio", "protocolo estudio", "modo escuela", "modo escom" ],
-      "appsToOpen" : [ "notion", "opera gx", "vscode" ],
-      "appsToClose" : [ "discord", "steam" ],
-      "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Estudio activo, prueba1. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
-    }, {
-      "id" : "GAMING",
-      "name" : "PROTOCOLO GAMING",
-      "triggers" : [ "vamos a jugar", "modo gaming", "modo juego", "protocolo gaming", "hora de jugar" ],
-      "appsToOpen" : [ "discord" ],
-      "appsToClose" : [ "vscode", "notion" ],
-      "spotifyPlaylist" : "mis me gusta",
-      "greeting" : "Modo Gaming activo, prueba1. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
-    } ],
-    "calendarEvents" : [ ],
-    "recentHistory" : [ {
-      "role" : "user",
-      "content" : "abre opera"
-    }, {
-      "role" : "assistant",
-      "content" : "Ampliando ventana activa de OPERA GX."
-    }, {
-      "role" : "user",
-      "content" : "ve a la pestaña de whatsapp"
-    }, {
-      "role" : "assistant",
-      "content" : "Lo siento, pero como asistente de inteligencia artificial, no puedo interactuar con tu dispositivo físico ni acceder a aplicaciones. Te recomendaría abrir la aplicación WhatsApp desde tu navegador web o móvil para acceder a la interfaz de usuario."
-    }, {
-      "role" : "user",
-      "content" : "en opera, ve a la ventana de whatsapp"
-    }, {
-      "role" : "assistant",
-      "content" : "Lo siento, pero como asistente de inteligencia artificial, no puedo interactuar con tu dispositivo físico ni acceder a aplicaciones. Te recomendaría abrir la aplicación WhatsApp desde tu navegador web o móvil para acceder a la interfaz de usuario."
-    }, {
-      "role" : "user",
-      "content" : "puedes dirigirte a una pestaña en especifico en mi navegador?"
-    }, {
-      "role" : "assistant",
-      "content" : "Lo siento, pero como asistente de inteligencia artificial, no tengo la capacidad para dirigirte a una pestaña específica en tu navegador. Te recomendaría abrir la aplicación WhatsApp desde tu navegador web o móvil para acceder a la interfaz de usuario."
-    } ],
-    "updatedAt" : 1793668258700
+    "recentHistory" : [ ],
+    "updatedAt" : 1793679448314
   } ]
 }
