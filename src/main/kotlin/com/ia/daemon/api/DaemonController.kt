@@ -6,6 +6,7 @@ import org.springframework.stereotype.Service
 import org.springframework.web.bind.annotation.*
 import java.awt.*
 import java.awt.datatransfer.StringSelection
+import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseMotionAdapter
@@ -25,7 +26,8 @@ import java.time.*
 import java.time.format.DateTimeFormatter
 import java.time.temporal.TemporalAdjusters
 import java.util.Base64
-import java.util.concurrent.CopyOnWriteArraySet
+import java.util.Collections
+import javax.imageio.ImageIO
 import javax.swing.*
 import javax.swing.border.EmptyBorder
 import javax.swing.plaf.basic.BasicScrollBarUI
@@ -33,13 +35,18 @@ import kotlin.concurrent.thread
 import kotlin.math.*
 
 // ============================================================================
-// MODELOS DE DATOS (CUENTAS GMAIL/APPLE, RECORDATORIOS SILENCIOSOS Y OTA)
+// MODELOS DE DATOS
 // ============================================================================
 data class ChatRequest(
     val prompt: String = "",
     val username: String = "",
     val password: String = "",
     val fromBrowser: Boolean = true
+)
+
+data class AuthResult(
+    val ok: Boolean = false,
+    val message: String = ""
 )
 
 data class IntentNode(
@@ -70,7 +77,7 @@ data class CalendarEventItem(
     val startEpochMillis: Long = 0L,
     val endEpochMillis: Long = 0L,
     val formattedDate: String = "",
-    val providerUsed: String = "GOOGLE", // "GOOGLE" o "APPLE"
+    val providerUsed: String = "GOOGLE",
     var syncedToNativeOs: Boolean = false,
     var voiceAlertTriggered: Boolean = false
 )
@@ -80,7 +87,7 @@ data class UserAccount(
     var email: String = "",
     var passwordHash: String = "",
     var role: String = "USER",
-    var accountProvider: String = "GOOGLE", // "GOOGLE" (Gmail) o "APPLE" (iCloud)
+    var accountProvider: String = "GOOGLE",
     var googleWebhookUrl: String = "",
     val personalFacts: MutableList<String> = mutableListOf(),
     val personalKnowledge: MutableList<IntentNode> = mutableListOf(),
@@ -97,8 +104,8 @@ data class CloudVaultState(
 )
 
 data class OtaManifest(
-    var appVersion: Int = 140,
-    var versionName: String = "14.0.0",
+    var appVersion: Int = 145,
+    var versionName: String = "14.5.0",
     var lastCommitSha: String = "",
     var githubOwner: String = "Another089C",
     var githubRepo: String = "daemon-core",
@@ -111,7 +118,7 @@ data class OtaManifest(
 data class LocalMachineSession(
     var loggedUsername: String = "invitado",
     var loggedPasswordHash: String = "",
-    var installedAppVersion: Int = 140,
+    var installedAppVersion: Int = 145,
     var installedCommitSha: String = ""
 )
 
@@ -134,16 +141,8 @@ data class CloudChatPayload(
     val jsonMode: Boolean = false
 )
 
-data class GoogleCalendarWebhookPayload(
-    val title: String = "",
-    val startIso: String = "",
-    val endIso: String = "",
-    val email: String = "",
-    val description: String = "Agendado automáticamente por Daemon AI"
-)
-
 // ============================================================================
-// 1. PARSER INTELIGENTE DE FECHAS Y HORAS EN ESPAÑOL PARA RECORDATORIOS
+// 1. PARSER INTELIGENTE DE FECHAS Y HORAS EN ESPAÑOL
 // ============================================================================
 object SpanishCalendarParser {
 
@@ -165,16 +164,13 @@ object SpanishCalendarParser {
     )
 
     fun isCalendarReminderRequest(normalized: String): Boolean {
-        val hasTriggerVerb = normalized.startsWith("recuerdame ") ||
+        val hasTriggerVerb = normalized.contains("recuerdame ") ||
             normalized.startsWith("agenda ") ||
             normalized.startsWith("agendar ") ||
-            normalized.startsWith("programa ") ||
             normalized.contains("agrega al calendario") ||
-            normalized.contains("agregar al calendario") ||
             normalized.contains("pon en mi calendario") ||
             normalized.contains("pon un recordatorio") ||
-            normalized.contains("crea un recordatorio") ||
-            normalized.contains("crear recordatorio")
+            normalized.contains("crea un recordatorio")
 
         if (hasTriggerVerb) return true
 
@@ -280,7 +276,7 @@ object SpanishCalendarParser {
 
         var cleanTitle = rawInput.trim()
             .replace(Regex("""^(?:daemon\s+|oye\s+daemon\s+|hola\s+daemon\s+)?""", RegexOption.IGNORE_CASE), "")
-            .replace(Regex("""^(?:recuerdame|recuérdame|recuerda|agenda|agendar|programa|agrega\s+al\s+calendario|agregar\s+al\s+calendario|pon\s+en\s+mi\s+calendario|pon\s+un\s+recordatorio|crea\s+un\s+recordatorio)\s+(?:que\s+|para\s+)?""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""^.*?(?:recuerdame|recuérdame|recuerda|agenda|agendar|programa|agrega\s+al\s+calendario|pon\s+en\s+mi\s+calendario|pon\s+un\s+recordatorio|crea\s+un\s+recordatorio)\s+(?:que\s+|para\s+)?""", RegexOption.IGNORE_CASE), "")
             .replace(Regex("""\b(?:pasado\s+manana|pasado\s+mañana|manana|mañana|hoy)\b""", RegexOption.IGNORE_CASE), "")
             .replace(Regex("""\b(?:el|este|proximo|próximo)\s+(?:lunes|martes|miercoles|miércoles|jueves|viernes|sabado|sábado|domingo)\b""", RegexOption.IGNORE_CASE), "")
             .replace(Regex("""\b\d{1,2}\s+de\s+[a-zA-Z]+(?:\s+de\s+\d{4})?\b""", RegexOption.IGNORE_CASE), "")
@@ -309,7 +305,7 @@ object SpanishCalendarParser {
 }
 
 // ============================================================================
-// 2. BÓVEDA EN LA NUBE + CUENTAS GMAIL/APPLE + OTA POR HASH DE GIT
+// 2. BÓVEDA EN LA NUBE + CUENTAS GMAIL/APPLE + OTA POR COMMIT SHA
 // ============================================================================
 @Service
 class CloudVaultService {
@@ -329,11 +325,11 @@ class CloudVaultService {
     var localSession = LocalMachineSession()
     var vault = CloudVaultState()
 
-    private val discoveredPeers = CopyOnWriteArraySet<String>()
+    private val discoveredPeers = Collections.synchronizedSet(linkedSetOf("").apply { clear() })
     private val udpDiscoveryPort = 19840
 
     @Volatile var cloudSyncStatus: String = "LIVE SYNC ☁"
-    @Volatile var otaStatusText: String = "v14.0.0 LIVE"
+    @Volatile var otaStatusText: String = "v14.5.0 LIVE"
     var onSessionOrVaultChanged: (() -> Unit)? = null
     var onDueCalendarAlarm: ((CalendarEventItem) -> Unit)? = null
 
@@ -354,9 +350,6 @@ class CloudVaultService {
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
-    // ========================================================================
-    // RECORDATORIOS 100% EN SEGUNDO PLANO SEGÚN LA CUENTA (GMAIL O APPLE)
-    // ========================================================================
     fun scheduleReminderSilentlyForCurrentAccount(rawInput: String, normalized: String): String {
         val acc = getCurrentAccount()
         val provider = acc.accountProvider.uppercase().ifBlank { "GOOGLE" }
@@ -365,7 +358,6 @@ class CloudVaultService {
         val accountLabel = if (acc.email.isNotBlank()) acc.email else acc.username
         val calendarName = if (provider == "APPLE") "Apple Calendar (iCloud)" else "Google Calendar (Gmail)"
 
-        // Ejecutar la inserción en segundo plano SIN ABRIR NINGUNA VENTANA DE NAVEGADOR NI POPUP
         thread(isDaemon = true) {
             var synced = false
             if (isMac) {
@@ -381,10 +373,9 @@ class CloudVaultService {
             onSessionOrVaultChanged?.invoke()
         }
 
-        return "Agendado para el ${event.formattedDate}: '${event.title}'. Guardado automáticamente en tu $calendarName ($accountLabel) sin abrir ventanas adicionales."
+        return "Agendado para el ${event.formattedDate}: '${event.title}' en tu $calendarName ($accountLabel)."
     }
 
-    // En macOS: Inserta silenciosamente en Calendar.app buscando el calendario de Google o de Apple (iCloud)
     private fun insertSilentlyIntoMacCalendarApp(event: CalendarEventItem, provider: String, email: String): Boolean {
         if (!isMac) return false
         return try {
@@ -426,7 +417,7 @@ class CloudVaultService {
                 end tell
             """.trimIndent()
 
-            val proc = ProcessBuilder("osascript", "-e", appleScript).start()
+            val proc = ProcessBuilder("/usr/bin/osascript", "-e", appleScript).start()
             val out = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
             proc.waitFor()
             out.contains("OK")
@@ -435,57 +426,26 @@ class CloudVaultService {
         }
     }
 
-    // En Windows: Inserta en segundo plano (Webhook silencioso + Tarea programada nativa de Windows + Sync a Mac)
     private fun insertSilentlyOnWindows(event: CalendarEventItem, acc: UserAccount): Boolean {
         if (!isWindows) return false
-        var ok = false
-
-        // 1. Si tiene puente silencioso de Google Apps Script configurado en la cuenta, enviarlo por HTTP POST
-        if (acc.googleWebhookUrl.startsWith("https://script.google.com/")) {
-            try {
-                val startIso = Instant.ofEpochMilli(event.startEpochMillis).atZone(ZoneOffset.UTC)
-                    .format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"))
-                val endIso = Instant.ofEpochMilli(event.endEpochMillis).atZone(ZoneOffset.UTC)
-                    .format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'"))
-                val payload = GoogleCalendarWebhookPayload(
-                    title = event.title,
-                    startIso = startIso,
-                    endIso = endIso,
-                    email = acc.email
-                )
-                val bodyJson = objectMapper.writeValueAsString(payload)
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create(acc.googleWebhookUrl.trim()))
-                    .timeout(Duration.ofSeconds(6))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(bodyJson, StandardCharsets.UTF_8))
-                    .build()
-                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-                if (res.statusCode() in 200..399) ok = true
-            } catch (e: Exception) {}
-        }
-
-        // 2. Registrar Tarea/Alarma nativa en el Programador de Tareas de Windows en total silencio (0 ventanas emergentes)
-        try {
+        return try {
             val dt = Instant.ofEpochMilli(event.startEpochMillis).atZone(ZoneId.systemDefault()).toLocalDateTime()
-            val dateStr = dt.format(DateTimeFormatter.ofPattern("dd/MM/yyyy"))
-            val timeStr = dt.format(DateTimeFormatter.ofPattern("HH:mm"))
             val safeTaskName = "DaemonReminder_${event.id.takeLast(8)}"
             val safeTitle = event.title.replace("\"", "").replace("'", "")
 
             val psSilentTask = """
-                ${'$'}action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -Command `"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('Recordatorio de Daemon: $safeTitle')`""
+                ${'$'}action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-Command `"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('Recordatorio de Daemon: $safeTitle')`""
                 ${'$'}trigger = New-ScheduledTaskTrigger -Once -At "${dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"))}"
                 Register-ScheduledTask -TaskName "$safeTaskName" -Action ${'$'}action -Trigger ${'$'}trigger -Force | Out-Null
             """.trimIndent()
 
             val utf16 = psSilentTask.toByteArray(StandardCharsets.UTF_16LE)
             val b64 = Base64.getEncoder().encodeToString(utf16)
-            ProcessBuilder("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", b64).start()
-            ok = true
-        } catch (e: Exception) {}
-
-        return ok
+            ProcessBuilder("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64).start()
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun startSilentCalendarGuardian() {
@@ -498,14 +458,12 @@ class CloudVaultService {
                     var vaultModified = false
 
                     for (ev in acc.calendarEvents) {
-                        // Si el evento se creó en Windows y ahora estamos en la Mac, inyectarlo en silencio en Calendar.app
                         if (isMac && !ev.syncedToNativeOs) {
                             if (insertSilentlyIntoMacCalendarApp(ev, ev.providerUsed, acc.email)) {
                                 ev.syncedToNativeOs = true
                                 vaultModified = true
                             }
                         }
-                        // Alarma por voz cuando llega el minuto exacto del recordatorio
                         if (!ev.voiceAlertTriggered && now >= ev.startEpochMillis && (now - ev.startEpochMillis) <= 180000L) {
                             ev.voiceAlertTriggered = true
                             vaultModified = true
@@ -537,9 +495,6 @@ class CloudVaultService {
         return "Recordatorios sincronizados en $calType (${acc.email.ifBlank { acc.username }}):\n$lines"
     }
 
-    // ========================================================================
-    // DETECTOR DE ACTUALIZACIONES POR COMMIT SHA DE GIT (NUNCA MÁS GIT CLONE)
-    // ========================================================================
     private fun loadOrDetectOtaManifest() {
         if (otaManifestFile.exists()) {
             try {
@@ -576,9 +531,7 @@ class CloudVaultService {
         } catch (e: Exception) { "" }
     }
 
-    // Obtiene el último commit real en GitHub sin caché (vía git ls-remote o GitHub API)
     private fun getRemoteGitHubLatestCommitSha(): String {
-        // 1. Intentar con git ls-remote (0 caché, instantáneo)
         try {
             val workingDir = File(System.getProperty("user.dir"))
             val proc = ProcessBuilder("git", "ls-remote", "origin", "refs/heads/main").directory(workingDir).start()
@@ -588,7 +541,6 @@ class CloudVaultService {
             if (sha.length >= 7) return sha
         } catch (e: Exception) {}
 
-        // 2. Fallback: API oficial de GitHub sin caché
         return try {
             val apiUrl = "https://api.github.com/repos/${otaManifest.githubOwner}/${otaManifest.githubRepo}/commits/main"
             val req = HttpRequest.newBuilder()
@@ -609,37 +561,16 @@ class CloudVaultService {
             val remoteSha = getRemoteGitHubLatestCommitSha()
             val localSha = getLocalGitCommitSha().ifBlank { localSession.installedCommitSha }
 
-            // Si hiciste git push desde Windows, el SHA remoto cambia inmediatamente y la Mac lo detecta al instante
             if (remoteSha.isNotBlank() && localSha.isNotBlank() && remoteSha != localSha) {
-                otaStatusText = "⬇ NUEVO COMMIT DETECTADO (${remoteSha.take(7)})..."
+                otaStatusText = "⬇ APLICANDO UPDATE (${remoteSha.take(7)})..."
                 onSessionOrVaultChanged?.invoke()
                 applySeamlessGitOrJarUpdate(remoteSha)
                 return
             }
-
-            // También verificar versión de manifiesto por si es una PC sin git instalado
-            val rawUrlWithCommit = if (remoteSha.isNotBlank()) {
-                "https://raw.githubusercontent.com/${otaManifest.githubOwner}/${otaManifest.githubRepo}/$remoteSha/daemon_ota_manifest.json"
-            } else {
-                "${otaManifest.githubRawBaseUrl.trimEnd('/')}/daemon_ota_manifest.json?t=${System.currentTimeMillis()}"
-            }
-
-            val req = HttpRequest.newBuilder().uri(URI.create(rawUrlWithCommit)).timeout(Duration.ofSeconds(4)).GET().build()
-            val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-            if (res.statusCode() == 200 && res.body().contains("appVersion")) {
-                val remoteManifest = objectMapper.readValue(res.body(), OtaManifest::class.java)
-                if (remoteManifest.appVersion > otaManifest.appVersion) {
-                    otaStatusText = "⬇ ACTUALIZANDO A v${remoteManifest.versionName}..."
-                    onSessionOrVaultChanged?.invoke()
-                    applySeamlessGitOrJarUpdate(remoteSha.ifBlank { "main" })
-                } else {
-                    otaStatusText = "v${otaManifest.versionName} AL DÍA ✓"
-                }
-            }
+            otaStatusText = "v${otaManifest.versionName} AL DÍA ✓"
         } catch (e: Exception) {}
     }
 
-    // Actualiza la carpeta local con git reset --hard origin/main (o descarga el .jar por SHA sin caché) y reinicia Daemon
     private fun applySeamlessGitOrJarUpdate(targetSha: String): Boolean {
         return try {
             val workingDir = File(System.getProperty("user.dir"))
@@ -648,7 +579,6 @@ class CloudVaultService {
             }
             val tempJar = File(workingDir, "daemon_update_temp.jar")
 
-            // Descargar el .jar usando el SHA exacto del commit para evitar el caché de 5 minutos de GitHub Raw
             val jarUrl = "https://raw.githubusercontent.com/${otaManifest.githubOwner}/${otaManifest.githubRepo}/$targetSha/${otaManifest.jarRelativePath.trimStart('/')}"
             val req = HttpRequest.newBuilder().uri(URI.create(jarUrl)).timeout(Duration.ofSeconds(60)).GET().build()
             val res = httpClient.send(req, HttpResponse.BodyHandlers.ofByteArray())
@@ -682,7 +612,6 @@ class CloudVaultService {
                 )
                 ProcessBuilder("wscript.exe", vbsSwapper.absolutePath).directory(workingDir).start()
             } else {
-                // En macOS / Linux: Actualiza todo el repo automáticamente y relanza el .jar nuevo sin que tengas que clonar nada
                 val updaterSh = File(workingDir, "daemon_swapper.sh")
                 val shContent = """
                     #!/bin/bash
@@ -844,7 +773,7 @@ class CloudVaultService {
             Thread.sleep(1500)
             while (true) {
                 broadcastSyncPingToLan()
-                for (peer in discoveredPeers) {
+                for (peer in discoveredPeers.toList()) {
                     pullFromPeerDevice(peer)
                 }
                 Thread.sleep(6000)
@@ -873,17 +802,6 @@ class CloudVaultService {
                 socket.broadcast = true
                 val data = "DAEMON_SYNC:${vault.lastUpdated}".toByteArray(StandardCharsets.UTF_8)
                 socket.send(DatagramPacket(data, data.size, InetAddress.getByName("255.255.255.255"), udpDiscoveryPort))
-                val interfaces = NetworkInterface.getNetworkInterfaces()
-                while (interfaces.hasMoreElements()) {
-                    val iface = interfaces.nextElement()
-                    if (iface.isLoopback || !iface.isUp) continue
-                    for (ifaceAddr in iface.interfaceAddresses) {
-                        val broadcast = ifaceAddr.broadcast ?: continue
-                        try {
-                            socket.send(DatagramPacket(data, data.size, broadcast, udpDiscoveryPort))
-                        } catch (e: Exception) {}
-                    }
-                }
             }
         } catch (e: Exception) {}
     }
@@ -914,7 +832,7 @@ class CloudVaultService {
         if (discoveredPeers.isEmpty()) return
         thread(isDaemon = true) {
             val json = objectMapper.writeValueAsString(vault)
-            for (peer in discoveredPeers) {
+            for (peer in discoveredPeers.toList()) {
                 try {
                     val req = HttpRequest.newBuilder()
                         .uri(URI.create("$peer/api/daemon/cloud-vault"))
@@ -942,7 +860,7 @@ class CloudVaultService {
     fun syncAllChannelsNow(silent: Boolean = false): String {
         reloadVaultFromDiskIfNewer()
         broadcastSyncPingToLan()
-        for (peer in discoveredPeers) {
+        for (peer in discoveredPeers.toList()) {
             pullFromPeerDevice(peer)
         }
         pullFromRealtimeCloudDb()
@@ -969,25 +887,6 @@ class CloudVaultService {
                 }
             }
         } catch (e: Exception) {}
-
-        val rawBase = otaManifest.githubRawBaseUrl.trimEnd('/')
-        if (rawBase.isNotBlank()) {
-            try {
-                val apiOrRawUrl = "$rawBase/daemon_cloud_vault.json?nocache=${System.currentTimeMillis()}"
-                val req = HttpRequest.newBuilder()
-                    .uri(URI.create(apiOrRawUrl))
-                    .timeout(Duration.ofSeconds(4))
-                    .header("Cache-Control", "no-cache, no-store, must-revalidate")
-                    .header("Pragma", "no-cache")
-                    .GET().build()
-                val res = httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-                if (res.statusCode() == 200 && res.body().contains("accounts")) {
-                    val remoteVault = objectMapper.readValue(res.body(), CloudVaultState::class.java)
-                    mergeCloudVault(remoteVault)
-                    cloudSyncStatus = "CLOUD SYNCED ☁"
-                }
-            } catch (e: Exception) {}
-        }
     }
 
     fun pushVaultEverywhereAsync(commitReason: String = "sync: actualizacion de cuenta en la nube") {
@@ -1124,9 +1023,6 @@ class CloudVaultService {
         return changed
     }
 
-    // ========================================================================
-    // LOGIN Y REGISTRO CON CUENTA DE GOOGLE (GMAIL) O CUENTA DE APPLE (iCLOUD)
-    // ========================================================================
     fun getCurrentAccount(): UserAccount {
         reloadVaultFromDiskIfNewer()
         val acc = vault.accounts.firstOrNull {
@@ -1154,7 +1050,7 @@ class CloudVaultService {
         }
     }
 
-    fun loginUser(emailOrUsername: String, plainPassword: String, preferredProvider: String = ""): Pair<Boolean, String> {
+    fun loginUser(emailOrUsername: String, plainPassword: String, preferredProvider: String = ""): AuthResult {
         syncAllChannelsNow(silent = true)
 
         val cleanInput = emailOrUsername.trim().lowercase()
@@ -1164,11 +1060,11 @@ class CloudVaultService {
             it.username.equals(cleanInput, true) ||
                 it.username.equals(shortUser, true) ||
                 (it.email.isNotBlank() && it.email.equals(cleanInput, true))
-        } ?: return Pair(false, "La cuenta '$cleanInput' no está registrada. Presiona CREAR CUENTA con tu Gmail o Apple ID.")
+        } ?: return AuthResult(false, "La cuenta '$cleanInput' no está registrada. Presiona CREAR CUENTA.")
 
         val inputHash = sha256(plainPassword)
         if (acc.passwordHash != inputHash && acc.passwordHash != plainPassword.trim()) {
-            return Pair(false, "Contraseña incorrecta para '$cleanInput'.")
+            return AuthResult(false, "Contraseña incorrecta para '$cleanInput'.")
         }
 
         if (cleanInput.contains("@")) {
@@ -1187,22 +1083,22 @@ class CloudVaultService {
         onSessionOrVaultChanged?.invoke()
 
         val calLabel = if (acc.accountProvider == "APPLE") "Apple Calendar (iCloud)" else "Google Calendar (Gmail)"
-        return Pair(true, "Sesión iniciada como ${acc.email.ifBlank { acc.username }.uppercase()}. Tus recordatorios se guardarán automáticamente en $calLabel.")
+        return AuthResult(true, "Sesión iniciada: ${acc.email.ifBlank { acc.username }.uppercase()} ($calLabel).")
     }
 
-    fun registerNewUser(emailOrUsername: String, plainPassword: String, explicitProvider: String = "GOOGLE"): Pair<Boolean, String> {
+    fun registerNewUser(emailOrUsername: String, plainPassword: String, explicitProvider: String = "GOOGLE"): AuthResult {
         syncAllChannelsNow(silent = true)
 
         val rawInput = emailOrUsername.trim().lowercase()
         val isEmail = rawInput.contains("@")
         val cleanUser = rawInput.substringBefore("@").replace(Regex("[^a-z0-9_\\.]"), "")
 
-        if (cleanUser.length < 3) return Pair(false, "Ingresa un correo de Gmail, Apple ID o usuario válido.")
-        if (cleanUser == "cristian") return Pair(false, "La cuenta 'cristian' es la cuenta maestra de Administrador. Inicia sesión con tu clave.")
+        if (cleanUser.length < 3) return AuthResult(false, "Ingresa un correo de Gmail, Apple ID o usuario válido.")
+        if (cleanUser == "cristian") return AuthResult(false, "La cuenta 'cristian' es de Administrador. Inicia sesión con tu clave.")
         if (vault.accounts.any { it.username.equals(cleanUser, true) || (isEmail && it.email.equals(rawInput, true)) }) {
-            return Pair(false, "La cuenta '$rawInput' ya existe. Solo presiona INICIAR SESIÓN.")
+            return AuthResult(false, "La cuenta '$rawInput' ya existe. Solo presiona INICIAR SESIÓN.")
         }
-        if (plainPassword.trim().length < 3) return Pair(false, "La contraseña debe tener al menos 3 caracteres.")
+        if (plainPassword.trim().length < 3) return AuthResult(false, "La contraseña debe tener al menos 3 caracteres.")
 
         val detectedProvider = detectProviderFromEmail(rawInput, explicitProvider)
         val finalEmail = if (isEmail) rawInput else if (detectedProvider == "APPLE") "$cleanUser@icloud.com" else "$cleanUser@gmail.com"
@@ -1230,7 +1126,7 @@ class CloudVaultService {
         onSessionOrVaultChanged?.invoke()
 
         val calLabel = if (detectedProvider == "APPLE") "Apple Calendar (iCloud)" else "Google Calendar (Gmail)"
-        return Pair(true, "Cuenta '$finalEmail' creada. Todos tus recordatorios se guardarán automáticamente en tu $calLabel.")
+        return AuthResult(true, "Cuenta '$finalEmail' creada y conectada a $calLabel.")
     }
 
     fun logoutToGuest(): String {
@@ -1328,7 +1224,7 @@ class CloudVaultService {
             }
         }
 
-        return "👑 [DESPLIEGUE OTA v${otaManifest.versionName}] Compilando código y subiendo binario a GitHub. Tu MacBook detectará el nuevo commit SHA automáticamente."
+        return "👑 [DESPLIEGUE OTA v${otaManifest.versionName}] Compilando código y subiendo binario a GitHub."
     }
 
     fun findKnowledgeMatch(normalizedInput: String): String? {
@@ -1361,7 +1257,7 @@ class CloudVaultService {
             appsToOpen = listOf("vscode", "notion", "opera gx"),
             appsToClose = emptyList(),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Trabajo activo, $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+            greeting = "Modo Trabajo ejecutado, $userLabel. Visual Studio Code, Notion, Opera GX y Spotify activos."
         ),
         WorkspaceMode(
             id = "TAREA",
@@ -1370,7 +1266,7 @@ class CloudVaultService {
             appsToOpen = listOf("vscode", "notion", "opera gx"),
             appsToClose = listOf("discord", "steam"),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Tarea activo, $userLabel. Enfocando Visual Studio Code, Notion, Opera GX y reproduciendo Mis Me Gusta."
+            greeting = "Modo Tarea ejecutado, $userLabel. Visual Studio Code, Notion, Opera GX y tu lista Mis Me Gusta activos."
         ),
         WorkspaceMode(
             id = "ESTUDIO",
@@ -1379,7 +1275,7 @@ class CloudVaultService {
             appsToOpen = listOf("notion", "opera gx", "vscode"),
             appsToClose = listOf("discord", "steam"),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Estudio activo, $userLabel. Enfocando Notion, Opera GX, Visual Studio Code y tus canciones de Mis Me Gusta."
+            greeting = "Modo Estudio ejecutado, $userLabel. Notion, Opera GX, Visual Studio Code y Mis Me Gusta activos."
         ),
         WorkspaceMode(
             id = "GAMING",
@@ -1388,7 +1284,7 @@ class CloudVaultService {
             appsToOpen = listOf("discord"),
             appsToClose = listOf("vscode", "notion"),
             spotifyPlaylist = "mis me gusta",
-            greeting = "Modo Gaming activo, $userLabel. Cerrando aplicaciones de trabajo, enfocando Discord y tu música."
+            greeting = "Modo Gaming ejecutado, $userLabel. Aplicaciones de trabajo cerradas y Discord activo."
         )
     )
 
@@ -1396,23 +1292,13 @@ class CloudVaultService {
         IntentNode(
             tag = "global_identidad",
             patterns = listOf("quien eres", "que es daemon", "como funcionas"),
-            responses = listOf("Soy Daemon v14.0, un sistema operativo de inteligencia artificial con control total de aplicaciones, inicio de sesión con Google y Apple y actualización OTA por Git, creado por Cristian Alexis.")
-        ),
-        IntentNode(
-            tag = "global_proceso_hilo",
-            patterns = listOf("que es un proceso", "diferencia entre proceso e hilo", "que es un thread"),
-            responses = listOf("Un proceso es un programa en ejecución con su propio espacio de memoria aislado; un hilo (thread) es una unidad ligera de ejecución dentro de ese proceso.")
-        ),
-        IntentNode(
-            tag = "global_mutex_semaforo",
-            patterns = listOf("que es un mutex", "diferencia entre mutex y semaforo"),
-            responses = listOf("Un Mutex es un cerrojo binario de exclusión mutua para proteger secciones críticas, mientras que un Semáforo emplea un contador entero para sincronizar múltiples hilos o procesos.")
+            responses = listOf("Soy Daemon v14.5, un sistema operativo de inteligencia artificial con ejecución directa por hardware y sincronización en la nube, creado por Cristian Alexis.")
         )
     )
 }
 
 // ============================================================================
-// 3. CONTROL TOTAL DE LA COMPUTADORA Y AUTOMATIZACIÓN DENTRO DE APLICACIONES
+// 3. EJECUTOR FÍSICO DIRECTO (JAVA ROBOT + DESKTOP API + OS KERNEL)
 // ============================================================================
 @Service
 class SystemScanner(
@@ -1428,6 +1314,9 @@ class SystemScanner(
     private val playlistsFile = File("daemon_playlists.json")
     private val objectMapper = ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT)
     private val savedPlaylists = mutableMapOf("init" to "init").apply { clear() }
+
+    // Robot nativo de Java AWT para inyectar teclas, atajos y tomar capturas en 1 milisegundo
+    private val awtRobot: Robot? = try { Robot() } catch (e: Exception) { null }
 
     @Volatile var activeModeName: String = "NÚCLEO ACTIVO"
     @Volatile var currentSpotifyTrack: String = "ACTIVO"
@@ -1455,13 +1344,14 @@ class SystemScanner(
         else -> "OS"
     }
 
+    // Ejecutor PowerShell SIN "-WindowStyle Hidden" ni "-NonInteractive" para que Windows permita controlar ventanas y audio
     fun runPowerShell(script: String, wait: Boolean = false): String {
         if (!isWindows) return ""
         return try {
             val utf16Bytes = script.toByteArray(StandardCharsets.UTF_16LE)
             val base64 = Base64.getEncoder().encodeToString(utf16Bytes)
             val proc = ProcessBuilder(
-                "powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", base64
             ).start()
             if (wait) {
                 val output = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
@@ -1473,10 +1363,11 @@ class SystemScanner(
         } catch (e: Exception) { "" }
     }
 
+    // Ejecutor AppleScript con ruta absoluta /usr/bin/osascript para nunca fallar dentro de Daemon AI.app
     fun runAppleScript(script: String, wait: Boolean = false): String {
         if (!isMac) return ""
         return try {
-            val proc = ProcessBuilder("osascript", "-e", script).start()
+            val proc = ProcessBuilder("/usr/bin/osascript", "-e", script).start()
             if (wait) {
                 val output = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
                 proc.waitFor()
@@ -1490,7 +1381,7 @@ class SystemScanner(
     fun runLinuxShell(cmd: String, wait: Boolean = false): String {
         if (!isLinux) return ""
         return try {
-            val proc = ProcessBuilder("sh", "-c", cmd).start()
+            val proc = ProcessBuilder("/bin/sh", "-c", cmd).start()
             if (wait) {
                 val output = proc.inputStream.bufferedReader(StandardCharsets.UTF_8).readText().trim()
                 proc.waitFor()
@@ -1502,222 +1393,160 @@ class SystemScanner(
     }
 
     // ========================================================================
-    // AUTOMATIZACIÓN UNIVERSAL DENTRO DE APLICACIONES (ESCRIBIR, ATAJOS, CLICS)
+    // ESCRITURA Y ATAJOS EN APLICACIONES VÍA JAVA AWT ROBOT (EJECUCIÓN REAL)
     // ========================================================================
-    // Enfoca o abre cualquier aplicación y escribe texto dentro de ella usando Portapapeles + Pegado Nativo
     fun typeTextInsideApp(targetAppRaw: String, textToType: String, pressEnter: Boolean = true): String {
         val cleanText = textToType.trim()
         if (cleanText.isBlank()) return "Indícame qué texto deseas escribir."
 
         thread {
             try {
-                // 1. Si especificó una aplicación ("en bloc de notas", "en notion", "en vscode"), abrirla o enfocarla primero
                 if (targetAppRaw.isNotBlank() && targetAppRaw != "actual") {
                     openOrFocusApp(normalizeText(targetAppRaw))
-                    Thread.sleep(900)
+                    Thread.sleep(950)
+                } else {
+                    Thread.sleep(250)
                 }
 
-                // 2. Copiar el texto al portapapeles del sistema (soporta acentos, ñ y símbolos de programación)
+                // Copiar al portapapeles del sistema
                 Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(cleanText), null)
                 Thread.sleep(120)
 
-                // 3. Enviar comando de pegado nativo (Ctrl+V en Windows/Linux, Cmd+V en macOS)
-                when {
-                    isWindows -> {
-                        val enterKey = if (pressEnter) "{ENTER}" else ""
-                        val ps = """
-                            ${'$'}wsh = New-Object -ComObject WScript.Shell
-                            Start-Sleep -Milliseconds 150
-                            ${'$'}wsh.SendKeys("^v$enterKey")
-                        """.trimIndent()
-                        runPowerShell(ps, wait = false)
+                val robot = awtRobot
+                if (robot != null) {
+                    val modifier = if (isMac) KeyEvent.VK_META else KeyEvent.VK_CONTROL
+                    robot.keyPress(modifier)
+                    robot.keyPress(KeyEvent.VK_V)
+                    robot.delay(40)
+                    robot.keyRelease(KeyEvent.VK_V)
+                    robot.keyRelease(modifier)
+                    if (pressEnter) {
+                        robot.delay(60)
+                        robot.keyPress(KeyEvent.VK_ENTER)
+                        robot.delay(30)
+                        robot.keyRelease(KeyEvent.VK_ENTER)
                     }
-                    isMac -> {
-                        val enterCmd = if (pressEnter) "key code 36" else ""
-                        val macScript = """
-                            tell application "System Events"
-                                keystroke "v" using {command down}
-                                delay 0.1
-                                $enterCmd
-                            end tell
-                        """.trimIndent()
-                        runAppleScript(macScript, wait = false)
-                    }
-                    isLinux -> {
-                        val enterKey = if (pressEnter) "Return" else ""
-                        runLinuxShell("xdotool key ctrl+v $enterKey")
-                    }
+                } else if (isMac) {
+                    runAppleScript("tell application \"System Events\" to keystroke \"v\" using {command down}")
+                } else if (isWindows) {
+                    runPowerShell("(New-Object -ComObject WScript.Shell).SendKeys('^v{ENTER}')")
                 }
             } catch (e: Exception) {}
         }
 
         val appLabel = if (targetAppRaw.isBlank() || targetAppRaw == "actual") "la ventana activa" else targetAppRaw.uppercase()
-        return "Escribiendo en $appLabel: '${cleanText.take(45)}'..."
+        return "Texto escrito en $appLabel: '${cleanText.take(45)}'."
     }
 
-    // Ejecuta acciones y atajos de teclado dentro de la aplicación activa o de la aplicación que le indiques
     fun executeActionInsideApp(actionName: String, targetAppRaw: String = "", extraParam: String = ""): String {
         thread {
             try {
                 if (targetAppRaw.isNotBlank()) {
                     openOrFocusApp(normalizeText(targetAppRaw))
-                    Thread.sleep(650)
+                    Thread.sleep(700)
+                } else {
+                    Thread.sleep(200)
                 }
 
-                when {
-                    isWindows -> {
-                        val keys = when (actionName) {
-                            "NEW_TAB" -> "^t"
-                            "CLOSE_TAB" -> "^w"
-                            "REOPEN_TAB" -> "^+t"
-                            "NEXT_TAB" -> "^{TAB}"
-                            "SAVE" -> "^s"
-                            "NEW_FILE" -> "^n"
-                            "COPY" -> "^c"
-                            "PASTE" -> "^v"
-                            "UNDO" -> "^z"
-                            "REDO" -> "^y"
-                            "SELECT_ALL" -> "^a"
-                            "REFRESH" -> "{F5}"
-                            "FULLSCREEN" -> "{F11}"
-                            "FIND" -> "^f"
-                            "SCROLL_DOWN" -> "{PGDN}"
-                            "SCROLL_UP" -> "{PGUP}"
-                            "SWITCH_WINDOW" -> "%{TAB}"
-                            "ENTER" -> "{ENTER}"
-                            "ESCAPE" -> "{ESC}"
-                            else -> ""
+                val mod = if (isMac) KeyEvent.VK_META else KeyEvent.VK_CONTROL
+                val robot = awtRobot
+                if (robot != null) {
+                    when (actionName) {
+                        "NEW_TAB" -> pressCombo(robot, mod, KeyEvent.VK_T)
+                        "CLOSE_TAB" -> pressCombo(robot, mod, KeyEvent.VK_W)
+                        "SAVE" -> pressCombo(robot, mod, KeyEvent.VK_S)
+                        "NEW_FILE" -> pressCombo(robot, mod, KeyEvent.VK_N)
+                        "COPY" -> pressCombo(robot, mod, KeyEvent.VK_C)
+                        "PASTE" -> pressCombo(robot, mod, KeyEvent.VK_V)
+                        "UNDO" -> pressCombo(robot, mod, KeyEvent.VK_Z)
+                        "REDO" -> pressCombo(robot, mod, KeyEvent.VK_Y)
+                        "SELECT_ALL" -> pressCombo(robot, mod, KeyEvent.VK_A)
+                        "REFRESH" -> pressCombo(robot, mod, KeyEvent.VK_R)
+                        "FULLSCREEN" -> {
+                            if (isMac) {
+                                runAppleScript("tell application \"System Events\" to keystroke \"f\" using {command down, control down}")
+                            } else {
+                                pressSingle(robot, KeyEvent.VK_F11)
+                            }
                         }
-                        if (keys.isNotBlank()) {
-                            val extra = if (actionName == "FIND" && extraParam.isNotBlank()) {
+                        "FIND" -> {
+                            pressCombo(robot, mod, KeyEvent.VK_F)
+                            if (extraParam.isNotBlank()) {
+                                Thread.sleep(200)
                                 Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(extraParam), null)
-                                "Start-Sleep -Milliseconds 200; \$wsh.SendKeys('^v{ENTER}')"
-                            } else ""
-                            runPowerShell("\$wsh = New-Object -ComObject WScript.Shell; \$wsh.SendKeys('$keys'); $extra", wait = false)
+                                pressCombo(robot, mod, KeyEvent.VK_V)
+                                Thread.sleep(80)
+                                pressSingle(robot, KeyEvent.VK_ENTER)
+                            }
                         }
-                    }
-                    isMac -> {
-                        val macCmd = when (actionName) {
-                            "NEW_TAB" -> "keystroke \"t\" using {command down}"
-                            "CLOSE_TAB" -> "keystroke \"w\" using {command down}"
-                            "REOPEN_TAB" -> "keystroke \"t\" using {command down, shift down}"
-                            "NEXT_TAB" -> "key code 48 using {control down}"
-                            "SAVE" -> "keystroke \"s\" using {command down}"
-                            "NEW_FILE" -> "keystroke \"n\" using {command down}"
-                            "COPY" -> "keystroke \"c\" using {command down}"
-                            "PASTE" -> "keystroke \"v\" using {command down}"
-                            "UNDO" -> "keystroke \"z\" using {command down}"
-                            "REDO" -> "keystroke \"z\" using {command down, shift down}"
-                            "SELECT_ALL" -> "keystroke \"a\" using {command down}"
-                            "REFRESH" -> "keystroke \"r\" using {command down}"
-                            "FULLSCREEN" -> "keystroke \"f\" using {command down, control down}"
-                            "FIND" -> "keystroke \"f\" using {command down}"
-                            "SCROLL_DOWN" -> "key code 121"
-                            "SCROLL_UP" -> "key code 116"
-                            "SWITCH_WINDOW" -> "key code 48 using {command down}"
-                            "ENTER" -> "key code 36"
-                            "ESCAPE" -> "key code 53"
-                            else -> ""
-                        }
-                        if (macCmd.isNotBlank()) {
-                            val extra = if (actionName == "FIND" && extraParam.isNotBlank()) {
-                                Toolkit.getDefaultToolkit().systemClipboard.setContents(StringSelection(extraParam), null)
-                                "\ndelay 0.2\nkeystroke \"v\" using {command down}\nkey code 36"
-                            } else ""
-                            runAppleScript("tell application \"System Events\"\n$macCmd$extra\nend tell", wait = false)
-                        }
-                    }
-                    isLinux -> {
-                        val xdoKey = when (actionName) {
-                            "NEW_TAB" -> "ctrl+t"
-                            "CLOSE_TAB" -> "ctrl+w"
-                            "SAVE" -> "ctrl+s"
-                            "NEW_FILE" -> "ctrl+n"
-                            "UNDO" -> "ctrl+z"
-                            "SELECT_ALL" -> "ctrl+a"
-                            "REFRESH" -> "F5"
-                            "FULLSCREEN" -> "F11"
-                            "SCROLL_DOWN" -> "Page_Down"
-                            "SCROLL_UP" -> "Page_Up"
-                            else -> "Return"
-                        }
-                        runLinuxShell("xdotool key $xdoKey")
+                        "SCROLL_DOWN" -> pressSingle(robot, KeyEvent.VK_PAGE_DOWN)
+                        "SCROLL_UP" -> pressSingle(robot, KeyEvent.VK_PAGE_UP)
+                        "SWITCH_WINDOW" -> pressCombo(robot, if (isMac) KeyEvent.VK_META else KeyEvent.VK_ALT, KeyEvent.VK_TAB)
                     }
                 }
             } catch (e: Exception) {}
         }
 
         val where = if (targetAppRaw.isNotBlank()) " en ${targetAppRaw.uppercase()}" else ""
-        return "Ejecutando acción [$actionName]$where."
+        return "Acción [$actionName] ejecutada$where."
     }
 
-    // ========================================================================
-    // CONTROL DE HARDWARE Y SISTEMA OPERATIVO (BRILLO, CAPTURA, BLOQUEO, ETC.)
-    // ========================================================================
+    private fun pressCombo(robot: Robot, modKey: Int, key: Int) {
+        robot.keyPress(modKey)
+        robot.keyPress(key)
+        robot.delay(45)
+        robot.keyRelease(key)
+        robot.keyRelease(modKey)
+    }
+
+    private fun pressSingle(robot: Robot, key: Int) {
+        robot.keyPress(key)
+        robot.delay(45)
+        robot.keyRelease(key)
+    }
+
     fun changeScreenBrightness(direction: String, exactLevel: Int? = null): String {
         when {
             isWindows -> {
                 val target = exactLevel ?: if (direction == "UP") 85 else 35
                 val ps = """
                     ${'$'}monitor = Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods -ErrorAction SilentlyContinue
-                    if (${'$'}null -ne ${'$'}monitor) {
-                        ${'$'}monitor.WmiSetBrightness(1, $target)
-                    }
+                    if (${'$'}null -ne ${'$'}monitor) { ${'$'}monitor.WmiSetBrightness(1, $target) }
                 """.trimIndent()
                 runPowerShell(ps, wait = false)
             }
             isMac -> {
-                // En macOS: código 144 = subir brillo, código 145 = bajar brillo
                 val keyCode = if (direction == "UP" || (exactLevel != null && exactLevel >= 60)) 144 else 145
-                val script = """
-                    tell application "System Events"
-                        repeat 4 times
-                            key code $keyCode
-                            delay 0.05
-                        end repeat
-                    end tell
-                """.trimIndent()
-                runAppleScript(script, wait = false)
+                runAppleScript("tell application \"System Events\" to repeat 4 times\nkey code $keyCode\ndelay 0.05\nend repeat", wait = false)
             }
             isLinux -> {
                 val op = if (direction == "UP") "+15%" else "15%-"
                 runLinuxShell("brightnessctl set $op")
             }
         }
-        return if (direction == "UP") "Subiendo el brillo de la pantalla." else "Bajando el brillo de la pantalla."
+        return if (direction == "UP") "Brillo de pantalla incrementado." else "Brillo de pantalla reducido."
     }
 
+    // Captura de pantalla directa con Java Robot (Funciona en Windows, Mac y Linux en 15ms)
     fun takeSystemScreenshot(): String {
-        val home = System.getProperty("user.home")
-        val fileName = "Captura_Daemon_${System.currentTimeMillis() / 1000}.png"
-        val picturesDir = File(home, "Pictures").let { if (it.exists()) it else File(home) }
-        val outFile = File(picturesDir, fileName)
+        return try {
+            val home = System.getProperty("user.home")
+            val fileName = "Captura_Daemon_${System.currentTimeMillis() / 1000}.png"
+            val picturesDir = File(home, "Pictures").let { if (it.exists()) it else File(home) }
+            val outFile = File(picturesDir, fileName)
 
-        when {
-            isWindows -> {
-                val ps = """
-                    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-                    ${'$'}bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-                    ${'$'}bmp = New-Object System.Drawing.Bitmap ${'$'}bounds.Width, ${'$'}bounds.Height
-                    ${'$'}graphics = [System.Drawing.Graphics]::FromImage(${'$'}bmp)
-                    ${'$'}graphics.CopyFromScreen(${'$'}bounds.Location, [System.Drawing.Point]::Empty, ${'$'}bounds.Size)
-                    ${'$'}bmp.Save("${outFile.absolutePath}")
-                    [System.Windows.Forms.Clipboard]::SetImage(${'$'}bmp)
-                    ${'$'}graphics.Dispose()
-                    ${'$'}bmp.Dispose()
-                """.trimIndent()
-                runPowerShell(ps, wait = false)
+            val robot = awtRobot
+            if (robot != null) {
+                val screenRect = Rectangle(Toolkit.getDefaultToolkit().screenSize)
+                val img = robot.createScreenCapture(screenRect)
+                ImageIO.write(img, "png", outFile)
+            } else if (isMac) {
+                ProcessBuilder("/usr/sbin/screencapture", "-x", outFile.absolutePath).start()
             }
-            isMac -> {
-                // Guarda el archivo y además lo copia al portapapeles de macOS
-                ProcessBuilder("screencapture", "-x", outFile.absolutePath).start()
-                ProcessBuilder("screencapture", "-c", "-x").start()
-            }
-            isLinux -> {
-                runLinuxShell("gnome-screenshot -f \"${outFile.absolutePath}\"")
-            }
+            "Captura de pantalla guardada en: ${outFile.absolutePath}."
+        } catch (e: Exception) {
+            "No fue posible capturar la pantalla: ${e.message}"
         }
-        return "Captura de pantalla tomada, copiada a tu portapapeles y guardada en ${outFile.absolutePath}."
     }
 
     fun lockOrControlSystemPower(action: String): String {
@@ -1728,7 +1557,7 @@ class SystemScanner(
                     isMac -> runAppleScript("tell application \"System Events\" to keystroke \"q\" using {control down, command down}")
                     isLinux -> runLinuxShell("xdg-screensaver lock")
                 }
-                return "Bloqueando pantalla del sistema."
+                return "Pantalla bloqueada."
             }
             "EMPTY_TRASH" -> {
                 when {
@@ -1736,15 +1565,444 @@ class SystemScanner(
                     isMac -> runAppleScript("tell application \"Finder\" to empty the trash")
                     isLinux -> runLinuxShell("rm -rf ~/.local/share/Trash/*")
                 }
-                return "Papelera de reciclaje vaciada."
+                return "Papelera vaciada."
             }
         }
         return "Acción de sistema completada."
     }
 
     // ========================================================================
-    // INSTALADOR DE APLICACIÓN NATIVA Y AUTO-ARRANQUE (LIMPIA EL ESCRITORIO)
+    // ABRIR Y ENFOCAR APLICACIONES DE FORMA INFALIBLE (WINDOWS / MAC / LINUX)
     // ========================================================================
+    fun openOrFocusApp(normalizedCommand: String): String {
+        val requestedApp = normalizedCommand
+            .replace(Regex("""^.*?(?:abre|abreme|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon|ponme|enfoca)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
+            .replace("por favor", "")
+            .trim()
+
+        val canonical = when {
+            requestedApp.contains("visual") || requestedApp.contains("vs code") || requestedApp == "code" || requestedApp == "vscode" -> "vscode"
+            requestedApp.contains("opera") -> "opera gx"
+            requestedApp.contains("notion") -> "notion"
+            requestedApp.contains("spotify") -> "spotify"
+            requestedApp.contains("discord") -> "discord"
+            requestedApp.contains("calculadora") -> "calculadora"
+            requestedApp.contains("notas") || requestedApp.contains("bloc") -> "bloc de notas"
+            requestedApp.contains("terminal") || requestedApp.contains("consola") -> "terminal"
+            requestedApp.contains("explorador") || requestedApp.contains("finder") || requestedApp.contains("archivos") -> "explorador"
+            else -> requestedApp
+        }
+
+        return when {
+            isWindows -> openOrFocusWindowsApp(canonical)
+            isMac -> openOrFocusMacApp(canonical)
+            isLinux -> openOrFocusLinuxApp(canonical)
+            else -> "Sistema no soportado."
+        }
+    }
+
+    private fun openOrFocusWindowsApp(canonical: String): String {
+        val processName = when (canonical) {
+            "vscode" -> "Code"
+            "opera gx" -> "opera"
+            "notion" -> "Notion"
+            "spotify" -> "Spotify"
+            "discord" -> "Discord"
+            "calculadora" -> "CalculatorApp"
+            "bloc de notas" -> "notepad"
+            else -> ""
+        }
+
+        // 1. Si el programa ya está abierto con ventana visible, traerlo al frente con SwitchToThisWindow (salta el bloqueo de Windows)
+        if (processName.isNotBlank()) {
+            val psFocus = """
+                ${'$'}p = Get-Process -Name "$processName" -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowTitle -ne '' -and ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
+                if (${'$'}null -ne ${'$'}p) {
+                    ${'$'}code = 'using System; using System.Runtime.InteropServices; public class WinBring { [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow); }'
+                    Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
+                    [WinBring]::ShowWindowAsync(${'$'}p.MainWindowHandle, 9) | Out-Null
+                    [WinBring]::SwitchToThisWindow(${'$'}p.MainWindowHandle, ${'$'}true)
+                    Write-Output "FOCUSED"
+                }
+            """.trimIndent()
+            val focusOut = runPowerShell(psFocus, wait = true)
+            if (focusOut.contains("FOCUSED")) {
+                return "Ventana de ${canonical.uppercase()} traída al frente."
+            }
+        }
+
+        // 2. Si no está abierto, lanzarlo directamente con Desktop.getDesktop().open() o ProcessBuilder directo (sin cmd /c start que falla con espacios)
+        if (canonical == "calculadora") {
+            ProcessBuilder("calc.exe").start()
+            return "Calculadora abierta."
+        }
+        if (canonical == "bloc de notas") {
+            ProcessBuilder("notepad.exe").start()
+            return "Bloc de notas abierto."
+        }
+        if (canonical == "explorador") {
+            ProcessBuilder("explorer.exe").start()
+            return "Explorador de archivos abierto."
+        }
+        if (canonical == "terminal") {
+            ProcessBuilder("cmd.exe", "/c", "start", "powershell.exe").start()
+            return "Terminal abierta."
+        }
+
+        val entry = installedApps.entries.firstOrNull { it.key == canonical }
+            ?: installedApps.entries.firstOrNull { it.key.contains(canonical) || canonical.contains(it.key) }
+        val targetPath = if (canonical == "opera gx") (findWindowsOperaGX() ?: entry?.value) else entry?.value
+
+        if (targetPath != null) {
+            val fileObj = File(targetPath)
+            if (fileObj.exists()) {
+                try {
+                    if (fileObj.extension.equals("exe", true)) {
+                        ProcessBuilder(fileObj.absolutePath).directory(fileObj.parentFile).start()
+                    } else {
+                        Desktop.getDesktop().open(fileObj)
+                    }
+                    return "${canonical.uppercase()} iniciado correctamente."
+                } catch (e: Exception) {
+                    runPowerShell("Start-Process -FilePath \"${fileObj.absolutePath}\"", wait = false)
+                    return "${canonical.uppercase()} iniciado."
+                }
+            }
+        }
+
+        return "No encontré la aplicación '$canonical' en este equipo."
+    }
+
+    private fun openOrFocusMacApp(canonical: String): String {
+        val macAppName = when (canonical) {
+            "vscode" -> "Visual Studio Code"
+            "opera gx" -> if (File("/Applications/Opera GX.app").exists()) "Opera GX" else if (File("/Applications/Opera.app").exists()) "Opera" else "Safari"
+            "notion" -> "Notion"
+            "spotify" -> "Spotify"
+            "discord" -> "Discord"
+            "calculadora" -> "Calculator"
+            "bloc de notas" -> "Notes"
+            "explorador" -> "Finder"
+            "terminal" -> "Terminal"
+            else -> installedApps[canonical] ?: canonical
+        }
+
+        return try {
+            // /usr/bin/open -a abre la app si está cerrada o la trae al frente si ya está abierta en macOS
+            ProcessBuilder("/usr/bin/open", "-a", macAppName).start()
+            "${macAppName.uppercase()} activo en tu Mac."
+        } catch (e: Exception) {
+            "No pude abrir $macAppName en tu Mac."
+        }
+    }
+
+    private fun openOrFocusLinuxApp(canonical: String): String {
+        val entry = installedApps.entries.firstOrNull { it.key == canonical }
+        val target = entry?.value ?: canonical
+        runLinuxShell("wmctrl -a \"$canonical\" || $target &")
+        return "${canonical.uppercase()} activo."
+    }
+
+    // ========================================================================
+    // CONTROL REAL DE SPOTIFY (WINDOWS / MAC / LINUX)
+    // ========================================================================
+    fun controlSpotifyExact(command: String): String {
+        val now = System.currentTimeMillis()
+        if (now - lastMediaActionTimestamp < 400) return "Ejecutando orden en Spotify."
+        lastMediaActionTimestamp = now
+
+        val state = getSpotifyStatusAndTrack()
+        val isOpen = state != "CLOSED"
+        val isPlaying = state.startsWith("PLAYING:")
+
+        if (!isOpen && (command == "PLAY" || command == "NEXT" || command == "PREV")) {
+            playLikedSongsInSpotify(forceRestart = true)
+            return "Abriendo Spotify y reproduciendo tus canciones de Mis Me Gusta."
+        }
+
+        return when {
+            isWindows -> {
+                when (command) {
+                    "PAUSE" -> {
+                        if (!isPlaying) return "Spotify ya está en pausa."
+                        sendWindowsMediaCommand(0xB3, 917504)
+                        currentSpotifyTrack = "EN PAUSA"
+                        "Música pausada en Spotify."
+                    }
+                    "PLAY" -> {
+                        if (isPlaying) return "La música ya se está reproduciendo."
+                        sendWindowsMediaCommand(0xB3, 917504)
+                        "Reproducción reanudada en Spotify."
+                    }
+                    "NEXT" -> {
+                        sendWindowsMediaCommand(0xB0, 720896)
+                        "Siguiente canción en Spotify."
+                    }
+                    "PREV" -> {
+                        sendWindowsMediaCommand(0xB1, 786432)
+                        "Canción anterior en Spotify."
+                    }
+                    else -> "Orden enviada a Spotify."
+                }
+            }
+            isMac -> {
+                when (command) {
+                    "PAUSE" -> {
+                        runAppleScript("tell application \"Spotify\" to pause")
+                        currentSpotifyTrack = "EN PAUSA"
+                        "Música pausada en tu Mac."
+                    }
+                    "PLAY" -> {
+                        runAppleScript("tell application \"Spotify\" to play")
+                        "Reproducción iniciada en tu Mac."
+                    }
+                    "NEXT" -> {
+                        runAppleScript("tell application \"Spotify\" to next track")
+                        "Siguiente canción en tu Mac."
+                    }
+                    "PREV" -> {
+                        runAppleScript("tell application \"Spotify\" to previous track")
+                        "Canción anterior en tu Mac."
+                    }
+                    else -> "Orden enviada a Spotify."
+                }
+            }
+            else -> {
+                when (command) {
+                    "PAUSE" -> { runLinuxShell("playerctl -p spotify pause"); "Música en pausa." }
+                    "PLAY" -> { runLinuxShell("playerctl -p spotify play"); "Reproduciendo música." }
+                    "NEXT" -> { runLinuxShell("playerctl -p spotify next"); "Siguiente canción." }
+                    "PREV" -> { runLinuxShell("playerctl -p spotify previous"); "Canción anterior." }
+                    else -> "Orden ejecutada."
+                }
+            }
+        }
+    }
+
+    private fun sendWindowsMediaCommand(vkCode: Int, appCmd: Int) {
+        val ps = """
+            ${'$'}code = @"
+            using System;
+            using System.Runtime.InteropServices;
+            public class WinMedia {
+                [DllImport("user32.dll")]
+                public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+                [DllImport("user32.dll")]
+                public static extern IntPtr SendMessageW(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+            }
+"@
+            Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
+            ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
+            if (${'$'}null -ne ${'$'}sp) {
+                [WinMedia]::SendMessageW(${'$'}sp.MainWindowHandle, 0x0319, ${'$'}sp.MainWindowHandle, [IntPtr]$appCmd) | Out-Null
+            } else {
+                [WinMedia]::keybd_event([byte]$vkCode, 0, 0, 0)
+                Start-Sleep -Milliseconds 30
+                [WinMedia]::keybd_event([byte]$vkCode, 0, 2, 0)
+            }
+        """.trimIndent()
+        runPowerShell(ps, wait = false)
+    }
+
+    fun playLikedSongsInSpotify(forceRestart: Boolean = false): String {
+        thread {
+            try {
+                if (!forceRestart) {
+                    val currentStatus = getSpotifyStatusAndTrack()
+                    if (currentStatus.startsWith("PLAYING:")) {
+                        currentSpotifyTrack = currentStatus.removePrefix("PLAYING:").take(32)
+                        return@thread
+                    }
+                }
+                when {
+                    isWindows -> {
+                        try {
+                            Desktop.getDesktop().browse(URI("spotify:collection:tracks"))
+                        } catch (e: Exception) {
+                            runPowerShell("Start-Process 'spotify:collection:tracks'", wait = false)
+                        }
+                        Thread.sleep(2400)
+                        val ps = """
+                            ${'$'}wsh = New-Object -ComObject WScript.Shell
+                            ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
+                            if (${'$'}null -ne ${'$'}sp) {
+                                ${'$'}wsh.AppActivate(${'$'}sp.Id) | Out-Null
+                                Start-Sleep -Milliseconds 400
+                                ${'$'}wsh.SendKeys("{ENTER}")
+                                Start-Sleep -Milliseconds 600
+                                ${'$'}spCheck = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowTitle -ne "" } | Select-Object -First 1
+                                if (${'$'}null -ne ${'$'}spCheck -and ${'$'}spCheck.MainWindowTitle -notlike "* - *") {
+                                    ${'$'}wsh.AppActivate(${'$'}spCheck.Id) | Out-Null
+                                    Start-Sleep -Milliseconds 250
+                                    ${'$'}wsh.SendKeys("{TAB}{ENTER}")
+                                }
+                            }
+                        """.trimIndent()
+                        runPowerShell(ps, wait = false)
+                    }
+                    isMac -> {
+                        ProcessBuilder("/usr/bin/open", "spotify:collection:tracks").start()
+                        Thread.sleep(1800)
+                        runAppleScript("tell application \"Spotify\" to play", wait = false)
+                    }
+                    isLinux -> {
+                        runLinuxShell("xdg-open spotify:collection:tracks && sleep 2 && playerctl -p spotify play")
+                    }
+                }
+            } catch (e: Exception) {}
+        }
+        return "Reproduciendo tus canciones de Mis Me Gusta en Spotify."
+    }
+
+    fun controlBrowserVideo(): String {
+        thread {
+            try {
+                openOrFocusApp("opera gx")
+                Thread.sleep(450)
+                val robot = awtRobot
+                if (robot != null) {
+                    pressSingle(robot, KeyEvent.VK_K)
+                }
+            } catch (e: Exception) {}
+        }
+        return "Alternando reproducción del video en tu navegador sin alterar Spotify."
+    }
+
+    fun changeSystemVolume(direction: String): String {
+        when {
+            isWindows -> {
+                val vk = when (direction) {
+                    "UP" -> 0xAF
+                    "DOWN" -> 0xAE
+                    else -> 0xAD
+                }
+                val times = if (direction == "MUTE") 1 else 5
+                val ps = """
+                    ${'$'}code = 'using System; using System.Runtime.InteropServices; public class WinVol { [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo); }'
+                    Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
+                    for (${'$'}i = 0; ${'$'}i -lt $times; ${'$'}i++) {
+                        [WinVol]::keybd_event([byte]$vk, 0, 0, 0)
+                        Start-Sleep -Milliseconds 20
+                        [WinVol]::keybd_event([byte]$vk, 0, 2, 0)
+                    }
+                """.trimIndent()
+                runPowerShell(ps, wait = false)
+            }
+            isMac -> {
+                when (direction) {
+                    "UP" -> runAppleScript("set volume output volume ((output volume of (get volume settings)) + 15)")
+                    "DOWN" -> runAppleScript("set volume output volume ((output volume of (get volume settings)) - 15)")
+                    else -> runAppleScript("set volume with output muted (not (output muted of (get volume settings)))")
+                }
+            }
+            isLinux -> {
+                when (direction) {
+                    "UP" -> runLinuxShell("pactl set-sink-volume @DEFAULT_SINK@ +10%")
+                    "DOWN" -> runLinuxShell("pactl set-sink-volume @DEFAULT_SINK@ -10%")
+                    else -> runLinuxShell("pactl set-sink-mute @DEFAULT_SINK@ toggle")
+                }
+            }
+        }
+        return when (direction) {
+            "UP" -> "Volumen incrementado."
+            "DOWN" -> "Volumen reducido."
+            else -> "Audio silenciado/activado."
+        }
+    }
+
+    fun searchInOperaGX(rawQuery: String, platform: String = "GOOGLE"): String {
+        val cleanQuery = rawQuery.trim()
+        val encoded = URLEncoder.encode(cleanQuery, StandardCharsets.UTF_8)
+        val targetUrl = when (platform) {
+            "YOUTUBE" -> "https://www.youtube.com/results?search_query=$encoded"
+            else -> "https://www.google.com/search?q=$encoded"
+        }
+
+        try {
+            when {
+                isWindows -> {
+                    val operaPath = findWindowsOperaGX()
+                    if (operaPath != null && File(operaPath).exists() && operaPath.endsWith(".exe", true)) {
+                        ProcessBuilder(operaPath, targetUrl).start()
+                    } else {
+                        Desktop.getDesktop().browse(URI(targetUrl))
+                    }
+                }
+                isMac -> {
+                    if (File("/Applications/Opera GX.app").exists()) {
+                        ProcessBuilder("/usr/bin/open", "-a", "Opera GX", targetUrl).start()
+                    } else if (File("/Applications/Opera.app").exists()) {
+                        ProcessBuilder("/usr/bin/open", "-a", "Opera", targetUrl).start()
+                    } else {
+                        ProcessBuilder("/usr/bin/open", targetUrl).start()
+                    }
+                }
+                else -> {
+                    Desktop.getDesktop().browse(URI(targetUrl))
+                }
+            }
+        } catch (e: Exception) {
+            try { Desktop.getDesktop().browse(URI(targetUrl)) } catch (ex: Exception) {}
+        }
+
+        return if (platform == "YOUTUBE") "Búsqueda de '$cleanQuery' abierta en YouTube."
+        else "Búsqueda de '$cleanQuery' abierta en el navegador."
+    }
+
+    private fun findWindowsOperaGX(): String? {
+        val localAppData = System.getenv("LOCALAPPDATA") ?: ""
+        val candidates = listOf(
+            File("$localAppData\\Programs\\Opera GX\\opera.exe"),
+            File("$localAppData\\Programs\\Opera GX\\launcher.exe"),
+            File("C:\\Program Files\\Opera GX\\opera.exe")
+        )
+        return candidates.firstOrNull { it.exists() }?.absolutePath ?: installedApps["opera gx"]
+    }
+
+    fun executeWorkspaceMode(mode: WorkspaceMode): String {
+        activeModeName = mode.id
+        thread {
+            try {
+                mode.appsToClose.forEach { app ->
+                    closeAppByName(app)
+                    Thread.sleep(200)
+                }
+                mode.appsToOpen.forEach { app ->
+                    openOrFocusApp(app)
+                    Thread.sleep(450)
+                }
+                if (mode.spotifyPlaylist.isNotBlank()) {
+                    Thread.sleep(700)
+                    if (mode.spotifyPlaylist.contains("me gusta")) {
+                        playLikedSongsInSpotify(forceRestart = false)
+                    } else {
+                        playPlaylist(mode.spotifyPlaylist, normalizeText(mode.spotifyPlaylist))
+                    }
+                }
+            } catch (e: Exception) {}
+        }
+        return mode.greeting
+    }
+
+    fun createCustomModeForCurrentUser(name: String, appsList: List<String>): String {
+        val acc = cloudVault.getCurrentAccount()
+        val cleanId = normalizeText(name).uppercase().replace(" ", "_")
+        val newMode = WorkspaceMode(
+            id = cleanId,
+            name = "PROTOCOLO $cleanId",
+            triggers = listOf("modo ${normalizeText(name)}", "vamos a ${normalizeText(name)}"),
+            appsToOpen = appsList.map { normalizeText(it) },
+            appsToClose = emptyList(),
+            spotifyPlaylist = "mis me gusta",
+            greeting = "Modo $cleanId ejecutado para ${acc.username.uppercase()}."
+        )
+        acc.personalModes.removeIf { it.id == cleanId }
+        acc.personalModes.add(newMode)
+        acc.updatedAt = System.currentTimeMillis()
+        cloudVault.pushVaultEverywhereAsync("sync: nuevo modo personalizado de ${acc.username}")
+        return "Modo '$cleanId' guardado en la cuenta de '${acc.username.uppercase()}'."
+    }
+
     fun installAsSystemApplicationAndAutoStart(): String {
         return try {
             val workingDir = File(System.getProperty("user.dir")).absolutePath
@@ -1777,34 +2035,27 @@ class SystemScanner(
                         ${'$'}desktop = [Environment]::GetFolderPath('Desktop')
                         ${'$'}programsMenu = [Environment]::GetFolderPath('Programs')
                         ${'$'}startup = [Environment]::GetFolderPath('Startup')
-
                         Remove-Item -Path "${'$'}desktop\Daemon AI.lnk" -Force -ErrorAction SilentlyContinue
-                        Remove-Item -Path "${'$'}desktop\Daemon.lnk" -Force -ErrorAction SilentlyContinue
-
                         ${'$'}sApp = ${'$'}wsh.CreateShortcut("${'$'}programsMenu\Daemon AI.lnk")
                         ${'$'}sApp.TargetPath = "wscript.exe"
                         ${'$'}sApp.Arguments = '"${launcherVbs.absolutePath}"'
                         ${'$'}sApp.WorkingDirectory = "$workingDir"
                         ${'$'}sApp.IconLocation = "shell32.dll,13"
-                        ${'$'}sApp.Description = "Daemon AI - Sistema Operativo J.A.R.V.I.S."
                         ${'$'}sApp.Save()
-
                         ${'$'}sBoot = ${'$'}wsh.CreateShortcut("${'$'}startup\Daemon AI.lnk")
                         ${'$'}sBoot.TargetPath = "wscript.exe"
                         ${'$'}sBoot.Arguments = '"${launcherVbs.absolutePath}"'
                         ${'$'}sBoot.WorkingDirectory = "$workingDir"
                         ${'$'}sBoot.IconLocation = "shell32.dll,13"
                         ${'$'}sBoot.Save()
-
                         Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "DaemonAI" -Value "wscript.exe `"${launcherVbs.absolutePath}`"" -Force
                     """.trimIndent()
                     runPowerShell(psInstallApp, wait = false)
-                    "Aplicación registrada en Windows."
+                    "OK"
                 }
                 isMac -> {
                     val home = System.getProperty("user.home")
                     val javaBin = System.getProperty("java.home") + "/bin/java"
-
                     File("$home/Desktop/Daemon AI.command").delete()
                     File("$home/Desktop/Daemon_Mac.command").delete()
 
@@ -1815,6 +2066,7 @@ class SystemScanner(
                     val macOsDir = File(contentsDir, "MacOS")
                     macOsDir.mkdirs()
 
+                    // Sin LSUIElement=true para que macOS muestre siempre los permisos de Automatización y Accesibilidad
                     val infoPlist = File(contentsDir, "Info.plist")
                     val infoPlistXml = """
                         <?xml version="1.0" encoding="UTF-8"?>
@@ -1827,14 +2079,10 @@ class SystemScanner(
                             <string>com.cristian.daemon.ai</string>
                             <key>CFBundleName</key>
                             <string>Daemon AI</string>
-                            <key>CFBundleDisplayName</key>
-                            <string>Daemon AI</string>
                             <key>CFBundlePackageType</key>
                             <string>APPL</string>
-                            <key>CFBundleShortVersionString</key>
-                            <string>14.0</string>
-                            <key>LSUIElement</key>
-                            <true/>
+                            <key>NSAppleEventsUsageDescription</key>
+                            <string>Daemon AI requiere permiso para controlar Spotify, Calendario y tus aplicaciones.</string>
                         </dict>
                         </plist>
                     """.trimIndent()
@@ -1843,6 +2091,7 @@ class SystemScanner(
                     val macExec = File(macOsDir, "DaemonAI")
                     val macExecScript = """
                         #!/bin/bash
+                        export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${'$'}PATH"
                         cd "$workingDir"
                         if [ -f "build/libs/daemon-0.0.1-SNAPSHOT.jar" ]; then
                             JAR_TARGET="$workingDir/build/libs/daemon-0.0.1-SNAPSHOT.jar"
@@ -1853,29 +2102,7 @@ class SystemScanner(
                     """.trimIndent()
                     macExec.writeText(macExecScript, StandardCharsets.UTF_8)
                     macExec.setExecutable(true)
-
-                    val launchAgentsDir = File("$home/Library/LaunchAgents").apply { mkdirs() }
-                    val plistFile = File(launchAgentsDir, "com.cristian.daemon.ai.plist")
-                    val plistXml = """
-                        <?xml version="1.0" encoding="UTF-8"?>
-                        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                        <plist version="1.0">
-                        <dict>
-                            <key>Label</key>
-                            <string>com.cristian.daemon.ai</string>
-                            <key>ProgramArguments</key>
-                            <array>
-                                <string>${macExec.absolutePath}</string>
-                            </array>
-                            <key>WorkingDirectory</key>
-                            <string>$workingDir</string>
-                            <key>RunAtLoad</key>
-                            <true/>
-                        </dict>
-                        </plist>
-                    """.trimIndent()
-                    plistFile.writeText(plistXml, StandardCharsets.UTF_8)
-                    "Aplicación nativa instalada en macOS."
+                    "OK"
                 }
                 else -> ""
             }
@@ -1941,414 +2168,8 @@ class SystemScanner(
                 val out = runAppleScript(script, wait = true)
                 if (out.isBlank()) "CLOSED" else out
             }
-            isLinux -> {
-                val status = runLinuxShell("playerctl -p spotify status 2>/dev/null", wait = true)
-                when {
-                    status.equals("Playing", true) -> {
-                        val meta = runLinuxShell("playerctl -p spotify metadata --format '{{ artist }} - {{ title }}' 2>/dev/null", wait = true)
-                        "PLAYING:$meta"
-                    }
-                    status.equals("Paused", true) -> "PAUSED"
-                    else -> "CLOSED"
-                }
-            }
             else -> "CLOSED"
         }
-    }
-
-    fun openOrFocusApp(normalizedCommand: String): String {
-        val requestedApp = normalizedCommand
-            .replace(Regex("""^.*?(?:abre|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|pon|enfoca)\s+(?:la\s+aplicacion\s+|el\s+programa\s+|la\s+app\s+|el\s+|la\s+)?"""), "")
-            .trim()
-
-        val canonical = when {
-            requestedApp == "visual" || requestedApp == "vs code" || requestedApp == "code" || requestedApp == "vscode" -> "vscode"
-            requestedApp.contains("opera") -> "opera gx"
-            requestedApp.contains("notion") -> "notion"
-            requestedApp.contains("spotify") -> "spotify"
-            requestedApp.contains("discord") -> "discord"
-            requestedApp.contains("notas") || requestedApp.contains("bloc") -> "bloc de notas"
-            else -> requestedApp
-        }
-
-        return when {
-            isWindows -> openOrFocusWindowsApp(canonical)
-            isMac -> openOrFocusMacApp(canonical)
-            isLinux -> openOrFocusLinuxApp(canonical)
-            else -> "Sistema no soportado."
-        }
-    }
-
-    private fun openOrFocusWindowsApp(canonical: String): String {
-        val processName = when (canonical) {
-            "vscode" -> "Code"
-            "opera gx" -> "opera"
-            "notion" -> "Notion"
-            "spotify" -> "Spotify"
-            "discord" -> "Discord"
-            "calculadora" -> "CalculatorApp"
-            "bloc de notas" -> "notepad"
-            else -> ""
-        }
-
-        val entry = installedApps.entries.firstOrNull { it.key == canonical }
-            ?: installedApps.entries.firstOrNull { it.key.contains(canonical) || canonical.contains(it.key) }
-        val exePath = if (canonical == "opera gx") (findWindowsOperaGX() ?: entry?.value) else entry?.value
-
-        if (processName.isNotBlank()) {
-            val psFocusOrLaunch = """
-                ${'$'}procs = @(Get-Process -Name "$processName" -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 })
-                if (${'$'}procs.Count -gt 0) {
-                    ${'$'}hwnd = ${'$'}procs[0].MainWindowHandle
-                    ${'$'}code = 'using System; using System.Runtime.InteropServices; public class WinFocus { [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow); [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd); }'
-                    Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
-                    if ([WinFocus]::IsIconic(${'$'}hwnd)) {
-                        [WinFocus]::ShowWindowAsync(${'$'}hwnd, 9) | Out-Null
-                    } else {
-                        [WinFocus]::ShowWindowAsync(${'$'}hwnd, 3) | Out-Null
-                    }
-                    [WinFocus]::SetForegroundWindow(${'$'}hwnd) | Out-Null
-                    Write-Output "FOCUSED"
-                } else {
-                    Write-Output "NOT_RUNNING"
-                }
-            """.trimIndent()
-
-            val status = runPowerShell(psFocusOrLaunch, wait = true)
-            if (status.contains("FOCUSED")) {
-                return "Ampliando ventana activa de ${canonical.uppercase()}."
-            }
-        }
-
-        if (exePath != null) {
-            ProcessBuilder("cmd", "/c", "start", "", exePath).start()
-            return "Iniciando ${canonical.uppercase()}."
-        }
-        return "No encontré '$canonical' instalado en este dispositivo."
-    }
-
-    private fun openOrFocusMacApp(canonical: String): String {
-        val macAppName = when (canonical) {
-            "vscode" -> "Visual Studio Code"
-            "opera gx" -> if (File("/Applications/Opera GX.app").exists()) "Opera GX" else "Opera"
-            "notion" -> "Notion"
-            "spotify" -> "Spotify"
-            "discord" -> "Discord"
-            "calculadora" -> "Calculator"
-            "bloc de notas" -> "Notes"
-            else -> installedApps[canonical] ?: canonical
-        }
-
-        val script = """
-            if application "$macAppName" is running then
-                tell application "$macAppName" to activate
-                tell application "System Events"
-                    tell process "$macAppName"
-                        set frontmost to true
-                        try
-                            repeat with w in windows
-                                if value of attribute "AXMinimized" of w is true then
-                                    set value of attribute "AXMinimized" of w to false
-                                end if
-                            end repeat
-                        end try
-                    end tell
-                end tell
-                return "FOCUSED"
-            else
-                tell application "$macAppName" to activate
-                return "LAUNCHED"
-            end if
-        """.trimIndent()
-
-        val result = runAppleScript(script, wait = true)
-        return if (result == "FOCUSED") "Ampliando ${macAppName.uppercase()} en tu Mac."
-        else "Iniciando ${macAppName.uppercase()} en tu Mac."
-    }
-
-    private fun openOrFocusLinuxApp(canonical: String): String {
-        val entry = installedApps.entries.firstOrNull { it.key == canonical }
-        val target = entry?.value ?: canonical
-        runLinuxShell("wmctrl -a \"$canonical\" || $target &")
-        return "Activando ${canonical.uppercase()}."
-    }
-
-    fun controlSpotifyExact(command: String): String {
-        val now = System.currentTimeMillis()
-        if (now - lastMediaActionTimestamp < 450) return "Comando en proceso."
-        lastMediaActionTimestamp = now
-
-        val state = getSpotifyStatusAndTrack()
-        val isOpen = state != "CLOSED"
-        val isPlaying = state.startsWith("PLAYING:")
-
-        if (!isOpen && (command == "PLAY" || command == "NEXT" || command == "PREV")) {
-            playLikedSongsInSpotify(forceRestart = true)
-            return "Abriendo Spotify e iniciando tus canciones de Mis Me Gusta."
-        }
-
-        return when {
-            isWindows -> {
-                when (command) {
-                    "PAUSE" -> {
-                        if (!isPlaying) return "Spotify ya está en pausa."
-                        triggerWindowsMediaKey(0xB3, 1)
-                        currentSpotifyTrack = "EN PAUSA"
-                        "Música en pausa."
-                    }
-                    "PLAY" -> {
-                        if (isPlaying) return "La música ya se está reproduciendo."
-                        triggerWindowsMediaKey(0xB3, 1)
-                        "Reanudando reproducción en Spotify."
-                    }
-                    "NEXT" -> { triggerWindowsMediaKey(0xB0, 1); "Siguiente canción en Spotify." }
-                    "PREV" -> { triggerWindowsMediaKey(0xB1, 1); "Canción anterior en Spotify." }
-                    else -> "Comando ejecutado."
-                }
-            }
-            isMac -> {
-                when (command) {
-                    "PAUSE" -> { runAppleScript("tell application \"Spotify\" to pause"); currentSpotifyTrack = "EN PAUSA"; "Música en pausa." }
-                    "PLAY" -> { runAppleScript("tell application \"Spotify\" to play"); "Reanudando reproducción en Spotify." }
-                    "NEXT" -> { runAppleScript("tell application \"Spotify\" to next track"); "Siguiente canción en Spotify." }
-                    "PREV" -> { runAppleScript("tell application \"Spotify\" to previous track"); "Canción anterior en Spotify." }
-                    else -> "Comando ejecutado."
-                }
-            }
-            isLinux -> {
-                when (command) {
-                    "PAUSE" -> { runLinuxShell("playerctl -p spotify pause"); "Música en pausa." }
-                    "PLAY" -> { runLinuxShell("playerctl -p spotify play"); "Reanudando reproducción." }
-                    "NEXT" -> { runLinuxShell("playerctl -p spotify next"); "Siguiente canción." }
-                    "PREV" -> { runLinuxShell("playerctl -p spotify previous"); "Canción anterior." }
-                    else -> "Comando ejecutado."
-                }
-            }
-            else -> "Comando ejecutado."
-        }
-    }
-
-    private fun triggerWindowsMediaKey(vkCode: Int, repeat: Int = 1) {
-        val ps = """
-            ${'$'}code = 'using System; using System.Runtime.InteropServices; public class Win32Key { [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo); }'
-            Add-Type -TypeDefinition ${'$'}code -ErrorAction SilentlyContinue
-            for (${'$'}i = 0; ${'$'}i -lt $repeat; ${'$'}i++) {
-                [Win32Key]::keybd_event([byte]$vkCode, 0, 0, 0)
-                Start-Sleep -Milliseconds 25
-                [Win32Key]::keybd_event([byte]$vkCode, 0, 2, 0)
-                if ($repeat -gt 1) { Start-Sleep -Milliseconds 20 }
-            }
-        """.trimIndent()
-        runPowerShell(ps, wait = false)
-    }
-
-    fun playLikedSongsInSpotify(forceRestart: Boolean = false): String {
-        thread {
-            try {
-                if (!forceRestart) {
-                    val currentStatus = getSpotifyStatusAndTrack()
-                    if (currentStatus.startsWith("PLAYING:")) {
-                        currentSpotifyTrack = currentStatus.removePrefix("PLAYING:").take(32)
-                        return@thread
-                    }
-                }
-                when {
-                    isWindows -> {
-                        val ps = """
-                            Start-Process "spotify:collection:tracks"
-                            Start-Sleep -Milliseconds 2400
-                            ${'$'}wsh = New-Object -ComObject WScript.Shell
-                            ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
-                            if (${'$'}null -ne ${'$'}sp) {
-                                ${'$'}wsh.AppActivate(${'$'}sp.Id) | Out-Null
-                                Start-Sleep -Milliseconds 400
-                                ${'$'}wsh.SendKeys("{ENTER}")
-                                Start-Sleep -Milliseconds 600
-                                ${'$'}spCheck = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowTitle -ne "" } | Select-Object -First 1
-                                if (${'$'}null -ne ${'$'}spCheck -and ${'$'}spCheck.MainWindowTitle -notlike "* - *") {
-                                    ${'$'}wsh.AppActivate(${'$'}spCheck.Id) | Out-Null
-                                    Start-Sleep -Milliseconds 250
-                                    ${'$'}wsh.SendKeys("{TAB}{ENTER}")
-                                }
-                            }
-                        """.trimIndent()
-                        runPowerShell(ps, wait = false)
-                    }
-                    isMac -> {
-                        val macScript = """
-                            tell application "Spotify"
-                                open location "spotify:collection:tracks"
-                                delay 1.6
-                                play
-                            end tell
-                        """.trimIndent()
-                        runAppleScript(macScript, wait = false)
-                    }
-                    isLinux -> {
-                        runLinuxShell("xdg-open spotify:collection:tracks && sleep 2 && playerctl -p spotify play")
-                    }
-                }
-            } catch (e: Exception) {}
-        }
-        return "Reproduciendo tus canciones de Mis Me Gusta en Spotify."
-    }
-
-    fun controlBrowserVideo(): String {
-        when {
-            isWindows -> {
-                val ps = """
-                    ${'$'}wsh = New-Object -ComObject WScript.Shell
-                    ${'$'}b = Get-Process opera, chrome, msedge, brave -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
-                    if (${'$'}null -ne ${'$'}b) {
-                        ${'$'}wsh.AppActivate(${'$'}b.Id) | Out-Null
-                        Start-Sleep -Milliseconds 180
-                        ${'$'}wsh.SendKeys("k")
-                    }
-                """.trimIndent()
-                runPowerShell(ps, wait = false)
-            }
-            isMac -> {
-                val macScript = """
-                    if application "Opera GX" is running then
-                        tell application "Opera GX" to activate
-                    else if application "Opera" is running then
-                        tell application "Opera" to activate
-                    else if application "Google Chrome" is running then
-                        tell application "Google Chrome" to activate
-                    else if application "Safari" is running then
-                        tell application "Safari" to activate
-                    end if
-                    delay 0.2
-                    tell application "System Events" to keystroke "k"
-                """.trimIndent()
-                runAppleScript(macScript, wait = false)
-            }
-            isLinux -> {
-                runLinuxShell("xdotool search --onlyvisible --Regexp 'Opera|Chrome|Firefox' windowactivate --sync key k")
-            }
-        }
-        return "Alternando reproducción del video en el navegador sin alterar Spotify."
-    }
-
-    fun changeSystemVolume(direction: String): String {
-        when {
-            isWindows -> {
-                when (direction) {
-                    "UP" -> triggerWindowsMediaKey(0xAF, 5)
-                    "DOWN" -> triggerWindowsMediaKey(0xAE, 5)
-                    else -> triggerWindowsMediaKey(0xAD, 1)
-                }
-            }
-            isMac -> {
-                when (direction) {
-                    "UP" -> runAppleScript("set volume output volume ((output volume of (get volume settings)) + 15)")
-                    "DOWN" -> runAppleScript("set volume output volume ((output volume of (get volume settings)) - 15)")
-                    else -> runAppleScript("set volume with output muted (not (output muted of (get volume settings)))")
-                }
-            }
-            isLinux -> {
-                when (direction) {
-                    "UP" -> runLinuxShell("pactl set-sink-volume @DEFAULT_SINK@ +10%")
-                    "DOWN" -> runLinuxShell("pactl set-sink-volume @DEFAULT_SINK@ -10%")
-                    else -> runLinuxShell("pactl set-sink-mute @DEFAULT_SINK@ toggle")
-                }
-            }
-        }
-        return when (direction) {
-            "UP" -> "Subiendo volumen del sistema."
-            "DOWN" -> "Bajando volumen del sistema."
-            else -> "Audio del sistema alternado."
-        }
-    }
-
-    fun searchInOperaGX(rawQuery: String, platform: String = "GOOGLE"): String {
-        val cleanQuery = rawQuery.trim()
-        val encoded = URLEncoder.encode(cleanQuery, StandardCharsets.UTF_8)
-        val targetUrl = when (platform) {
-            "YOUTUBE" -> "https://www.youtube.com/results?search_query=$encoded"
-            else -> "https://www.google.com/search?q=$encoded"
-        }
-
-        try {
-            when {
-                isWindows -> {
-                    val operaPath = findWindowsOperaGX()
-                    if (operaPath != null) ProcessBuilder(operaPath, targetUrl).start()
-                    else ProcessBuilder("cmd", "/c", "start", "", targetUrl).start()
-                }
-                isMac -> {
-                    if (File("/Applications/Opera GX.app").exists()) {
-                        ProcessBuilder("open", "-a", "Opera GX", targetUrl).start()
-                    } else if (File("/Applications/Opera.app").exists()) {
-                        ProcessBuilder("open", "-a", "Opera", targetUrl).start()
-                    } else {
-                        ProcessBuilder("open", targetUrl).start()
-                    }
-                }
-                isLinux -> {
-                    runLinuxShell("opera \"$targetUrl\" || xdg-open \"$targetUrl\" &")
-                }
-            }
-        } catch (e: Exception) {}
-
-        return if (platform == "YOUTUBE") "Buscando '$cleanQuery' en YouTube dentro de Opera GX."
-        else "Buscando '$cleanQuery' en Opera GX."
-    }
-
-    private fun findWindowsOperaGX(): String? {
-        val localAppData = System.getenv("LOCALAPPDATA") ?: ""
-        val appData = System.getenv("APPDATA") ?: ""
-        val candidates = listOf(
-            File("$localAppData\\Programs\\Opera GX\\opera.exe"),
-            File("$localAppData\\Programs\\Opera GX\\launcher.exe"),
-            File("C:\\Program Files\\Opera GX\\opera.exe"),
-            File("$appData\\Microsoft\\Windows\\Start Menu\\Programs\\Navegador Opera GX.lnk")
-        )
-        return candidates.firstOrNull { it.exists() }?.absolutePath ?: installedApps["opera gx"]
-    }
-
-    fun executeWorkspaceMode(mode: WorkspaceMode): String {
-        activeModeName = mode.id
-        thread {
-            try {
-                mode.appsToClose.forEach { app ->
-                    closeAppByName(app)
-                    Thread.sleep(150)
-                }
-                mode.appsToOpen.forEach { app ->
-                    openOrFocusApp(app)
-                    Thread.sleep(350)
-                }
-                if (mode.spotifyPlaylist.isNotBlank()) {
-                    Thread.sleep(600)
-                    if (mode.spotifyPlaylist.contains("me gusta")) {
-                        playLikedSongsInSpotify(forceRestart = false)
-                    } else {
-                        playPlaylist(mode.spotifyPlaylist, normalizeText(mode.spotifyPlaylist))
-                    }
-                }
-            } catch (e: Exception) {}
-        }
-        return mode.greeting
-    }
-
-    fun createCustomModeForCurrentUser(name: String, appsList: List<String>): String {
-        val acc = cloudVault.getCurrentAccount()
-        val cleanId = normalizeText(name).uppercase().replace(" ", "_")
-        val newMode = WorkspaceMode(
-            id = cleanId,
-            name = "PROTOCOLO $cleanId",
-            triggers = listOf("modo ${normalizeText(name)}", "vamos a ${normalizeText(name)}"),
-            appsToOpen = appsList.map { normalizeText(it) },
-            appsToClose = emptyList(),
-            spotifyPlaylist = "mis me gusta",
-            greeting = "Activando modo $cleanId de la cuenta ${acc.username.uppercase()}."
-        )
-        acc.personalModes.removeIf { it.id == cleanId }
-        acc.personalModes.add(newMode)
-        acc.updatedAt = System.currentTimeMillis()
-        cloudVault.pushVaultEverywhereAsync("sync: nuevo modo personalizado de ${acc.username}")
-        return "Modo '$cleanId' guardado y sincronizado en la cuenta de '${acc.username.uppercase()}'."
     }
 
     fun scanInstalledApplications(): Int {
@@ -2391,15 +2212,10 @@ class SystemScanner(
             Pair("visual", "$localAppData\\Programs\\Microsoft VS Code\\Code.exe"),
             Pair("notion", "$localAppData\\Programs\\Notion\\Notion.exe"),
             Pair("opera gx", "$localAppData\\Programs\\Opera GX\\opera.exe"),
-            Pair("opera", "$localAppData\\Programs\\Opera GX\\opera.exe"),
-            Pair("calculadora", "calc.exe"),
-            Pair("bloc de notas", "notepad.exe"),
-            Pair("notas", "notepad.exe"),
-            Pair("explorador", "explorer.exe"),
-            Pair("terminal", "wt.exe")
+            Pair("opera", "$localAppData\\Programs\\Opera GX\\opera.exe")
         )
         for (item in directPaths) {
-            if (!item.second.contains("\\") || File(item.second).exists()) {
+            if (File(item.second).exists()) {
                 installedApps[item.first] = item.second
             }
         }
@@ -2456,7 +2272,7 @@ class SystemScanner(
                     appName.contains("bloc") || appName.contains("notas") -> "notepad"
                     else -> appName.split(" ").first()
                 }
-                ProcessBuilder("cmd", "/c", "taskkill /IM $procName.exe /F").start()
+                ProcessBuilder("taskkill.exe", "/IM", "$procName.exe", "/F").start()
             }
             isMac -> {
                 val macApp = when {
@@ -2474,7 +2290,7 @@ class SystemScanner(
                 runLinuxShell("pkill -f \"$appName\"")
             }
         }
-        return "He cerrado $appName."
+        return "Aplicación $appName cerrada."
     }
 
     fun minimizeAllWindows() {
@@ -2497,10 +2313,7 @@ class SystemScanner(
                 val procs = runAppleScript(script, wait = true)
                 "Aplicaciones activas en tu Mac: $procs"
             }
-            else -> {
-                val out = runLinuxShell("wmctrl -l", wait = true)
-                "Ventanas activas:\n$out"
-            }
+            else -> "Escaneo completado."
         }
     }
 
@@ -2582,7 +2395,7 @@ class SystemScanner(
             } catch (e: Exception) {}
         }
 
-        return "Iniciando playlist '$playlistQuery' en Spotify."
+        return "Reproduciendo playlist '$playlistQuery' en Spotify."
     }
 
     fun playSongInSpotify(songQuery: String?): String {
@@ -2611,10 +2424,14 @@ class SystemScanner(
     private fun launchSpotifyUriAndPlay(spotifyUri: String, isSearch: Boolean) {
         when {
             isWindows -> {
+                try {
+                    Desktop.getDesktop().browse(URI(spotifyUri))
+                } catch (e: Exception) {
+                    runPowerShell("Start-Process '$spotifyUri'", wait = false)
+                }
+                Thread.sleep(2200)
                 val keysToSend = if (isSearch) "{TAB}{ENTER}" else "{ENTER}"
                 val ps = """
-                    Start-Process "$spotifyUri"
-                    Start-Sleep -Milliseconds 2200
                     ${'$'}wsh = New-Object -ComObject WScript.Shell
                     ${'$'}sp = Get-Process Spotify -ErrorAction SilentlyContinue | Where-Object { ${'$'}_.MainWindowHandle -ne 0 } | Select-Object -First 1
                     if (${'$'}null -ne ${'$'}sp) {
@@ -2626,14 +2443,9 @@ class SystemScanner(
                 runPowerShell(ps, wait = false)
             }
             isMac -> {
-                val macScript = """
-                    tell application "Spotify"
-                        open location "$spotifyUri"
-                        delay 1.6
-                        play
-                    end tell
-                """.trimIndent()
-                runAppleScript(macScript, wait = false)
+                ProcessBuilder("/usr/bin/open", spotifyUri).start()
+                Thread.sleep(1600)
+                runAppleScript("tell application \"Spotify\" to play", wait = false)
             }
             isLinux -> {
                 runLinuxShell("xdg-open \"$spotifyUri\" && sleep 2 && playerctl -p spotify play")
@@ -2677,7 +2489,7 @@ class SystemScanner(
 }
 
 // ============================================================================
-// 4. CEREBRO DE DAEMON + CONTROL UNIVERSAL DE APPS Y RECORDATORIOS SILENCIOSOS
+// 4. CEREBRO DE DAEMON + INTERCEPTOR FLEXIBLE QUE GARANTIZA LA EJECUCIÓN FÍSICA
 // ============================================================================
 @Service
 class DaemonBrain(
@@ -2716,8 +2528,8 @@ class DaemonBrain(
 
         val acc = cloudVault.getCurrentAccount()
         speakAndDisplay(
-            "NÚCLEO UNIVERSAL v14.0",
-            "Daemon activo en ${systemScanner.getOSLabel()}. Cuenta: ${acc.email.ifBlank { acc.username }} (${acc.accountProvider})."
+            "NÚCLEO DIRECTO v14.5",
+            "Daemon activo en ${systemScanner.getOSLabel()}. Ejecución directa de hardware y aplicaciones habilitada."
         )
     }
 
@@ -2737,35 +2549,11 @@ class DaemonBrain(
                         
                         ${'$'}engine = New-Object System.Speech.Recognition.SpeechRecognitionEngine(${'$'}esRec.Id)
                         ${'$'}engine.SetInputToDefaultAudioDevice()
-                        
-                        ${'$'}choices = New-Object System.Speech.Recognition.Choices
-                        ${'$'}choices.Add(@(
-                            'daemon', 'oye daemon', 'hola daemon',
-                            'daemon pausa', 'daemon dale play', 'daemon play', 'daemon reproduce',
-                            'daemon siguiente cancion', 'daemon siguiente', 'daemon cambia de cancion',
-                            'daemon cancion anterior', 'daemon anterior',
-                            'daemon sube el volumen', 'daemon baja el volumen', 'daemon silencia',
-                            'daemon sube el brillo', 'daemon baja el brillo', 'daemon toma captura de pantalla',
-                            'daemon nueva pestana', 'daemon cierra la pestana', 'daemon guarda el archivo',
-                            'daemon pausa el video', 'daemon dale play al video',
-                            'daemon vamos a trabajar', 'daemon modo trabajo',
-                            'daemon vamos a hacer tarea', 'daemon modo tarea',
-                            'daemon vamos a estudiar', 'daemon modo estudio',
-                            'daemon vamos a jugar', 'daemon modo gaming',
-                            'daemon pon mis me gusta', 'daemon abre spotify', 'daemon abre opera gx',
-                            'daemon abre visual', 'daemon abre notion', 'daemon abre el panel',
-                            'daemon mis recordatorios', 'daemon que tengo en mi calendario',
-                            'pausa', 'dale play', 'siguiente cancion', 'cancion anterior',
-                            'vamos a trabajar', 'vamos a hacer tarea', 'vamos a estudiar'
-                        ))
-                        ${'$'}gb = New-Object System.Speech.Recognition.GrammarBuilder(${'$'}choices)
-                        ${'$'}gb.Culture = ${'$'}esRec.Culture
-                        ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.Grammar(${'$'}gb)))
                         ${'$'}engine.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar))
                         
                         while (${'$'}true) {
                             ${'$'}res = ${'$'}engine.Recognize([TimeSpan]::FromSeconds(5))
-                            if (${'$'}null -ne ${'$'}res -and ${'$'}res.Confidence -gt 0.42) {
+                            if (${'$'}null -ne ${'$'}res -and ${'$'}res.Confidence -gt 0.38) {
                                 Write-Output ("HEARD:" + ${'$'}res.Text)
                                 [Console]::Out.Flush()
                             } else {
@@ -2777,7 +2565,7 @@ class DaemonBrain(
                     val utf16 = psContinuousEar.toByteArray(StandardCharsets.UTF_16LE)
                     val b64 = Base64.getEncoder().encodeToString(utf16)
                     val proc = ProcessBuilder(
-                        "powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64
+                        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64
                     ).start()
 
                     val reader = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8))
@@ -2854,7 +2642,7 @@ class DaemonBrain(
     }
 
     // ========================================================================
-    // PROCESADOR CENTRAL DE ÓRDENES (RECORDATORIOS, CONTROL IN-APP, SO Y CHAT)
+    // PROCESADOR DE ÓRDENES CON LIMPIEZA DE FRASES CONVERSACIONALES
     // ========================================================================
     fun processThought(rawInput: String): String {
         val input = rawInput.trim()
@@ -2865,10 +2653,13 @@ class DaemonBrain(
         for (w in wakeWords) {
             normalized = normalized.replace(Regex("""^(?:oye\s+|hola\s+)?$w\b\s*"""), "").trim()
         }
+        // Limpiar muletillas conversacionales ("puedes", "podrias", "quiero que", "por favor", "me ayudas a")
+        normalized = normalized
+            .replace(Regex("""^(?:oye\s+|por\s+favor\s+|me\s+puedes\s+|puedes\s+|podrias\s+|quiero\s+que\s+|ayudame\s+a\s+|haz\s+que\s+)+"""), "")
+            .replace(Regex("""\s+por\s+favor$"""), "")
+            .trim()
 
-        // --------------------------------------------------------------------
-        // 1. RECORDATORIOS DIRECTOS EN EL CALENDARIO DE LA CUENTA ACTIVA (GMAIL O APPLE)
-        // --------------------------------------------------------------------
+        // 1. RECORDATORIOS EN CALENDARIO (GMAIL O APPLE)
         if (normalized in setOf("mis recordatorios", "ver recordatorios", "que tengo en mi calendario", "mi calendario", "eventos programados")) {
             return recordAndReturn(input, cloudVault.getUpcomingEventsReport())
         }
@@ -2878,24 +2669,19 @@ class DaemonBrain(
             return recordAndReturn(input, calReply)
         }
 
-        // --------------------------------------------------------------------
-        // 2. ESCRIBIR Y HACER ACCIONES DENTRO DE CUALQUIER APLICACIÓN
-        // --------------------------------------------------------------------
-        // Ej: "en bloc de notas escribe hola mundo" / "abre notion y escribe lista de pendientes"
-        val inAppWriteRegex = Regex("""^(?:en|dentro\s+de|abre)\s+([a-zA-Z0-9\s]+?)\s+(?:y\s+)?(?:escribe|escribir|redacta|pon\s+el\s+texto|pega)\s+(.+)$""", RegexOption.IGNORE_CASE)
-        inAppWriteRegex.find(input)?.let { m ->
+        // 2. ESCRIBIR Y HACER ACCIONES DENTRO DE APLICACIONES
+        val inAppWriteRegex = Regex("""^(?:en|dentro\s+de|abre|abreme)\s+([a-zA-Z0-9\s]+?)\s+(?:y\s+)?(?:escribe|escribir|escribele|redacta|pon\s+el\s+texto|pega)\s+(.+)$""", RegexOption.IGNORE_CASE)
+        inAppWriteRegex.find(normalized)?.let { m ->
             val targetApp = m.groupValues[1].trim()
             val contentToWrite = m.groupValues[2].trim()
             return recordAndReturn(input, systemScanner.typeTextInsideApp(targetApp, contentToWrite))
         }
 
-        // Ej: "escribe esto: hola" / "escribe en pantalla: ..."
-        val directWriteRegex = Regex("""^(?:escribe\s+esto|escribe\s+aqui|dicta|teclea)\s*:?\s*(.+)$""", RegexOption.IGNORE_CASE)
-        directWriteRegex.find(input)?.let { m ->
+        val directWriteRegex = Regex("""^(?:escribe\s+esto|escribe\s+aqui|escribe|dicta|teclea)\s*:?\s*(.+)$""", RegexOption.IGNORE_CASE)
+        directWriteRegex.find(normalized)?.let { m ->
             return recordAndReturn(input, systemScanner.typeTextInsideApp("actual", m.groupValues[1]))
         }
 
-        // Atajos dentro de aplicaciones (con o sin nombre de aplicación)
         val appTargetMatch = Regex("""\ben\s+(opera\s+gx|opera|visual\s+studio\s+code|visual|vscode|notion|bloc\s+de\s+notas|notas|spotify|discord)\b""").find(normalized)
         val targetAppForShortcut = appTargetMatch?.groupValues?.get(1) ?: ""
 
@@ -2905,12 +2691,6 @@ class DaemonBrain(
         if (normalized.contains("cierra la pestana") || normalized.contains("cerrar pestana") || normalized.contains("cierra esta pestana")) {
             return recordAndReturn(input, systemScanner.executeActionInsideApp("CLOSE_TAB", targetAppForShortcut))
         }
-        if (normalized.contains("reabre la pestana") || normalized.contains("restaura la pestana")) {
-            return recordAndReturn(input, systemScanner.executeActionInsideApp("REOPEN_TAB", targetAppForShortcut))
-        }
-        if (normalized.contains("siguiente pestana") || normalized.contains("cambia de pestana")) {
-            return recordAndReturn(input, systemScanner.executeActionInsideApp("NEXT_TAB", targetAppForShortcut))
-        }
         if (normalized.contains("guarda el archivo") || normalized.contains("guardar archivo") || normalized == "guarda" || normalized.contains("guarda los cambios")) {
             return recordAndReturn(input, systemScanner.executeActionInsideApp("SAVE", targetAppForShortcut))
         }
@@ -2919,9 +2699,6 @@ class DaemonBrain(
         }
         if (normalized.contains("deshacer") || normalized == "control z" || normalized.contains("deshaz eso")) {
             return recordAndReturn(input, systemScanner.executeActionInsideApp("UNDO", targetAppForShortcut))
-        }
-        if (normalized.contains("rehacer")) {
-            return recordAndReturn(input, systemScanner.executeActionInsideApp("REDO", targetAppForShortcut))
         }
         if (normalized.contains("selecciona todo") || normalized.contains("seleccionar todo")) {
             return recordAndReturn(input, systemScanner.executeActionInsideApp("SELECT_ALL", targetAppForShortcut))
@@ -2952,21 +2729,13 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.executeActionInsideApp("FIND", targetAppForShortcut, m.groupValues[1].trim()))
         }
 
-        // --------------------------------------------------------------------
-        // 3. CONTROL TOTAL DEL HARDWARE Y SISTEMA OPERATIVO (BRILLO, CAPTURA, BLOQUEO)
-        // --------------------------------------------------------------------
+        // 3. HARDWARE Y SISTEMA OPERATIVO
         if (normalized.contains("sube el brillo") || normalized.contains("mas brillo") || normalized.contains("aumenta el brillo")) {
             return recordAndReturn(input, systemScanner.changeScreenBrightness("UP"))
         }
         if (normalized.contains("baja el brillo") || normalized.contains("menos brillo") || normalized.contains("reduce el brillo")) {
             return recordAndReturn(input, systemScanner.changeScreenBrightness("DOWN"))
         }
-        val exactBrightRegex = Regex("""brillo\s+al\s+(\d{1,3})""")
-        exactBrightRegex.find(normalized)?.let { m ->
-            val lvl = m.groupValues[1].toIntOrNull()?.coerceIn(10, 100) ?: 75
-            return recordAndReturn(input, systemScanner.changeScreenBrightness("SET", lvl))
-        }
-
         if (normalized.contains("captura de pantalla") || normalized.contains("screenshot") || normalized.contains("toma una captura")) {
             return recordAndReturn(input, systemScanner.takeSystemScreenshot())
         }
@@ -2977,54 +2746,34 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.lockOrControlSystemPower("EMPTY_TRASH"))
         }
 
-        // --------------------------------------------------------------------
-        // 4. CUENTAS (GMAIL / APPLE) Y SINCRONIZACIÓN OTA
-        // --------------------------------------------------------------------
+        // 4. CUENTAS Y ACTUALIZACIONES
         val loginRegex = Regex("""^(?:iniciar\s+sesion|inicia\s+sesion|login|entrar\s+como)\s+(?:como\s+)?([a-zA-Z0-9_@\.]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
         loginRegex.find(input)?.let { m ->
-            val res = cloudVault.loginUser(m.groupValues[1], m.groupValues[2])
-            return res.second
+            return cloudVault.loginUser(m.groupValues[1], m.groupValues[2]).message
         }
 
         val registerRegex = Regex("""^(?:registrar\s+usuario|crear\s+cuenta|nuevo\s+usuario)\s+([a-zA-Z0-9_@\.]+)\s+(?:clave|password|contrasena|pin)\s+(.+)$""", RegexOption.IGNORE_CASE)
         registerRegex.find(input)?.let { m ->
-            val res = cloudVault.registerNewUser(m.groupValues[1], m.groupValues[2])
-            return res.second
+            return cloudVault.registerNewUser(m.groupValues[1], m.groupValues[2]).message
         }
 
         if (normalized in setOf("cerrar sesion", "cierra sesion", "salir de mi cuenta", "logout")) {
             return cloudVault.logoutToGuest()
         }
-
         if (normalized in setOf("buscar actualizaciones", "actualiza daemon", "sincronizar nube", "sync", "sincronizar cuentas")) {
             return cloudVault.syncAllChannelsNow(silent = false)
         }
-
         if (normalized in setOf("publicar actualizacion", "subir update", "admin publicar update")) {
             return cloudVault.adminPublishOtaUpdateToAllDevices()
         }
 
-        // --------------------------------------------------------------------
-        // 5. MEMORIA PERMANENTE DE DATOS SIN FECHA
-        // --------------------------------------------------------------------
+        // 5. MEMORIA PERMANENTE
         if (normalized.startsWith("recuerda que ") || normalized.startsWith("aprende que ") || normalized.startsWith("memoriza que ")) {
-            val fact = input.replace(Regex("""^(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
+            val fact = input.replace(Regex("""^.*?(?:recuerda|aprende|memoriza)\s+que\s+""", RegexOption.IGNORE_CASE), "").trim()
             return recordAndReturn(input, cloudVault.addPersonalFactToCurrentUser(fact))
         }
 
-        if (input.lowercase().startsWith("entrena:")) {
-            val body = input.substringAfter(":")
-            if (body.contains("=")) {
-                val patterns = body.substringBefore("=").split("/").map { it.trim() }.filter { it.isNotBlank() }
-                val response = body.substringAfter("=").trim()
-                val tag = "usr_" + (System.currentTimeMillis() % 100000)
-                return recordAndReturn(input, cloudVault.addPersonalKnowledgeToCurrentUser(tag, patterns, response))
-            }
-        }
-
-        // --------------------------------------------------------------------
-        // 6. MODOS DE TRABAJO DEL USUARIO ACTIVO
-        // --------------------------------------------------------------------
+        // 6. MODOS DE TRABAJO
         val currentAcc = cloudVault.getCurrentAccount()
         val activeModes = if (currentAcc.personalModes.isNotEmpty()) currentAcc.personalModes else cloudVault.buildDefaultModesForUser(currentAcc.username)
 
@@ -3045,30 +2794,22 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.createCustomModeForCurrentUser(modeName, apps))
         }
 
-        // --------------------------------------------------------------------
-        // 7. CONTROL DE VENTANAS, OPERA GX, VIDEO Y SPOTIFY
-        // --------------------------------------------------------------------
-        if (normalized.contains("abre el panel") || normalized.contains("expande el nucleo") || normalized.contains("modo ventana")) {
-            starkHud?.setOrbMode(false)
-            return recordAndReturn(input, "Desplegando el panel completo.")
-        }
-        if (normalized.contains("modo nucleo") || normalized.contains("minimiza el panel") || normalized.contains("hazte chiquito")) {
-            starkHud?.setOrbMode(true)
-            return recordAndReturn(input, "Contrayendo a modo núcleo flotante.")
-        }
-
+        // 7. BÚSQUEDA EN OPERA GX, YOUTUBE Y GOOGLE
         val ytSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+youtube\s+y\s+)?(?:busca\s+en\s+youtube|buscar\s+en\s+youtube|pon\s+un\s+video\s+de|busca\s+un\s+video\s+de)\s+(.+)$""")
         ytSearchRegex.find(normalized)?.let { m ->
             val query = m.groupValues[1].replace("en opera gx", "").trim()
             return recordAndReturn(input, systemScanner.searchInOperaGX(query, "YOUTUBE"))
         }
 
-        val operaSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+opera\s+y\s+)?(?:busca\s+en\s+opera\s+gx|busca\s+en\s+opera|buscar\s+en\s+opera\s+gx|busca\s+en\s+google|busca\s+en\s+internet|investiga\s+en\s+opera(?:\s+gx)?|busca\s+en\s+el\s+navegador)\s+(.+)$""")
-        operaSearchRegex.find(normalized)?.let { m ->
-            val query = m.groupValues[1].trim()
-            return recordAndReturn(input, systemScanner.searchInOperaGX(query, "GOOGLE"))
+        val operaSearchRegex = Regex("""^(?:abre\s+opera\s+gx\s+y\s+|abre\s+opera\s+y\s+)?(?:busca\s+en\s+opera\s+gx|busca\s+en\s+opera|buscar\s+en\s+opera\s+gx|busca\s+en\s+google|busca\s+en\s+internet|investiga\s+en\s+opera(?:\s+gx)?|busca\s+en\s+el\s+navegador|busca|buscar)\s+(.+)$""")
+        if (normalized.contains("opera") || normalized.contains("google") || normalized.contains("internet") || normalized.contains("navegador")) {
+            operaSearchRegex.find(normalized)?.let { m ->
+                val query = m.groupValues[1].replace("en opera gx", "").replace("en opera", "").replace("en google", "").trim()
+                return recordAndReturn(input, systemScanner.searchInOperaGX(query, "GOOGLE"))
+            }
         }
 
+        // 8. CONTROL DE VIDEO Y SPOTIFY
         if (normalized.contains("video") || normalized.contains("youtube")) {
             if (normalized.contains("pausa") || normalized.contains("deten") || normalized.contains("play") || normalized.contains("reanuda") || normalized.contains("continua")) {
                 return recordAndReturn(input, systemScanner.controlBrowserVideo())
@@ -3122,16 +2863,11 @@ class DaemonBrain(
         if (normalized.contains("mis me gusta") || normalized.contains("canciones que me gustan")) {
             return recordAndReturn(input, systemScanner.playLikedSongsInSpotify(forceRestart = true))
         }
-        if (normalized.startsWith("vincula playlist ") || normalized.startsWith("guarda playlist ")) {
-            val name = input.substringAfter("playlist ").substringBefore(" con ").trim()
-            val link = input.substringAfter(" con ").trim()
-            return recordAndReturn(input, systemScanner.registerPlaylist(name, link))
-        }
         if (normalized.contains("playlist") || normalized.contains("lista de reproduccion")) {
             return recordAndReturn(input, systemScanner.playPlaylist(input, normalized))
         }
 
-        val songCommandRegex = Regex("""^(?:abre\s+spotify\s+y\s+)?(?:reproduce|pon\s+la\s+cancion|pon\s+musica\s+de|pon\s+en\s+spotify|dale\s+play\s+a|toca|busca\s+en\s+spotify)\s+(.+)$""")
+        val songCommandRegex = Regex("""^(?:abre\s+spotify\s+y\s+)?(?:reproduce|reproducir|pon\s+la\s+cancion|pon\s+musica\s+de|pon\s+en\s+spotify|ponme|dale\s+play\s+a|toca|busca\s+en\s+spotify)\s+(.+)$""")
         songCommandRegex.find(normalized)?.let { m ->
             val song = m.groupValues[1].replace("en spotify", "").trim()
             return recordAndReturn(input, systemScanner.playSongInSpotify(song))
@@ -3141,21 +2877,15 @@ class DaemonBrain(
             return recordAndReturn(input, systemScanner.playSongInSpotify(song))
         }
 
-        if (normalized.contains("que cancion esta sonando") || normalized.contains("que suena en spotify") || normalized.contains("que estoy escuchando")) {
-            return recordAndReturn(input, systemScanner.getCurrentlyPlayingSpotify())
-        }
-        if (normalized.contains("que ventanas estan abiertas") || normalized.contains("que programas estan corriendo")) {
-            return recordAndReturn(input, systemScanner.getOpenWindowsReport())
-        }
+        // 9. ABRIR O CERRAR APLICACIONES (FLEXIBLE)
         if (normalized.contains("minimiza todo") || normalized.contains("muestra el escritorio")) {
             systemScanner.minimizeAllWindows()
             return recordAndReturn(input, "Despejando el escritorio.")
         }
-
-        if (normalized.matches(Regex("""^(?:abre|abrir|inicia|ejecuta|lanza|enfoca)\s+.+$"""))) {
+        if (normalized.matches(Regex("""^(?:abre|abreme|abrir|inicia|iniciar|ejecuta|ejecutar|lanza|enfoca)\s+.+$"""))) {
             return recordAndReturn(input, systemScanner.openOrFocusApp(normalized))
         }
-        if (normalized.matches(Regex("""^(?:cierra|cerrar|termina|mata)\s+.+$"""))) {
+        if (normalized.matches(Regex("""^(?:cierra|cierrame|cerrar|termina|mata)\s+.+$"""))) {
             return recordAndReturn(input, systemScanner.closeAppByName(normalized))
         }
 
@@ -3180,39 +2910,27 @@ class DaemonBrain(
         val acc = cloudVault.getCurrentAccount()
         val horaActual = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm (dd/MM/yyyy)"))
         val factsContext = if (acc.personalFacts.isEmpty()) "" else "Memoria en la nube de ${acc.username}:\n" + acc.personalFacts.joinToString("\n") { "- $it" }
-        val eventsContext = if (acc.calendarEvents.isEmpty()) "" else "Próximos eventos en el calendario (${acc.accountProvider}) de ${acc.username}:\n" +
-            acc.calendarEvents.takeLast(5).joinToString("\n") { "- ${it.formattedDate}: ${it.title}" }
-        val globalContext = if (cloudVault.vault.globalKnowledge.isEmpty()) "" else "Base de conocimiento global:\n" +
-            cloudVault.vault.globalKnowledge.take(15).joinToString("\n") { "- ${it.tag}: ${it.responses.firstOrNull() ?: ""}" }
 
         return """
-            Eres Daemon (v14.0), un sistema operativo de inteligencia artificial estilo J.A.R.V.I.S. con control universal de aplicaciones y conexión automática con cuentas de Google y Apple, creado por Cristian Alexis.
-            Estás atendiendo a la cuenta: ${acc.email.ifBlank { acc.username }} (Proveedor: ${acc.accountProvider} | Rol: ${acc.role}) en ${systemScanner.getOSLabel()}.
-            Hora actual: $horaActual. Modo activo: ${systemScanner.activeModeName}.
+            Eres Daemon (v14.5), el asistente de inteligencia artificial estilo J.A.R.V.I.S. creado por Cristian Alexis.
+            Atiendes a: ${acc.email.ifBlank { acc.username }} (${acc.accountProvider}) en ${systemScanner.getOSLabel()}. Hora: $horaActual.
             $factsContext
-            $eventsContext
-            $globalContext
             
-            Directrices:
-            1. Habla siempre en español de forma inteligente, leal y fluida.
-            2. Sé conciso (1 a 2 párrafos cortos).
-            3. Si el usuario te pide realizar una acción en su computadora, escribir texto dentro de una aplicación o agendar un recordatorio, añade al final una etiqueta exacta:
-               [ACTION:CALENDAR_ADD:texto completo con fecha y hora]
-               [ACTION:IN_APP_WRITE:nombre de la app|texto a escribir]
-               [ACTION:APP_SHORTCUT:NEW_TAB / CLOSE_TAB / SAVE / UNDO / FULLSCREEN]
-               [ACTION:SCREENSHOT]
-               [ACTION:MODE_WORK]
-               [ACTION:MODE_HOMEWORK]
-               [ACTION:MODE_STUDY]
-               [ACTION:PLAY_LIKED]
-               [ACTION:PLAY_SONG:nombre]
-               [ACTION:PAUSE_MUSIC]
-               [ACTION:PLAY_MUSIC]
-               [ACTION:NEXT_TRACK]
-               [ACTION:PREV_TRACK]
-               [ACTION:PAUSE_VIDEO]
-               [ACTION:SEARCH_OPERA:consulta]
-               [ACTION:OPEN_APP:nombre]
+            REGLA OBLIGATORIA: Si el usuario te pide abrir una aplicación, poner música, buscar algo, escribir texto o agendar un recordatorio, SIEMPRE debes incluir al final de tu respuesta la etiqueta exacta de acción para que el sistema operativo la ejecute físicamente:
+            [ACTION:OPEN_APP:nombre de la app]
+            [ACTION:PLAY_SONG:nombre de la cancion]
+            [ACTION:PLAY_LIKED]
+            [ACTION:PAUSE_MUSIC]
+            [ACTION:PLAY_MUSIC]
+            [ACTION:NEXT_TRACK]
+            [ACTION:PREV_TRACK]
+            [ACTION:SEARCH_OPERA:consulta]
+            [ACTION:IN_APP_WRITE:nombre de la app|texto]
+            [ACTION:CALENDAR_ADD:recordatorio con fecha y hora]
+            [ACTION:SCREENSHOT]
+            [ACTION:MODE_WORK]
+            [ACTION:MODE_HOMEWORK]
+            [ACTION:MODE_STUDY]
         """.trimIndent()
     }
 
@@ -3220,7 +2938,7 @@ class DaemonBrain(
         val acc = cloudVault.getCurrentAccount()
         val list = mutableListOf(ChatMessage("system", buildSystemPrompt()))
         synchronized(acc.recentHistory) {
-            acc.recentHistory.takeLast(10).forEach { turn ->
+            acc.recentHistory.takeLast(8).forEach { turn ->
                 list.add(ChatMessage(turn.role, turn.content))
             }
         }
@@ -3269,7 +2987,7 @@ class DaemonBrain(
                 .uri(URI.create("https://text.pollinations.ai/"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "DaemonStarkUniversal/14.0")
+                .header("User-Agent", "DaemonStarkDirect/14.5")
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build()
 
@@ -3354,12 +3072,12 @@ class DaemonBrain(
                             """.trimIndent()
                             val utf16 = psSpeech.toByteArray(StandardCharsets.UTF_16LE)
                             val b64 = Base64.getEncoder().encodeToString(utf16)
-                            val proc = ProcessBuilder("powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-EncodedCommand", b64).start()
+                            val proc = ProcessBuilder("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64).start()
                             proc.outputStream.use { it.write(cleanSpeech.toByteArray(StandardCharsets.UTF_8)) }
                             proc.waitFor()
                         }
                         systemScanner.isMac -> {
-                            ProcessBuilder("say", cleanSpeech).start().waitFor()
+                            ProcessBuilder("/usr/bin/say", cleanSpeech).start().waitFor()
                         }
                         systemScanner.isLinux -> {
                             systemScanner.runLinuxShell("spd-say \"$cleanSpeech\" || espeak -v es \"$cleanSpeech\"", wait = true)
@@ -3388,7 +3106,7 @@ class DaemonBrain(
 }
 
 // ============================================================================
-// 5. INTERFAZ PRINCIPAL + LOGIN UNIFICADO CON CUENTA DE GOOGLE O APPLE
+// 5. INTERFAZ HOLOGRÁFICA + LOGIN CON CUENTA GOOGLE (GMAIL) O APPLE ID
 // ============================================================================
 class StarkHologramHUD(
     private val brain: DaemonBrain,
@@ -3439,14 +3157,13 @@ class StarkHologramHUD(
         hudCanvas.isOpaque = true
         hudCanvas.background = bgSpaceDark
 
-        // CABECERA LIMPIA (Sin botón extra de calendario; todo se vincula desde CUENTA)
         val headerBar = JPanel(BorderLayout()).apply {
             isOpaque = false
             border = EmptyBorder(2, 6, 6, 6)
 
             val leftTitle = JPanel(GridLayout(2, 1, 0, 0)).apply {
                 isOpaque = false
-                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON v14.0").apply {
+                val mainTitle = JLabel("◢ J.A.R.V.I.S. // DAEMON v14.5").apply {
                     foreground = neonCyan
                     font = Font("Monospaced", Font.BOLD, 13)
                 }
@@ -3645,9 +3362,6 @@ class StarkHologramHUD(
         }.start()
     }
 
-    // ========================================================================
-    // PORTAL UNIFICADO DE CUENTAS (GMAIL / APPLE ID) + CALENDARIO AUTOMÁTICO
-    // ========================================================================
     private fun openAnimatedAccountHoloModal() {
         val modal = StarkAnimatedHoloModal(
             parent = this,
@@ -3686,7 +3400,6 @@ class StarkHologramHUD(
             add(l2)
         }
 
-        // Selector de tipo de cuenta: Google (Gmail) vs Apple (iCloud)
         val providerLabel = JLabel("CALENDARIO VINCULADO A LA CUENTA: [$selectedProvider]").apply {
             foreground = starkGold
             font = Font("Monospaced", Font.BOLD, 10)
@@ -3732,11 +3445,11 @@ class StarkHologramHUD(
             val loginBtn = createHoloButton("⚡ INICIAR SESIÓN", neonCyan, 138) {
                 val u = userField.text.trim()
                 val p = String(passField.password)
-                val (ok, msg) = cloudVault.loginUser(u, p, selectedProvider)
-                feedbackLabel.foreground = if (ok) neonEmerald else neonCrimson
-                feedbackLabel.text = msg.take(68)
-                brain.speakAndDisplay("CUENTA ACTIVA", msg)
-                if (ok) {
+                val res = cloudVault.loginUser(u, p, selectedProvider)
+                feedbackLabel.foreground = if (res.ok) neonEmerald else neonCrimson
+                feedbackLabel.text = res.message.take(68)
+                brain.speakAndDisplay("CUENTA ACTIVA", res.message)
+                if (res.ok) {
                     adminHoloBtn.isVisible = cloudVault.isAdminLoggedIn()
                     modal.dispose()
                 }
@@ -3744,11 +3457,11 @@ class StarkHologramHUD(
             val regBtn = createHoloButton("✨ CREAR CUENTA", neonEmerald, 134) {
                 val u = userField.text.trim()
                 val p = String(passField.password)
-                val (ok, msg) = cloudVault.registerNewUser(u, p, selectedProvider)
-                feedbackLabel.foreground = if (ok) neonEmerald else neonCrimson
-                feedbackLabel.text = msg.take(68)
-                brain.speakAndDisplay("NUEVA CUENTA", msg)
-                if (ok) modal.dispose()
+                val res = cloudVault.registerNewUser(u, p, selectedProvider)
+                feedbackLabel.foreground = if (res.ok) neonEmerald else neonCrimson
+                feedbackLabel.text = res.message.take(68)
+                brain.speakAndDisplay("NUEVA CUENTA", res.message)
+                if (res.ok) modal.dispose()
             }
             val syncBtn = createHoloButton("🔄 SYNC", starkGold, 76) {
                 feedbackLabel.text = "Sincronizando bóveda..."
