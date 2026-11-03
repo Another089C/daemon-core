@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793680039659,
+  "lastUpdated" : 1793680049882,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -122,8 +122,14 @@
     }, {
       "role" : "assistant",
       "content" : "La pestaña de Instagram ya está abierta."
+    }, {
+      "role" : "user",
+      "content" : "amplia la pestaña de instagram"
+    }, {
+      "role" : "assistant",
+      "content" : "La pestaña de Instagram está ampliada."
     } ],
-    "updatedAt" : 1793680039659
+    "updatedAt" : 1793680049882
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
