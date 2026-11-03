@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793681047261,
+  "lastUpdated" : 1793681145444,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "abre el chat de emiliano"
-    }, {
-      "role" : "assistant",
-      "content" : "No encontré la aplicación 'chat de emiliano' en este equipo."
-    }, {
-      "role" : "user",
       "content" : "amplia opera"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
+    }, {
+      "role" : "user",
+      "content" : "cierra todo"
+    }, {
+      "role" : "assistant",
+      "content" : "Aplicación todo cerrada."
     } ],
-    "updatedAt" : 1793681047261
+    "updatedAt" : 1793681145444
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
