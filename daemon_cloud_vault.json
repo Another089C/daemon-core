@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793680911777,
+  "lastUpdated" : 1793680969591,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "abre una nueva pestaña en opera gx"
-    }, {
-      "role" : "assistant",
-      "content" : "Acción [NEW_TAB] ejecutada en OPERA GX."
-    }, {
-      "role" : "user",
       "content" : "abre instagram en esa pestaña"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "Texto escrito en OPERA GX TENGO EL WHATSAPP ABIERTO: 'en el chat de emiliano hermano el mensaje hol'."
+    }, {
+      "role" : "user",
+      "content" : "abre el chat de emiliano"
+    }, {
+      "role" : "assistant",
+      "content" : "No encontré la aplicación 'chat de emiliano' en este equipo."
     } ],
-    "updatedAt" : 1793680911777
+    "updatedAt" : 1793680969591
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
