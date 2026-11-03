@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793681015677,
+  "lastUpdated" : 1793681023550,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "en el chat de emiliano hermano ponle ola we"
-    }, {
-      "role" : "assistant",
-      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
-    }, {
-      "role" : "user",
       "content" : "en opera gx tengo el whatsapp abierto, escribe en el chat de emiliano hermano el mensaje \"hola we\""
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
+    }, {
+      "role" : "user",
+      "content" : "quien es itzel?"
+    }, {
+      "role" : "assistant",
+      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
     } ],
-    "updatedAt" : 1793681015677
+    "updatedAt" : 1793681023550
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
