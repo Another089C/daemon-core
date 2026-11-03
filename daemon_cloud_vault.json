@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793681150115,
+  "lastUpdated" : 1793681156443,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "siguiente cancion"
-    }, {
-      "role" : "assistant",
-      "content" : "Siguiente canción en Spotify."
-    }, {
-      "role" : "user",
       "content" : "amplia la aplicacion de opera gx"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "Aplicación opera cerrada."
+    }, {
+      "role" : "user",
+      "content" : "cierra todas las aplicaciones"
+    }, {
+      "role" : "assistant",
+      "content" : "Aplicación todas las aplicaciones cerrada."
     } ],
-    "updatedAt" : 1793681150115
+    "updatedAt" : 1793681156443
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
