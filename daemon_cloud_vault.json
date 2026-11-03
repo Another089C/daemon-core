@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793681156443,
+  "lastUpdated" : 1793681163540,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "amplia la aplicacion de opera gx"
-    }, {
-      "role" : "assistant",
-      "content" : "Abrir la aplicación Opera GX."
-    }, {
-      "role" : "user",
       "content" : "quien es itzel?"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "Aplicación todas las aplicaciones cerrada."
+    }, {
+      "role" : "user",
+      "content" : "cierra visual"
+    }, {
+      "role" : "assistant",
+      "content" : "Aplicación visual cerrada."
     } ],
-    "updatedAt" : 1793681156443
+    "updatedAt" : 1793681163540
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
