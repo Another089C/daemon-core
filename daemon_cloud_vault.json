@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793680061502,
+  "lastUpdated" : 1793680524678,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -134,8 +134,14 @@
     }, {
       "role" : "assistant",
       "content" : "Ejecutando acción [NEW_TAB]."
+    }, {
+      "role" : "user",
+      "content" : "abre una pestaña de instagram"
+    }, {
+      "role" : "assistant",
+      "content" : "Ejecutando acción [NEW_TAB]."
     } ],
-    "updatedAt" : 1793680061502
+    "updatedAt" : 1793680524678
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
