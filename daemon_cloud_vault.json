@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793680977594,
+  "lastUpdated" : 1793680990202,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "abre instagram en opera gx"
-    }, {
-      "role" : "assistant",
-      "content" : "Ventana de OPERA GX traída al frente."
-    }, {
-      "role" : "user",
       "content" : "busca instagram.com en opera gx"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
+    }, {
+      "role" : "user",
+      "content" : "siguiente cancion"
+    }, {
+      "role" : "assistant",
+      "content" : "Siguiente canción en Spotify."
     } ],
-    "updatedAt" : 1793680977594
+    "updatedAt" : 1793680990202
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
