@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793680809902,
+  "lastUpdated" : 1793680825575,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "abre una nueva pestaña y busca youtube.com"
-    }, {
-      "role" : "assistant",
-      "content" : "Ejecutando acción [NEW_TAB]."
-    }, {
-      "role" : "user",
       "content" : "abre una pestaña de instagram"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "Acción [NEW_TAB] ejecutada en OPERA GX."
+    }, {
+      "role" : "user",
+      "content" : "abre instagram en esa pestaña"
+    }, {
+      "role" : "assistant",
+      "content" : "No encontré la aplicación 'instagram en esa pestana' en este equipo."
     } ],
-    "updatedAt" : 1793680809902
+    "updatedAt" : 1793680825575
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
