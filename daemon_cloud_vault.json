@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793758927321,
+  "lastUpdated" : 1793830441407,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "apaga la cp"
-    }, {
-      "role" : "assistant",
-      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
-    }, {
-      "role" : "user",
       "content" : "puedes apagar la pc?"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "SPOTIFY iniciado correctamente."
+    }, {
+      "role" : "user",
+      "content" : "abre spotify"
+    }, {
+      "role" : "assistant",
+      "content" : "SPOTIFY activo en tu Mac."
     } ],
-    "updatedAt" : 1793758927321
+    "updatedAt" : 1793830441407
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
