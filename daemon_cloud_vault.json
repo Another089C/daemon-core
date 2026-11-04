@@ -1,5 +1,5 @@
 {
-  "lastUpdated" : 1793758846030,
+  "lastUpdated" : 1793758927321,
   "globalKnowledge" : [ {
     "tag" : "global_identidad",
     "patterns" : [ "quien eres", "que es daemon", "como funcionas" ],
@@ -106,12 +106,6 @@
     "calendarEvents" : [ ],
     "recentHistory" : [ {
       "role" : "user",
-      "content" : "apaga el ordenador"
-    }, {
-      "role" : "assistant",
-      "content" : "En línea (INVITADO). ¿Qué orden ejecutamos?"
-    }, {
-      "role" : "user",
       "content" : "apaga la cp"
     }, {
       "role" : "assistant",
@@ -146,8 +140,14 @@
     }, {
       "role" : "assistant",
       "content" : "Modo Trabajo activo, Usuario. Enfocando Visual Studio Code, Notion, Opera GX y tu música en Mis Me Gusta."
+    }, {
+      "role" : "user",
+      "content" : "abre spotify"
+    }, {
+      "role" : "assistant",
+      "content" : "SPOTIFY iniciado correctamente."
     } ],
-    "updatedAt" : 1793758846030
+    "updatedAt" : 1793758927321
   }, {
     "username" : "ccristinorocha7",
     "email" : "ccristinorocha7@gmail.com",
